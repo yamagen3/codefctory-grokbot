@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Idempotent install of a pinned pstack-claude skill subset for factory agents.
-# - Claude Code (Agent SDK via DSH): ~/.claude/skills/<name>
+# - Claude Code user files: ~/.claude/skills/<name>
+#   Files alone do not enter the CC prompt. factory-setup's CC patch spreads
+#   pstackQueryOverlay() into the Agent SDK query (docs/pstack-cc.md).
 # - OpenCode (factory-oc + bwrap): /home/factory-oc/.agents/skills/<name>
 #   (also mirrored under /home/factory-oc/.config/opencode/skills for discovery)
 # Never mounts /workspace/factory into OpenCode; skills are copied into factory-oc HOME.
-# Does not widen CC FS allowlist or OC sandbox.
+# Does not widen CC FS allowlist or OC sandbox. Does not install the pstack
+# marketplace plugin or its SessionStart hook.
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
 
@@ -145,7 +148,7 @@ fi
 
 ensure_checkout
 
-# Claude Code user skills (Agent SDK default settingSources includes "user")
+# Claude Code user skills. The SDK loads this directory only as setting source "user".
 install_to "${HOME}/.claude/skills" "claude-code"
 
 # OpenCode under factory-oc home (bwrap bind-mounts /home/factory-oc)
