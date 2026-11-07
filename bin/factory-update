@@ -1,0 +1,1001 @@
+#!/usr/bin/env python3
+"""factory-update — daily security-update batch for the code factory box.
+
+Usage:
+  factory-update check            inventory + newer versions + vulns -> local/updates/<date>/
+  factory-update apply [--check-json F] [--approve <id|name@version>]...   apply auto items (security, patch/minor) with snapshot+rollback
+  factory-update daily            check, then apply if anything is auto-applicable; writes latest-summary.md
+
+Exit codes (daily/apply):
+  0 nothing-to-do   10 updated-ok   20 needs-approval (nothing auto-applied, or applied ok + pending approvals)
+  30 rolled-back    1 error         75 another run holds the lock
+`check` exits 0 on success, 1 on error.
+
+Never prints secret values; only checks that env vars exist. No model calls in `check`.
+Test hooks (env): FACTORY_UPDATE_DIR, FACTORY_UPDATE_NPM_PREFIX, FACTORY_UPDATE_VERIFY_CMD,
+FACTORY_UPDATE_SKIP_POST=1, FACTORY_UPDATE_SKIP_DOCTOR=1, FACTORY_UPDATE_DOCTOR_CMD.
+"""
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+ROOT = Path(os.environ.get("FACTORY_ROOT", "/workspace/factory"))
+UPD = Path(os.environ.get("FACTORY_UPDATE_DIR", ROOT / "local/updates"))
+PREFIX = Path(os.environ.get("FACTORY_UPDATE_NPM_PREFIX", HOME / ".local"))
+PROFILE = HOME / ".dsh/profiles/headless"
+OC_ISO_BIN = Path("/home/factory-oc/bin/opencode")
+AGMSG_CLONE = ROOT / "tools/agmsg"
+AGMSG_SKILL = HOME / ".agents/skills/agmsg"
+PSTACK = ROOT / "tools/pstack-claude"
+OSV_VERSION = "2.7.0"
+DSH_PKG = "@deepseek-ai/dsh"
+OC_PKG = "@opencode/cli"
+PONG = "Reply with exactly the single word pong and nothing else."
+PONG_CHECK = ("python3 -c \"import sys,json; d=json.loads(sys.stdin.read().strip().splitlines()[-1]); "
+              "sys.exit(0 if d.get('stopReason')=='completed' and d.get('text','').strip().strip('.').lower()=='pong' else 1)\"")
+EXIT = {"nothing-to-do": 0, "updated-ok": 10, "needs-approval": 20, "rolled-back": 30, "error": 1}
+
+os.environ["PATH"] = f"{ROOT}/bin:{HOME}/.local/bin:" + os.environ.get("PATH", "")
+
+
+def now():
+    return dt.datetime.now().astimezone()
+
+
+def log(*a):
+    print("factory-update:", *a, file=sys.stderr, flush=True)
+
+
+def run(cmd, timeout=600, check=False, env=None, cwd=None, shell=False):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd, shell=shell)
+    except subprocess.TimeoutExpired:
+        if check:
+            raise RuntimeError(f"timeout: {cmd}")
+        return subprocess.CompletedProcess(cmd, 124, "", "timeout")
+    if check and p.returncode != 0:
+        raise RuntimeError(f"{cmd} -> rc={p.returncode}: {p.stderr[-800:]}")
+    return p
+
+
+def which(c):
+    return shutil.which(c)
+
+
+# ---------- versions ----------
+def parse_ver(v):
+    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?", v or "")
+    if not m:
+        return None
+    pre = m.group(4)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), pre)
+
+
+def vkey(v):
+    p = parse_ver(v)
+    if not p:
+        return (-1, -1, -1, 0, "")
+    return (p[0], p[1], p[2], 0 if p[3] else 1, p[3] or "")
+
+
+def bump_kind(cur, new):
+    a, b = parse_ver(cur), parse_ver(new)
+    if not a or not b:
+        return "unknown"
+    if a[3] or b[3]:
+        return "prerelease"
+    if b[0] != a[0] or (a[0] == 0 and b[1] != a[1]):
+        return "major"  # 0.x minor is breaking per semver
+    if b[1] != a[1]:
+        return "minor"
+    if b[2] != a[2]:
+        return "patch"
+    return "none"
+
+
+def classify(cur, new, rule=None):
+    """auto | needs-approval | none"""
+    if vkey(new) <= vkey(cur):
+        return "none", "not newer"
+    if rule == "dsh":
+        return "needs-approval", "DSH release channel change (rc/prerelease policy)"
+    k = bump_kind(cur, new)
+    if k in ("patch", "minor"):
+        return "auto", k
+    return "needs-approval", k
+
+
+# ---------- check ----------
+def npm_globals():
+    p = run(["npm", "ls", "-g", "--depth=0", "--json", "--prefix", str(PREFIX)], timeout=120)
+    try:
+        deps = json.loads(p.stdout or "{}").get("dependencies", {})
+    except json.JSONDecodeError:
+        deps = {}
+    return {k: v.get("version") for k, v in deps.items()}
+
+
+def npm_view(name):
+    p = run(["npm", "view", name, "dist-tags", "versions", "--json"], timeout=120)
+    if p.returncode != 0:
+        return None
+    try:
+        return json.loads(p.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def best_stable(versions, cur):
+    cand = [v for v in versions if parse_ver(v) and not parse_ver(v)[3] and vkey(v) > vkey(cur)]
+    if not cand:
+        return None, None
+    cand.sort(key=vkey)
+    same_major = [v for v in cand if bump_kind(cur, v) in ("patch", "minor")]
+    return (same_major[-1] if same_major else None), cand[-1]
+
+
+def ensure_osv():
+    p = which("osv-scanner")
+    if p:
+        return p
+    dest = HOME / ".local/bin/osv-scanner"
+    base = f"https://github.com/google/osv-scanner/releases/download/v{OSV_VERSION}"
+    with tempfile.TemporaryDirectory() as td:
+        binp, sums = Path(td) / "osv", Path(td) / "sums"
+        urllib.request.urlretrieve(f"{base}/osv-scanner_linux_amd64", binp)
+        urllib.request.urlretrieve(f"{base}/osv-scanner_SHA256SUMS", sums)
+        want = next(l.split()[0] for l in sums.read_text().splitlines() if l.endswith(" osv-scanner_linux_amd64"))
+        got = hashlib.sha256(binp.read_bytes()).hexdigest()
+        if got != want:
+            raise RuntimeError("osv-scanner checksum mismatch")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(binp, dest)
+        dest.chmod(0o755)
+    log(f"installed osv-scanner {OSV_VERSION} (sha256 verified)")
+    return str(dest)
+
+
+def osv_scan(lockfile):
+    osv = ensure_osv()
+    p = run([osv, "scan", "source", "-L", str(lockfile), "--format", "json"], timeout=300)
+    out = []
+    try:
+        d = json.loads(p.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    for r in d.get("results", []):
+        for pk in r.get("packages", []):
+            for v in pk.get("vulnerabilities", []):
+                fixed = sorted({e["fixed"] for a in v.get("affected", []) for rg in a.get("ranges", []) for e in rg.get("events", []) if "fixed" in e}, key=vkey)
+                out.append({"package": pk["package"]["name"], "version": pk["package"]["version"],
+                            "id": v["id"], "aliases": v.get("aliases", []), "summary": v.get("summary", ""),
+                            "fixed": fixed})
+    return out
+
+
+def npm_audit_tmp(globals_):
+    """npm audit needs a lockfile: build one in a temp dir from the exact global versions."""
+    with tempfile.TemporaryDirectory(prefix="factory-update-audit-") as td:
+        pkg = {"name": "factory-update-audit", "private": True, "dependencies": {k: v for k, v in globals_.items()}}
+        Path(td, "package.json").write_text(json.dumps(pkg))
+        p = run(["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"], cwd=td, timeout=300)
+        if p.returncode != 0:
+            return {"error": p.stderr[-500:]}, None
+        a = run(["npm", "audit", "--json"], cwd=td, timeout=300)
+        try:
+            aud = json.loads(a.stdout or "{}")
+        except json.JSONDecodeError:
+            aud = {"error": "unparseable"}
+        vulns = {n: {"severity": v.get("severity"), "via": [x if isinstance(x, str) else x.get("title") for x in v.get("via", [])],
+                     "fixAvailable": v.get("fixAvailable")} for n, v in aud.get("vulnerabilities", {}).items()}
+        osv = osv_scan(Path(td, "package-lock.json"))
+        return {"metadata": aud.get("metadata", {}).get("vulnerabilities"), "vulnerabilities": vulns}, osv
+
+
+def check_npm(rep):
+    g = npm_globals()
+    rep["inventory"]["npm_globals"] = g
+    for name, cur in g.items():
+        info = npm_view(name)
+        if info is None:
+            rep["errors"].append(f"npm view {name} failed")
+            continue
+        tags = info.get("dist-tags", {})
+        versions = info.get("versions", [])
+        if name == DSH_PKG:
+            newer = sorted({v for v in tags.values() if vkey(v) > vkey(cur)}, key=vkey)
+            for v in newer:
+                rep["actions"].append({"id": f"npm:{name}@{v}", "kind": "npm", "name": name, "from": cur, "to": v,
+                                       "class": "needs-approval", "reason": "DSH rc/prerelease channel change (" + ",".join(k for k, t in tags.items() if t == v) + ")"})
+            continue
+        safe, top = best_stable(versions, cur)
+        if safe:
+            rep["actions"].append({"id": f"npm:{name}@{safe}", "kind": "npm", "name": name, "from": cur, "to": safe,
+                                   "class": "auto", "reason": bump_kind(cur, safe)})
+        if top and top != safe:
+            rep["actions"].append({"id": f"npm:{name}@{top}", "kind": "npm", "name": name, "from": cur, "to": top,
+                                   "class": "needs-approval", "reason": bump_kind(cur, top)})
+    audit, osv = npm_audit_tmp(g)
+    rep["vulns"]["npm_audit_globals"] = audit
+    rep["vulns"]["osv_globals"] = osv
+
+
+def pkgjson(p):
+    try:
+        return json.loads(Path(p).read_text())
+    except Exception:
+        return {}
+
+
+def check_dsh_nested(rep):
+    nm = PROFILE / "node_modules"
+    cc = pkgjson(nm / "@deepseek-ai/dsh-subagent-claude-code/package.json")
+    sdk = pkgjson(nm / "@anthropic-ai/claude-agent-sdk/package.json")
+    inv = {"profile": str(PROFILE), "dsh-subagent-claude-code": cc.get("version"),
+           "dsh-subagent-acp": pkgjson(nm / "@deepseek-ai/dsh-subagent-acp/package.json").get("version"),
+           "claude-agent-sdk": sdk.get("version"), "claude": sdk.get("claudeCodeVersion"),
+           "cc_allowlist_patch": "FACTORY_CC_STEP" in (nm / "@deepseek-ai/dsh-subagent-claude-code/lib/index.js").read_text(errors="ignore")
+           if (nm / "@deepseek-ai/dsh-subagent-claude-code/lib/index.js").exists() else None}
+    rep["inventory"]["dsh_profile"] = inv
+    info = npm_view("@anthropic-ai/claude-agent-sdk")
+    if info and sdk.get("version"):
+        lat = info.get("dist-tags", {}).get("latest")
+        if lat and vkey(lat) > vkey(sdk["version"]):
+            rep["actions"].append({"id": f"sdk:claude-agent-sdk@{lat}", "kind": "cc-sdk", "name": "@anthropic-ai/claude-agent-sdk",
+                                   "from": sdk["version"], "to": lat, "class": "needs-approval",
+                                   "reason": f"pinned exactly by dsh-subagent-claude-code {cc.get('version')}; approve to override in the profile ({bump_kind(sdk['version'], lat)})"})
+    lock = PROFILE / "pnpm-lock.yaml"
+    if lock.exists():
+        osv = osv_scan(lock)
+        rep["vulns"]["osv_dsh_profile"] = osv
+        for e in group_vulns(osv):
+            rep["actions"].append({"id": f"vuln:profile:{e['package']}@{e['version']}", "kind": "info",
+                                   "name": e["package"], "from": e["version"], "to": e["fix"] or "no fix listed",
+                                   "class": "needs-approval", "reason": f"{', '.join(e['ids'])} in DSH profile (pinned by DSH packages; needs DSH release or override)"})
+
+
+def fixed_for(v):
+    """Smallest fixed version above the installed one (OSV lists fixes for every release line)."""
+    up = [f for f in v["fixed"] if vkey(f) > vkey(v["version"])]
+    return up[0] if up else "no fix listed"
+
+
+def owners_of(pkg, version):
+    """Which top-level global package actually ships pkg@version (scan installed trees)."""
+    out = set()
+    base = PREFIX / "lib/node_modules"
+    tops = [d for d in base.iterdir() if not d.name.startswith("@")] + [d for s in base.glob("@*") for d in s.iterdir()]
+    for top in tops:
+        for pj in top.glob(f"**/node_modules/{pkg}/package.json"):
+            if pkgjson(pj).get("version") == version:
+                out.add(str(top.relative_to(base)))
+                break
+    return sorted(out)
+
+
+def group_vulns(lst):
+    g = {}
+    for v in lst or []:
+        k = (v["package"], v["version"])
+        e = g.setdefault(k, {"package": v["package"], "version": v["version"], "ids": [], "fix": None})
+        e["ids"].append(v["id"])
+        f = fixed_for(v)
+        if f != "no fix listed" and (e["fix"] is None or vkey(f) > vkey(e["fix"])):
+            e["fix"] = f
+    return list(g.values())
+
+
+def check_global_vulns_to_actions(rep):
+    for e in group_vulns(rep["vulns"].get("osv_globals")):
+        own = owners_of(e["package"], e["version"])
+        rep["actions"].append({"id": f"vuln:global:{e['package']}@{e['version']}", "kind": "info", "name": e["package"],
+                               "from": e["version"], "to": e["fix"] or "no fix listed", "class": "needs-approval", "owners": own,
+                               "reason": f"{', '.join(e['ids'])} nested in {', '.join(own) or 'global tree'}; needs an upstream release of the owner (not auto-applicable)"})
+
+
+def git(args, cwd, timeout=120):
+    return run(["git", "-C", str(cwd)] + args, timeout=timeout)
+
+
+def check_tools(rep):
+    inv = {}
+    if (AGMSG_CLONE / ".git").exists():
+        head = git(["rev-parse", "--short", "HEAD"], AGMSG_CLONE).stdout.strip()
+        ver = (AGMSG_CLONE / "VERSION").read_text().strip() if (AGMSG_CLONE / "VERSION").exists() else None
+        tags = git(["ls-remote", "--tags", "origin"], AGMSG_CLONE).stdout
+        rel = sorted({m for m in re.findall(r"refs/tags/(v\d+\.\d+\.\d+)$", tags, re.M)}, key=vkey)
+        skill_ver = (AGMSG_SKILL / "VERSION").read_text().strip() if (AGMSG_SKILL / "VERSION").exists() else None
+        inv["agmsg_clone"] = {"head": head, "version": ver, "latest_release": rel[-1] if rel else None, "skill_installed": skill_ver}
+        if rel and ver:
+            safe = [t for t in rel if classify(ver, t)[0] == "auto"]
+            if safe:
+                rep["actions"].append({"id": f"agmsg-skill:{safe[-1]}", "kind": "agmsg-skill", "name": "tools/agmsg+skill",
+                                       "from": ver, "to": safe[-1].lstrip("v"), "tag": safe[-1], "class": "auto", "reason": bump_kind(ver, safe[-1])})
+            if classify(ver, rel[-1])[0] == "needs-approval":
+                rep["actions"].append({"id": f"agmsg-skill:{rel[-1]}", "kind": "info", "name": "tools/agmsg+skill",
+                                       "from": ver, "to": rel[-1], "class": "needs-approval", "reason": bump_kind(ver, rel[-1])})
+    if (PSTACK / ".git").exists():
+        pin = (ROOT / "local/pstack-installed-sha").read_text().strip() if (ROOT / "local/pstack-installed-sha").exists() else None
+        remote = git(["ls-remote", "origin", "HEAD"], PSTACK).stdout.split()
+        inv["pstack"] = {"pin": pin, "upstream_head": remote[0] if remote else None}
+        if remote and pin and remote[0] != pin:
+            rep["actions"].append({"id": f"pstack:{remote[0][:12]}", "kind": "info", "name": "tools/pstack-claude", "from": pin[:12],
+                                   "to": remote[0][:12], "class": "needs-approval", "reason": "pinned SHA (DECISIONS); review upstream diff before re-pin"})
+    rep["inventory"]["tools"] = inv
+
+
+def apt_check(rep):
+    st = {"update_ok": False, "attempts": 0, "upgradable": [], "security": []}
+    for i in range(3):
+        st["attempts"] = i + 1
+        p = run(["sudo", "-n", "apt-get", "update", "-q"], timeout=180)
+        errs = [l for l in (p.stdout + p.stderr).splitlines() if l.startswith(("E:", "W:", "Err"))]
+        if p.returncode == 0 and not any(l.startswith("E:") for l in errs):
+            st["update_ok"] = True
+            break
+        st["last_error"] = "; ".join(errs[:4])[:600]
+        time.sleep(5 * (i + 1) if not os.environ.get("FACTORY_UPDATE_FAST") else 0)
+    if not st["update_ok"]:
+        rep["warnings"].append(f"apt-get update failed after {st['attempts']} attempts (mirror error); using cached lists: {st.get('last_error','')[:200]}")
+    p = run(["apt", "list", "--upgradable"], timeout=120)
+    for l in p.stdout.splitlines():
+        m = re.match(r"^(\S+?)/(\S+)\s+(\S+)\s+\S+\s+\[upgradable from: (\S+)\]", l)
+        if m:
+            e = {"package": m.group(1), "suite": m.group(2), "to": m.group(3), "from": m.group(4)}
+            st["upgradable"].append(e)
+            if "security" in m.group(2):
+                st["security"].append(e)
+                rep["actions"].append({"id": f"apt:{e['package']}={e['to']}", "kind": "apt", "name": e["package"], "from": e["from"],
+                                       "to": e["to"], "class": "auto", "reason": f"security ({e['suite']})"})
+    rep["inventory"]["apt"] = st
+
+
+def gh_latest(repo):
+    try:
+        req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases/latest", headers={"Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r).get("tag_name")
+    except Exception as e:
+        return None
+
+
+def check_uv_python(rep):
+    uvv = run(["uv", "--version"]).stdout.split()
+    cur = uvv[1] if len(uvv) > 1 else None
+    lat = gh_latest("astral-sh/uv")
+    inv = {"uv": cur, "uv_path": which("uv"), "uv_latest": lat}
+    if cur and lat:
+        c, why = classify(cur, lat)
+        if c != "none":
+            rep["actions"].append({"id": f"uv:{lat}", "kind": "uv", "name": "uv", "from": cur, "to": lat, "class": c, "reason": why})
+    py = HOME / ".local/bin/python3.12"
+    pyv = run([str(py), "-V"]).stdout.split()[-1] if py.exists() else None
+    inv["python3.12"] = pyv
+    inv["python3.12_target"] = os.path.realpath(py) if py.exists() else None
+    p = run(["uv", "python", "list", "3.12", "--all-versions", "--output-format", "json"], timeout=120)
+    try:
+        avail = sorted({e["version"] for e in json.loads(p.stdout) if e.get("implementation") == "cpython" and e.get("variant", "default") == "default"}, key=vkey)
+    except Exception:
+        avail = sorted(set(re.findall(r"cpython-(3\.12\.\d+)-", p.stdout)), key=vkey)
+    inv["python3.12_available"] = avail[-1] if avail else None
+    if pyv and avail and vkey(avail[-1]) > vkey(pyv):
+        rep["actions"].append({"id": f"python:{avail[-1]}", "kind": "python", "name": "cpython", "from": pyv, "to": avail[-1],
+                               "class": "auto", "reason": "patch"})
+    rep["inventory"]["uv_python"] = inv
+
+
+def sha256(path, sudo=False):
+    if sudo:
+        p = run(["sudo", "-n", "sha256sum", str(path)])
+        return p.stdout.split()[0] if p.returncode == 0 else None
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def oc_global_bin():
+    return PREFIX / "lib/node_modules/@opencode/cli/bin/opencode.exe"
+
+
+def check_oc_isolation(rep):
+    g = oc_global_bin()
+    inv = {"factory_oc_bin": str(OC_ISO_BIN), "separate_copy": True}
+    inv["global_sha256"] = sha256(g) if g.exists() else None
+    inv["factory_oc_sha256"] = sha256(OC_ISO_BIN, sudo=True)
+    v = run(["sudo", "-n", "-u", "factory-oc", str(OC_ISO_BIN), "--version"], timeout=60)
+    inv["factory_oc_version"] = (v.stdout.strip().splitlines() or [None])[-1]
+    inv["in_sync"] = inv["global_sha256"] == inv["factory_oc_sha256"]
+    cfg = run(["sudo", "-n", "find", "/home/factory-oc/.config/opencode", "-maxdepth", "1", "-type", "f", "-printf", "%f\n"])
+    inv["factory_oc_config_files"] = sorted(cfg.stdout.split())
+    if not inv["in_sync"] and inv["global_sha256"]:
+        rep["actions"].append({"id": "oc-copy", "kind": "oc-copy", "name": "factory-oc opencode", "from": (inv["factory_oc_sha256"] or "?")[:12],
+                               "to": inv["global_sha256"][:12], "class": "auto", "reason": "sync isolated copy to global @opencode/cli"})
+    rep["inventory"]["factory_oc"] = inv
+
+
+def check_actions_pins(rep):
+    out = []
+    for wf in sorted((ROOT / "repo-template/.github/workflows").glob("*.y*ml")):
+        for i, l in enumerate(wf.read_text().splitlines(), 1):
+            m = re.search(r"uses:\s*([^\s#]+)", l)
+            if m and not m.group(1).startswith("./"):
+                ref = m.group(1).split("@", 1)[1] if "@" in m.group(1) else ""
+                if not re.fullmatch(r"[0-9a-f]{40}", ref):
+                    out.append({"file": str(wf.relative_to(ROOT)), "line": i, "uses": m.group(1)})
+    rep["inventory"]["repo_template_unpinned_actions"] = out
+    rep["inventory"]["repo_template_dependabot"] = (ROOT / "repo-template/.github/dependabot.yml").exists()
+
+
+def secrets_presence():
+    return {k: bool(os.environ.get(k)) for k in ("CLAUDE_CODE_OAUTH_TOKEN", "OPENCODE_GO_KEY")}
+
+
+def do_check():
+    t = now()
+    rep = {"generated": t.isoformat(timespec="seconds"), "inventory": {}, "vulns": {}, "actions": [], "warnings": [], "errors": [],
+           "secrets_present": secrets_presence()}
+    for name, fn in [("npm", check_npm), ("dsh_nested", check_dsh_nested), ("tools", check_tools), ("apt", apt_check),
+                     ("uv_python", check_uv_python), ("factory_oc", check_oc_isolation), ("actions", check_actions_pins)]:
+        try:
+            fn(rep)
+        except Exception as e:  # keep going: one broken source must not hide the others
+            rep["errors"].append(f"{name}: {e}")
+    check_global_vulns_to_actions(rep)
+    # dedupe
+    seen, acts = set(), []
+    for a in rep["actions"]:
+        if a["id"] not in seen:
+            seen.add(a["id"]); acts.append(a)
+    rep["actions"] = acts
+    d = UPD / t.strftime("%Y-%m-%d")
+    d.mkdir(parents=True, exist_ok=True)
+    stamp = t.strftime("%H%M%S")
+    jp = d / f"check-{stamp}.json"
+    jp.write_text(json.dumps(rep, indent=2, ensure_ascii=False))
+    (d / "check-latest.json").write_text(json.dumps(rep, indent=2, ensure_ascii=False))
+    md = render_check(rep)
+    (d / f"check-{stamp}.md").write_text(md)
+    (d / "check-latest.md").write_text(md)
+    rep["_path"] = str(jp)
+    log(f"check written: {jp}")
+    print(md)
+    return rep
+
+
+def render_check(rep):
+    L = [f"# factory-update check {rep['generated']}", ""]
+    inv = rep["inventory"]
+    L.append("## Inventory")
+    for k, v in (inv.get("npm_globals") or {}).items():
+        L.append(f"- npm global {k} {v}")
+    dp = inv.get("dsh_profile") or {}
+    L.append(f"- DSH profile: subagent-claude-code {dp.get('dsh-subagent-claude-code')}, Agent SDK {dp.get('claude-agent-sdk')}, claude {dp.get('claude')}, CC allowlist patch={dp.get('cc_allowlist_patch')}")
+    up = inv.get("uv_python") or {}
+    L.append(f"- uv {up.get('uv')} (latest {up.get('uv_latest')}); python3.12 {up.get('python3.12')} (newest available {up.get('python3.12_available')})")
+    fo = inv.get("factory_oc") or {}
+    L.append(f"- factory-oc opencode {fo.get('factory_oc_version')} separate copy, in_sync={fo.get('in_sync')}")
+    tl = inv.get("tools") or {}
+    if "agmsg_clone" in tl:
+        a = tl["agmsg_clone"]; L.append(f"- tools/agmsg {a['version']} @{a['head']} (latest release {a['latest_release']})")
+    if "pstack" in tl:
+        L.append(f"- tools/pstack-claude pin {str(tl['pstack']['pin'])[:12]} (upstream {str(tl['pstack']['upstream_head'])[:12]})")
+    ap = inv.get("apt") or {}
+    L.append(f"- apt: update_ok={ap.get('update_ok')}, upgradable={len(ap.get('upgradable', []))}, security={len(ap.get('security', []))}")
+    un = inv.get("repo_template_unpinned_actions") or []
+    L.append(f"- repo-template actions not SHA-pinned: {len(un)}" + "".join(f"\n  - {u['file']}:{u['line']} {u['uses']}" for u in un))
+    L.append(f"- secrets present: " + ", ".join(f"{k}={'yes' if v else 'NO'}" for k, v in rep["secrets_present"].items()))
+    for cls in ("auto", "needs-approval"):
+        items = [a for a in rep["actions"] if a["class"] == cls]
+        L += ["", f"## {cls} ({len(items)})"] + [f"- {a['name']}: {a['from']} -> {a['to']} ({a['reason']})" for a in items] or ["- none"]
+    if rep["warnings"]:
+        L += ["", "## Warnings"] + [f"- {w}" for w in rep["warnings"]]
+    if rep["errors"]:
+        L += ["", "## Errors"] + [f"- {e}" for e in rep["errors"]]
+    return "\n".join(L) + "\n"
+
+
+# ---------- apply ----------
+class Snapshot:
+    def __init__(self, d):
+        self.d = d
+        self.d.mkdir(parents=True, exist_ok=True)
+        self.items = []  # restore closures recorded as data
+
+    def save(self):
+        (self.d / "snapshot.json").write_text(json.dumps(self.items, indent=2))
+
+
+def npm_pkg_dir(name):
+    return PREFIX / "lib/node_modules" / name
+
+
+def npm_bins(name):
+    pj = pkgjson(npm_pkg_dir(name) / "package.json")
+    b = pj.get("bin", {})
+    if isinstance(b, str):
+        b = {name.split("/")[-1]: b}
+    return list(b.keys())
+
+
+def snap_npm(snap, a):
+    name = a["name"]
+    src = npm_pkg_dir(name)
+    dst = snap.d / "npm" / name
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    run(["cp", "-a", "--reflink=auto", str(src), str(dst)], check=True, timeout=900)
+    links = {}
+    for b in npm_bins(name):
+        p = PREFIX / "bin" / b
+        if p.is_symlink():
+            links[b] = os.readlink(p)
+    snap.items.append({"kind": "npm", "name": name, "version": a["from"], "backup": str(dst), "bins": links})
+
+
+def restore_npm(it):
+    d = npm_pkg_dir(it["name"])
+    if d.exists():
+        shutil.rmtree(d)
+    run(["cp", "-a", "--reflink=auto", it["backup"], str(d)], check=True, timeout=900)
+    (PREFIX / "bin").mkdir(parents=True, exist_ok=True)
+    for b, tgt in it["bins"].items():
+        p = PREFIX / "bin" / b
+        if p.is_symlink() or p.exists():
+            p.unlink()
+        os.symlink(tgt, p)
+
+
+def apply_npm(a, staging):
+    spec = a.get("spec") or f"{a['name']}@{a['to']}"
+    # 1) staging prefix first: proves the version resolves/installs (incl. postinstall) without touching the real prefix
+    sp = staging / "npm-prefix"
+    run(["npm", "install", "-g", "--prefix", str(sp), "--no-audit", "--no-fund", spec], check=True, timeout=900)
+    got = pkgjson(sp / "lib/node_modules" / a["name"] / "package.json").get("version")
+    if got != a["to"]:
+        raise RuntimeError(f"staging installed {a['name']}@{got}, expected {a['to']}")
+    # 2) real prefix
+    run(["npm", "install", "-g", "--prefix", str(PREFIX), "--no-audit", "--no-fund", spec], check=True, timeout=900)
+    got = pkgjson(npm_pkg_dir(a["name"]) / "package.json").get("version")
+    if got != a["to"]:
+        raise RuntimeError(f"installed {a['name']}@{got}, expected {a['to']}")
+    if a["name"] == DSH_PKG and not os.environ.get("FACTORY_UPDATE_SKIP_POST"):
+        apply_dsh_profile(a["to"])
+
+
+def apply_dsh_profile(version):
+    """DSH host and the headless profile's subagent packages move together (exact rc pins)."""
+    pj = PROFILE / "package.json"
+    d = json.loads(pj.read_text())
+    deps = {k: version for k in d.get("dependencies", {}) if k.startswith("@deepseek-ai/dsh-")}
+    run(["dsh", "plugin", "--profile", PROFILE.name, "add", "--save-exact"] + [f"{k}@{v}" for k, v in deps.items()], check=True, timeout=1200)
+    for k in deps:
+        got = pkgjson(PROFILE / "node_modules" / k / "package.json").get("version")
+        if got != version:
+            raise RuntimeError(f"profile {k}@{got}, expected {version}")
+    # keep the tracked copy of the profile manifest in sync
+    shutil.copy(pj, ROOT / "config/headless.package.json")
+
+
+def apply_cc_sdk(version):
+    """Override DSH's exact Agent SDK pin in the headless profile (pnpm overrides in pnpm-workspace.yaml).
+    The platform binary package (bundled claude CLI) is overridden to the same version."""
+    ws = PROFILE / "pnpm-workspace.yaml"
+    lines = [l for l in ws.read_text().splitlines()]
+    # drop any previous factory override block
+    out, skip = [], False
+    for l in lines:
+        if l.startswith("overrides:"):
+            skip = True
+            continue
+        if skip and (l.startswith("  ") or not l.strip()):
+            continue
+        skip = False
+        out.append(l)
+    out += ["overrides:", f"  '@anthropic-ai/claude-agent-sdk': {version}", f"  '@anthropic-ai/claude-agent-sdk-linux-x64': {version}"]
+    ws.write_text("\n".join(out) + "\n")
+    run(["dsh", "plugin", "--profile", PROFILE.name, "install"], check=True, timeout=1200)
+    for pk in ("@anthropic-ai/claude-agent-sdk", "@anthropic-ai/claude-agent-sdk-linux-x64"):
+        got = pkgjson(PROFILE / "node_modules" / pk / "package.json").get("version")
+        if got != version:
+            raise RuntimeError(f"profile {pk}@{got}, expected {version}")
+    shutil.copy(ws, ROOT / "config/headless.pnpm-workspace.yaml")
+
+
+def snap_dsh_profile(snap):
+    dst = snap.d / "dsh-profile"
+    run(["cp", "-a", "--reflink=auto", str(PROFILE), str(dst)], check=True, timeout=900)
+    cfg = snap.d / "headless.package.json"
+    shutil.copy(ROOT / "config/headless.package.json", cfg)
+    snap.items.append({"kind": "dsh-profile", "path": str(PROFILE), "backup": str(dst), "cfg_backup": str(cfg)})
+
+
+def snap_file_sudo(snap, kind, path):
+    dst = snap.d / kind / Path(path).name
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    run(["sudo", "-n", "cp", "-a", str(path), str(dst)], check=True)
+    snap.items.append({"kind": "file", "path": str(path), "backup": str(dst)})
+
+
+def restore_file(it):
+    run(["sudo", "-n", "cp", "-a", it["backup"], it["path"]], check=True)
+
+
+def apply_oc_copy():
+    src = oc_global_bin()
+    run(["sudo", "-n", "install", "-o", "factory-oc", "-g", "factory-oc", "-m", "755", str(src), str(OC_ISO_BIN)], check=True, timeout=300)
+    if sha256(OC_ISO_BIN, sudo=True) != sha256(src):
+        raise RuntimeError("factory-oc opencode copy checksum mismatch")
+
+
+def apply_uv(a, staging):
+    tag = a["to"]
+    base = f"https://github.com/astral-sh/uv/releases/download/{tag}"
+    tgz = staging / "uv.tar.gz"
+    urllib.request.urlretrieve(f"{base}/uv-x86_64-unknown-linux-gnu.tar.gz", tgz)
+    sumtxt = urllib.request.urlopen(f"{base}/uv-x86_64-unknown-linux-gnu.tar.gz.sha256", timeout=60).read().decode()
+    if sumtxt.split()[0] != sha256(tgz):
+        raise RuntimeError("uv tarball checksum mismatch")
+    run(["tar", "-xzf", str(tgz), "-C", str(staging)], check=True)
+    d = staging / "uv-x86_64-unknown-linux-gnu"
+    v = run([str(d / "uv"), "--version"]).stdout.split()
+    if len(v) < 2 or v[1] != tag:
+        raise RuntimeError(f"staged uv reports {v}")
+    uvp = Path(which("uv"))
+    for b in ("uv", "uvx"):
+        if (d / b).exists():
+            run(["sudo", "-n", "install", "-m", "755", str(d / b), str(uvp.parent / b)], check=True)
+
+
+def apply_python(a):
+    run(["uv", "python", "install", a["to"]], check=True, timeout=900)
+    p = run(["uv", "python", "find", a["to"]], check=True).stdout.strip()
+    link = HOME / ".local/bin/python3.12"
+    tmp = link.with_name("python3.12.new")
+    if tmp.exists() or tmp.is_symlink():
+        tmp.unlink()
+    os.symlink(p, tmp)
+    os.replace(tmp, link)
+
+
+def apply_agmsg(a):
+    run(["git", "-C", str(AGMSG_CLONE), "fetch", "--depth", "1", "origin", "tag", a["tag"]], check=True)
+    run(["git", "-C", str(AGMSG_CLONE), "checkout", "-q", "--detach", a["tag"]], check=True)
+    p = run(["./install.sh", "--update"], cwd=str(AGMSG_CLONE), timeout=300, env={**os.environ, "CI": "1"})
+    if p.returncode != 0:
+        raise RuntimeError(f"agmsg install.sh --update rc={p.returncode}: {p.stderr[-400:]}")
+
+
+def apply_apt(pkgs):
+    p = run(["sudo", "-n", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "--only-upgrade"] + pkgs, timeout=1800)
+    if p.returncode != 0:
+        raise RuntimeError(f"apt-get install failed: {p.stderr[-400:]}")
+
+
+def dpkg_ver(pkg):
+    p = run(["dpkg-query", "-W", "-f", "${Version}", pkg])
+    return p.stdout.strip() if p.returncode == 0 else None
+
+
+# ---------- verify ----------
+def verify_steps(stamp):
+    # The test count is chosen by the CC spec step (13–34 observed), so a fixed 18 flakes; require the
+    # dry run's gate/claude PASS + all acceptance OK + a sanity floor instead.
+    min_acc = int(os.environ.get("FACTORY_UPDATE_MIN_ACCEPTANCE", "10"))
+    pong_env = f"PATH={ROOT}/bin:{HOME}/.local/bin:$PATH"
+    dry_id = f"update-verify-{stamp}"
+    return [
+        ("factory-doctor", f"{ROOT}/bin/factory-doctor"),
+        ("pong-cc", f"set -o pipefail; env {pong_env} factory-step --json '{PONG}' | tee /dev/stderr | {PONG_CHECK}"),
+        ("pong-opencode", f"set -o pipefail; env {pong_env} FACTORY_PROVIDER=opencode factory-step --json '{PONG}' | tee /dev/stderr | {PONG_CHECK}"),
+        ("oc-leak-check", f"{ROOT}/bin/factory-oc-leak-check"),
+        ("cc-fs-allowlist", f"node {ROOT}/local/tests/test-cc-allowlist.mjs && bash {ROOT}/local/tests/test_cc_fs_allowlist.sh"),
+        ("local-dry-run", f"set -o pipefail; {ROOT}/bin/factory-local-dry-run {dry_id} 2>&1 | tee {ROOT}/local/updates/.verify-{dry_id}.log && cd {ROOT}/dry-runs/{dry_id} && "
+                          f"PYTHONPATH=src python3.12 -m unittest discover -s tests/acceptance 2>&1 | tee /tmp/{dry_id}.acc | tail -3; "
+                          f"n=$(grep -oP 'Ran \\K[0-9]+' /tmp/{dry_id}.acc); grep -q '^OK' /tmp/{dry_id}.acc && [ \"${{n:-0}}\" -ge {min_acc} ] && "
+                          f"grep -q 'GATE: PASS' {ROOT}/local/updates/.verify-{dry_id}.log"),
+    ]
+
+
+def run_verify(d, stamp):
+    override = os.environ.get("FACTORY_UPDATE_VERIFY_CMD")
+    steps = [("verify-override", override)] if override else verify_steps(stamp)
+    results = []
+    for name, cmd in steps:
+        log(f"verify: {name}")
+        t0 = time.time()
+        p = run(["bash", "-c", cmd], timeout=int(os.environ.get("FACTORY_UPDATE_VERIFY_TIMEOUT", "2400")))
+        (d / f"verify-{name}.log").write_text(p.stdout + "\n--- stderr ---\n" + p.stderr)
+        results.append({"step": name, "rc": p.returncode, "secs": round(time.time() - t0, 1), "log": str(d / f"verify-{name}.log")})
+        if p.returncode != 0:
+            return False, results
+    return True, results
+
+
+def post_apply(changed_kinds):
+    """Re-apply CC allowlist patch + pstack (factory-setup is idempotent) and resync factory-oc OpenCode."""
+    if os.environ.get("FACTORY_UPDATE_SKIP_POST"):
+        return []
+    notes = []
+    p = run([str(ROOT / "bin/factory-setup")], timeout=900)
+    notes.append(f"factory-setup rc={p.returncode}")
+    if p.returncode != 0:
+        raise RuntimeError(f"factory-setup failed: {p.stderr[-400:]}")
+    if oc_global_bin().exists() and sha256(oc_global_bin()) != sha256(OC_ISO_BIN, sudo=True):
+        apply_oc_copy()
+        notes.append("factory-oc opencode resynced")
+    return notes
+
+
+def doctor():
+    if os.environ.get("FACTORY_UPDATE_SKIP_DOCTOR"):
+        return 0
+    cmd = os.environ.get("FACTORY_UPDATE_DOCTOR_CMD", str(ROOT / "bin/factory-doctor"))
+    return run(["bash", "-c", cmd], timeout=600).returncode
+
+
+def append_log(entry):
+    lp = UPD / "UPDATES-LOG.md"
+    new = not lp.exists()
+    with lp.open("a") as f:
+        if new:
+            f.write("# factory-update log (linked from DECISIONS.md)\n\n")
+        f.write(entry + "\n")
+
+
+def do_apply(rep):
+    t = now()
+    stamp = t.strftime("%Y%m%d-%H%M%S")
+    d = UPD / t.strftime("%Y-%m-%d") / f"apply-{t.strftime('%H%M%S')}"
+    d.mkdir(parents=True, exist_ok=True)
+    auto = [a for a in rep["actions"] if a["class"] == "auto"]
+    pending = [a for a in rep["actions"] if a["class"] == "needs-approval"]
+    res = {"started": t.isoformat(timespec="seconds"), "dir": str(d), "auto": auto, "needs_approval": pending,
+           "applied": [], "verify": [], "notes": []}
+    if not auto:
+        res["status"] = "needs-approval" if pending else "nothing-to-do"
+        return res
+    snap = Snapshot(d / "snapshot")
+    staging = Path(tempfile.mkdtemp(prefix="factory-update-stage-"))
+    order = {"npm": 0, "cc-sdk": 0.5, "agmsg-skill": 1, "oc-copy": 2, "uv": 3, "python": 4, "apt": 5}
+    auto.sort(key=lambda a: order.get(a["kind"], 9))
+    try:
+        # snapshot everything first
+        snap.items.append({"kind": "versions", "npm": npm_globals(),
+                           "uv": run(["uv", "--version"]).stdout.strip(), "python3.12": os.path.realpath(HOME / ".local/bin/python3.12")})
+        for a in auto:
+            if a["kind"] == "npm":
+                snap_npm(snap, a)
+                if a["name"] == DSH_PKG and not os.environ.get("FACTORY_UPDATE_SKIP_POST"):
+                    snap_dsh_profile(snap)
+            elif a["kind"] == "cc-sdk":
+                if not any(i.get("kind") == "dsh-profile" for i in snap.items):
+                    snap_dsh_profile(snap)
+            elif a["kind"] == "agmsg-skill":
+                dst = snap.d / "agmsg-skill"
+                run(["cp", "-a", str(AGMSG_SKILL), str(dst)], check=True)
+                snap.items.append({"kind": "agmsg", "clone_head": git(["rev-parse", "HEAD"], AGMSG_CLONE).stdout.strip(), "skill_backup": str(dst)})
+            elif a["kind"] == "uv":
+                for b in ("uv", "uvx"):
+                    p = Path(which("uv")).parent / b
+                    if p.exists():
+                        snap_file_sudo(snap, "uv", p)
+            elif a["kind"] == "python":
+                snap.items.append({"kind": "python-link", "path": str(HOME / ".local/bin/python3.12"), "target": os.readlink(HOME / ".local/bin/python3.12")})
+            elif a["kind"] == "apt":
+                snap.items.append({"kind": "apt", "package": a["name"], "version": dpkg_ver(a["name"])})
+        if (not os.environ.get("FACTORY_UPDATE_SKIP_POST") and any(a["kind"] in ("npm", "oc-copy") for a in auto)
+                and run(["sudo", "-n", "test", "-f", str(OC_ISO_BIN)]).returncode == 0):
+            snap_file_sudo(snap, "factory-oc", OC_ISO_BIN)
+        snap.save()
+        log(f"snapshot saved: {snap.d}")
+        apt_pkgs = [a["name"] for a in auto if a["kind"] == "apt"]
+        for a in auto:
+            log(f"apply: {a['id']}")
+            if a["kind"] == "npm":
+                apply_npm(a, staging)
+            elif a["kind"] == "cc-sdk":
+                apply_cc_sdk(a["to"])
+            elif a["kind"] == "agmsg-skill":
+                apply_agmsg(a)
+            elif a["kind"] == "oc-copy":
+                apply_oc_copy()
+            elif a["kind"] == "uv":
+                apply_uv(a, staging)
+            elif a["kind"] == "python":
+                apply_python(a)
+            elif a["kind"] == "apt":
+                continue
+            res["applied"].append(a["id"])
+        if apt_pkgs:
+            apply_apt(apt_pkgs)
+            res["applied"] += [f"apt:{p}" for p in apt_pkgs]
+        res["notes"] += post_apply({a["kind"] for a in auto})
+        ok, vres = run_verify(d, stamp)
+        res["verify"] = vres
+        if not ok:
+            failed = vres[-1]
+            raise VerifyFailed(f"verify step {failed['step']} failed rc={failed['rc']} (log {failed['log']})")
+        res["status"] = "updated-ok"
+    except Exception as e:
+        reason = str(e)
+        log(f"FAILED: {reason} -> rolling back")
+        res["rollback_reason"] = reason
+        try:
+            rollback(snap)
+            res["doctor_after_rollback_rc"] = doctor()
+            res["status"] = "rolled-back"
+        except Exception as e2:
+            res["status"] = "error"
+            res["rollback_error"] = str(e2)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    res["finished"] = now().isoformat(timespec="seconds")
+    (d / "result.json").write_text(json.dumps(res, indent=2, ensure_ascii=False))
+    entry = (f"- {res['finished']}: **{res['status']}** — applied: {', '.join(res['applied']) or 'none'}"
+             + (f"; reason: {res.get('rollback_reason')}" if res.get("rollback_reason") else "")
+             + f"; pending approval: {len(pending)}; details `{d.relative_to(UPD) if str(d).startswith(str(UPD)) else d}/result.json`")
+    append_log(entry)
+    return res
+
+
+class VerifyFailed(RuntimeError):
+    pass
+
+
+def rollback(snap):
+    items = snap.items
+    for it in reversed(items):
+        k = it["kind"]
+        if k == "npm":
+            restore_npm(it)
+        elif k == "dsh-profile":
+            shutil.rmtree(it["path"])
+            run(["cp", "-a", "--reflink=auto", it["backup"], it["path"]], check=True, timeout=900)
+            shutil.copy(it["cfg_backup"], ROOT / "config/headless.package.json")
+        elif k == "file":
+            restore_file(it)
+        elif k == "python-link":
+            p = Path(it["path"])
+            if p.is_symlink() or p.exists():
+                p.unlink()
+            os.symlink(it["target"], p)
+        elif k == "agmsg":
+            run(["git", "-C", str(AGMSG_CLONE), "checkout", "-q", "--detach", it["clone_head"]])
+            if AGMSG_SKILL.exists():
+                shutil.rmtree(AGMSG_SKILL)
+            run(["cp", "-a", it["skill_backup"], str(AGMSG_SKILL)], check=True)
+        elif k == "apt" and it.get("version"):
+            # best effort: old .deb may no longer be on the mirror
+            run(["sudo", "-n", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "--allow-downgrades",
+                 f"{it['package']}={it['version']}"], timeout=900)
+    if not os.environ.get("FACTORY_UPDATE_SKIP_POST"):
+        run([str(ROOT / "bin/factory-setup")], timeout=900)
+    log("rollback done")
+
+
+# ---------- summary / daily ----------
+def write_summary(status, rep=None, res=None, err=None):
+    t = now().isoformat(timespec="seconds")
+    L = [f"# factory-update summary", "", f"- status: **{status}**", f"- time: {t}", f"- exit code: {EXIT.get(status, 1)}"]
+    if rep and rep.get("_path"):
+        L.append(f"- check: `{rep['_path']}`")
+    if res:
+        L.append(f"- apply result: {res.get('status')}")
+        L.append(f"- applied: {', '.join(res.get('applied', [])) or 'none'}")
+        if res.get("rollback_reason"):
+            L.append(f"- rolled back, reason: {res['rollback_reason']}")
+            L.append(f"- factory-doctor after rollback rc={res.get('doctor_after_rollback_rc')}")
+        for v in res.get("verify", []):
+            L.append(f"- verify {v['step']}: rc={v['rc']} ({v['secs']}s)")
+    pend = [a for a in (rep or {}).get("actions", []) if a["class"] == "needs-approval"]
+    if pend:
+        L += ["", "## needs-approval"] + [f"- {a['name']}: {a['from']} -> {a['to']} ({a['reason']})" for a in pend]
+    if rep and rep.get("warnings"):
+        L += ["", "## warnings"] + [f"- {w}" for w in rep["warnings"]]
+    if err:
+        L += ["", f"## error", f"- {err}"]
+    UPD.mkdir(parents=True, exist_ok=True)
+    (UPD / "latest-summary.md").write_text("\n".join(L) + "\n")
+    print("\n".join(L))
+
+
+def final_status(rep, res):
+    pend = any(a["class"] == "needs-approval" for a in rep["actions"])
+    if res is None:
+        return "needs-approval" if pend else "nothing-to-do"
+    if res["status"] in ("rolled-back", "error"):
+        return res["status"]
+    if res["status"] == "updated-ok":
+        return "needs-approval" if pend else "updated-ok"
+    return res["status"]
+
+
+def with_lock(fn):
+    UPD.mkdir(parents=True, exist_ok=True)
+    fh = open(UPD / ".lock", "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log("another factory-update run holds the lock; exiting 75")
+        return 75
+    fh.write(str(os.getpid())); fh.flush()
+    try:
+        return fn()
+    finally:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def approve(rep, args):
+    """Explicit human approval: reclassify matching needs-approval items as auto for THIS apply only."""
+    wanted = [args[i + 1] for i, a in enumerate(args) if a == "--approve"]
+    for w in wanted:
+        hits = [a for a in rep["actions"] if a["class"] == "needs-approval" and a["kind"] != "info"
+                and w in (a["id"], f"{a['name']}@{a['to']}", a["name"])]
+        if len(hits) != 1:
+            raise RuntimeError(f"--approve {w}: matched {len(hits)} applicable items ({[a['id'] for a in hits]}); use the exact id or name@version")
+        hits[0]["class"] = "auto"
+        hits[0]["approved"] = True
+        hits[0]["reason"] += " [approved]"
+        log(f"approved: {hits[0]['id']}")
+    return rep
+
+
+def load_check(args):
+    if "--check-json" in args:
+        return json.loads(Path(args[args.index("--check-json") + 1]).read_text())
+    return None
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__); return 0
+    cmd, args = argv[0], argv[1:]
+
+    def _check():
+        try:
+            rep = do_check()
+            return 1 if rep["errors"] else 0
+        except Exception as e:
+            log(f"check error: {e}"); return 1
+
+    def _apply(daily=False):
+        rep = None
+        try:
+            rep = load_check(args) or do_check()
+            if not daily:
+                rep = approve(rep, args)
+            if daily and rep.get("errors") and not any(a["class"] == "auto" for a in rep["actions"]):
+                write_summary("error", rep, None, "; ".join(rep["errors"])); return EXIT["error"]
+            res = do_apply(rep) if any(a["class"] == "auto" for a in rep["actions"]) else None
+            st = final_status(rep, res)
+            write_summary(st, rep, res, "; ".join(rep.get("errors", [])) or None)
+            # updated-ok with pending approvals → report as needs-approval but keep the "updated" fact in summary
+            if res and res["status"] == "updated-ok" and st == "needs-approval":
+                return EXIT["needs-approval"]
+            return EXIT[st]
+        except Exception as e:
+            write_summary("error", rep, None, str(e)); return EXIT["error"]
+
+    if cmd == "check":
+        return with_lock(_check)
+    if cmd == "apply":
+        return with_lock(lambda: _apply(False))
+    if cmd == "daily":
+        return with_lock(lambda: _apply(True))
+    print(__doc__); return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

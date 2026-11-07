@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# OpenCode isolation leak check (P3 "Test B", 14 items). No model call; never prints secret values.
+# Derives the sandbox from the real launcher: copies bin/opencode-acp-isolated, swaps only the final
+# `"$OC_BIN" acp` for a probe script, and runs it through the same root -> factory-oc -> bwrap path.
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+[[ -n "${OPENCODE_GO_KEY:-}" ]] || die "OPENCODE_GO_KEY must be set (presence only)"
+T=$(mktemp -d /tmp/factory-leak-XXXXXX); chmod 755 "$T"
+WS=/var/factory/oc-workspaces/leak-$(date +%Y%m%d-%H%M%S)-$$
+sudo -n mkdir -p "$WS/.git"
+trap 'sudo -n rm -rf "$T" "$WS"' EXIT
+grep -q '"$OC_BIN" acp' "$FACTORY_ROOT/bin/opencode-acp-isolated" || die "launcher shape changed; update leak check"
+sed 's#"$OC_BIN" acp#/bin/sh "$WS/.probe.sh"#' "$FACTORY_ROOT/bin/opencode-acp-isolated" > "$T/launcher"
+chmod 755 "$T/launcher"
+cat > "$T/probe.sh" <<'PROBE'
+n=0; f=0
+chk() { n=$((n+1)); if eval "$2"; then echo "PASS $n $1"; else echo "FAIL $n $1"; f=$((f+1)); fi; }
+for v in CLAUDE_CODE_OAUTH_TOKEN GITHUB_TOKEN GH_TOKEN GIT_ASKPASS SAND_BOX_PERSISTENT_KEYRING DEEPSEEK_API_KEY OPENCODE_GO_KEY; do
+  chk "env $v absent" "[ -z \"\${$v:-}\" ]"
+done
+chk "env OPENCODE_API_KEY present" '[ -n "${OPENCODE_API_KEY:-}" ]'
+chk "only secretish env is OPENCODE_API_KEY" '[ "$(env | cut -d= -f1 | grep -Ei "token|key|secret|pass|auth" | grep -vx OPENCODE_API_KEY | wc -l)" -eq 0 ]'
+chk "/home/box hidden" '[ ! -e /home/box ]'
+chk "box-secrets hidden" '[ ! -e /home/box/sand-data/box-secrets.json ] && [ ! -e /home/box/sand-data/host-secrets.json ]'
+chk "~/.dsh hidden" '[ ! -e /home/box/.dsh ]'
+chk "/workspace (factory config) hidden" '[ ! -e /workspace/factory/config ] && [ ! -e /workspace ]'
+chk ".git stripped from workspace" '[ ! -e "$PWD/.git" ]'
+echo "leak-check: $((n-f))/$n PASS"; [ "$f" -eq 0 ] && [ "$n" -eq 14 ]
+PROBE
+sudo -n cp "$T/probe.sh" "$WS/.probe.sh"
+# Secret goes via the environment (never argv). Canary vars must be stripped by the launcher.
+export FACTORY_OC_WORKSPACE="$WS" GH_TOKEN=leak-canary DEEPSEEK_API_KEY=leak-canary CLAUDE_CODE_OAUTH_TOKEN=leak-canary
+sudo -n --preserve-env=OPENCODE_GO_KEY,FACTORY_OC_WORKSPACE,GH_TOKEN,DEEPSEEK_API_KEY,CLAUDE_CODE_OAUTH_TOKEN "$T/launcher"

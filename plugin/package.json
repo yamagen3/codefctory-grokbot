@@ -1,0 +1,12 @@
+{
+  "name": "factory-orchestrator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "description": "Model-less DSH factory step runner: drives Claude Code via ctx.subagents.startActivation",
+  "dependencies": {
+    "@deepseek-ai/dsh-brand": "0.2.1-rc.5",
+    "@deepseek-ai/schemastery": "~3.18.5"
+  }
+}

@@ -1,0 +1,2 @@
+- Confirm default STATE_DIR when omitted (`.` vs requiring an argument).
+- Exact duration calculation when only start/end agmsg lines exist.

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Guard: fail if spec/, tests/acceptance/, or .github/ differ from spec/<id> tag.
+# Runnable locally and from .github/workflows/guard.yml (same script).
+# Usage: factory-guard <repo> <id> [base-ref]
+# Env: FACTORY_GUARD_BASE (default spec/<id>)
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+REPO="${1:-}"; ID="${2:-}"; BASE="${3:-${FACTORY_GUARD_BASE:-spec/${ID}}}"
+[[ -n "$REPO" && -n "$ID" ]] || die "usage: factory-guard <repo> <id> [base-ref]"
+REPO="$(resolve_repo "$REPO")"
+cd "$REPO"
+git rev-parse -q --verify "$BASE^{commit}" >/dev/null || die "missing base ref $BASE"
+PATHS=(spec tests/acceptance .github)
+# Collect changed files under protected paths vs base
+mapfile -t CHANGED < <(git diff --name-only "$BASE"...HEAD -- "${PATHS[@]}" || true)
+if [[ ${#CHANGED[@]} -eq 0 ]]; then
+  echo "factory-guard: PASS (no protected-path changes vs $BASE)"
+  exit 0
+fi
+echo "factory-guard: FAIL protected paths changed vs $BASE:" >&2
+printf '  %s\n' "${CHANGED[@]}" >&2
+exit 1

@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Commit statuses via FACTORY_BACKEND=local|github (default local).
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+export PYTHONPATH="${FACTORY_ROOT}/lib${PYTHONPATH:+:$PYTHONPATH}"
+CMD="${1:-}"; shift || true
+case "$CMD" in
+  set)
+    REPO="${1:-}"; SHA="${2:-}"; CTX="${3:-}"; STATE="${4:-}"; DESC="${5:-}"
+    [[ -n "$REPO" && -n "$SHA" && -n "$CTX" && -n "$STATE" ]] || die "usage: factory-status set <repo> <sha> <context> <state> [desc]"
+REPO="$(resolve_repo "$REPO")"
+    exec python3 -m factory_github status-set "$REPO" "$SHA" "$CTX" "$STATE" "$DESC"
+    ;;
+  get)
+    REPO="${1:-}"; SHA="${2:-}"; CTX="${3:-}"
+    [[ -n "$REPO" && -n "$SHA" ]] || die "usage: factory-status get <repo> <sha> [context]"
+REPO="$(resolve_repo "$REPO")"
+    exec python3 -m factory_github status-get "$REPO" "$SHA" ${CTX:+"$CTX"}
+    ;;
+  all)
+    REPO="${1:-}"; SHA="${2:-}"
+    [[ -n "$REPO" && -n "$SHA" ]] || die "usage: factory-status all <repo> <sha>"
+REPO="$(resolve_repo "$REPO")"
+    exec python3 -m factory_github status-get "$REPO" "$SHA"
+    ;;
+  required-ok)
+    REPO="${1:-}"; SHA="${2:-}"
+    [[ -n "$REPO" && -n "$SHA" ]] || die "usage: factory-status required-ok <repo> <sha>"
+REPO="$(resolve_repo "$REPO")"
+    exec python3 -m factory_github status-required-ok "$REPO" "$SHA"
+    ;;
+  *) die "usage: factory-status set|get|all|required-ok ..." ;;
+esac

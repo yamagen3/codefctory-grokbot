@@ -1,0 +1,16 @@
+[project]
+name = "factory-timeline"
+version = "0.0.0"
+description = "Factory log aggregation CLI + offline HTML dashboard (stdlib only)"
+requires-python = ">=3.12"
+readme = "README.md"
+
+[project.scripts]
+factory-timeline = "factory_timeline.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

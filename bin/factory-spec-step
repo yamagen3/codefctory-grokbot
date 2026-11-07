@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Spec step: Claude Code may write only spec/ + tests/acceptance/ (FS allowlist + verify).
+unset FACTORY_OC_WORKSPACE || true
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+
+REPO="${1:-}"; ID="${2:-}"; shift 2 || true
+[[ -n "$REPO" && -n "$ID" ]] || die "usage: factory-spec-step <work-repo> <id> [brief...]"
+REPO="$(resolve_repo "$REPO")"
+[[ -d "$REPO/.git" ]] || die "not a git repo: $REPO"
+BRIEF="${*:-}"
+if [[ -z "$BRIEF" ]]; then
+  if [[ -f "$REPO/spec/PRODUCT.md" ]]; then
+    BRIEF="Refine and freeze the product described in existing spec/PRODUCT.md. Keep stdlib-only Python 3.12 unless the brief says otherwise."
+  else
+    BRIEF="Build a stdlib-only Python CLI. Keep open questions short."
+  fi
+fi
+
+BRANCH="factory/${ID}"
+cd "$REPO"
+git checkout -B "$BRANCH"
+
+# Package / CLI name hint from pyproject if present (optional)
+PKG_HINT=""
+if [[ -f pyproject.toml ]]; then
+  PKG_HINT=$(python3 -c "import re,pathlib; t=pathlib.Path('pyproject.toml').read_text(); m=re.search(r'(?m)^name\s*=\s*\"([^\"]+)\"', t); print(m.group(1) if m else '')" 2>/dev/null || true)
+fi
+
+TASK="You are the factory SPEC step. Working directory is the product repo.
+
+Create or update ONLY under spec/ and tests/acceptance/:
+- spec/PRODUCT.md — concise, testable product spec (Python stdlib only unless the brief explicitly allows deps; target Python 3.12+). Include CLI invocation, I/O, errors, and constraints.
+- tests/acceptance/ — real unittest acceptance tests that encode frozen behavior (may fail until implemented). Prefer fixtures under tests/acceptance/fixtures/ with no secrets.
+- spec/OPEN_QUESTIONS.md — open questions for the human (bullet list). If none, write: None.
+- spec/IMPL_STRATEGY.md — decide OpenCode IMPL parallelism for this run. First line MUST be machine-readable:
+    parallel: <N>
+  where N is an integer 1..4 (cap 4). Below that, write a short Japanese and/or English rationale.
+
+  Parallel-first guidance (you decide N; humans do not set it via env):
+  - Prefer N≥2 when the work can usefully diverge (multiple approaches, independent modules, flaky single-shot risk).
+  - Use N=1 only when the change is tiny/sequential or parallelism would waste OpenCode Go quota without benefit.
+  - Be concrete about why this N fits THIS product/spec.
+
+Do not implement the product under src/ beyond what already exists as a scaffold. Do not modify .github/. Keep changes minimal.
+Package/CLI name hint from pyproject: ${PKG_HINT:-unknown}
+Brief: ${BRIEF}"
+
+export FACTORY_CC_STEP=spec
+factory-cc-fs-allowlist apply "$REPO" spec
+set +e
+FACTORY_USAGE_STEP=spec FACTORY_USAGE_RUN_ID="${FACTORY_USAGE_RUN_ID:-$ID}" FACTORY_PROVIDER=claude-code factory-step --json "$TASK" | tee /tmp/factory-spec-step.json
+EC=${PIPESTATUS[0]}
+set -e
+factory-cc-fs-allowlist restore "$REPO"
+factory-cc-fs-allowlist verify "$REPO" spec || die "spec step wrote outside allowlist"
+echo "factory-spec-step: branch=${BRANCH} ec=${EC}"
+exit "$EC"

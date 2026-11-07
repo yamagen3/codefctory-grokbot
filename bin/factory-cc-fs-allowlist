@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Filesystem allowlist for Claude Code steps (enforcement; see DECISIONS.md).
+# Usage:
+#   factory-cc-fs-allowlist apply <repo> spec|gate
+#   factory-cc-fs-allowlist restore <repo>
+#   factory-cc-fs-allowlist verify <repo> spec|gate
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+CMD="${1:-}"; REPO="${2:-}"; STEP="${3:-}"
+[[ -n "$CMD" && -n "$REPO" ]] || die "usage: factory-cc-fs-allowlist apply|restore|verify <repo> [step]"
+REPO="$(resolve_repo "$REPO")"
+cd "$REPO"
+META=".factory-cc-fs-state"
+
+apply_spec() {
+  # Make everything read-only, then reopen allowed trees
+  find . -path ./.git -prune -o -type f -exec chmod a-w {} +
+  find . -path ./.git -prune -o -type d -exec chmod a-w {} + 2>/dev/null || true
+  # dirs need +x to traverse; reopen dirs writable for allowed only
+  find . -path ./.git -prune -o -type d -exec chmod u+rwx {} + 2>/dev/null || true
+  find . -path ./.git -prune -o -type f -exec chmod u+rw {} + 2>/dev/null || true
+  # Actually: start from normal, then lock disallowed
+  git checkout -q -- . 2>/dev/null || true
+  # Reset perms to user writable first
+  find . -path ./.git -prune -o -exec chmod u+rwX {} + 2>/dev/null || true
+  # Lock files outside allowlist
+  while IFS= read -r -d '' f; do
+    rel="${f#./}"
+    case "$rel" in
+      spec|spec/*|tests/acceptance|tests/acceptance/*|.factory-cc-fs-state) ;;
+      *) chmod a-w "$f" 2>/dev/null || true ;;
+    esac
+  done < <(find . -path ./.git -prune -o -type f -print0)
+  # Lock disallowed directories against create (sticky approach: chmod a-w on parent dirs except allowed)
+  while IFS= read -r -d '' d; do
+    rel="${d#./}"
+    case "$rel" in
+      .|spec|spec/*|tests|tests/acceptance|tests/acceptance/*) chmod u+rwx "$d" ;;
+      *) chmod a-w "$d" 2>/dev/null || chmod u+x "$d" 2>/dev/null || true ;;
+    esac
+  done < <(find . -path ./.git -prune -o -type d -print0)
+  # Ensure allowed dirs writable
+  mkdir -p spec tests/acceptance
+  chmod -R u+rwX spec tests/acceptance
+  echo "spec" > "$META"
+  echo "factory-cc-fs-allowlist: applied spec"
+}
+
+apply_gate() {
+  find . -path ./.git -prune -o -type f -exec chmod a-w {} +
+  find . -path ./.git -prune -o -type d -exec chmod u+rx {} + 2>/dev/null || true
+  echo "gate" > "$META"
+  echo "factory-cc-fs-allowlist: applied gate (read-only)"
+}
+
+restore() {
+  find . -path ./.git -prune -o -exec chmod u+rwX {} + 2>/dev/null || true
+  rm -f "$META"
+  echo "factory-cc-fs-allowlist: restored"
+}
+
+verify() {
+  local step="${STEP:-$(cat "$META" 2>/dev/null || echo spec)}"
+  mapfile -t dirty < <(git status --porcelain | awk '{print $2}')
+  bad=()
+  for f in "${dirty[@]:-}"; do
+    [[ -z "$f" ]] && continue
+    case "$step" in
+      spec)
+        case "$f" in
+          spec/*|tests/acceptance/*) ;;
+          *) bad+=("$f") ;;
+        esac
+        ;;
+      gate)
+        bad+=("$f")
+        ;;
+    esac
+  done
+  if [[ ${#bad[@]} -gt 0 ]]; then
+    echo "factory-cc-fs-allowlist: VERIFY FAIL disallowed changes:" >&2
+    printf '  %s\n' "${bad[@]}" >&2
+    # revert disallowed
+    git checkout -- "${bad[@]}" 2>/dev/null || true
+    git clean -fd -- "${bad[@]}" 2>/dev/null || true
+    return 1
+  fi
+  echo "factory-cc-fs-allowlist: VERIFY PASS step=$step"
+}
+
+case "$CMD" in
+  apply)
+    case "$STEP" in
+      spec) apply_spec ;;
+      gate) apply_gate ;;
+      *) die "step must be spec|gate" ;;
+    esac
+    ;;
+  restore) restore ;;
+  verify) verify ;;
+  *) die "unknown $CMD" ;;
+esac

@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""factory-usage — token / wall-clock usage of factory steps, plus agmsg backlog.
+
+Report:
+  factory-usage show    [--date YYYY-MM-DD] [--run ID] [--target T] [--json]
+  factory-usage summary [--date D] [--run ID] [--target T] [--by day,provider,step] [--json]
+  factory-usage agmsg   [--date D] [--json]
+  factory-usage balance [--json] [--snapshot] [--quiet]   OpenCode Go remaining (rolling 5h / weekly / monthly)
+Hooks (called by factory-step / runners; never fail the caller):
+  factory-usage oc-stats                      print OpenCode lifetime token stats JSON (factory-oc)
+  factory-usage record-step --provider P --started ISO --ended ISO --duration-ms N --exit N
+                            [--result-file F] [--cc-usage-file F] [--oc-before JSON] [--oc-after JSON] [--notes S]
+  factory-usage record --step S --provider P --started ISO --ended ISO [--exit N] [--notes S]
+  factory-usage agmsg-poll before|after
+  factory-usage agmsg-send --duration-ms N --exit N
+  factory-usage run-summary <run_id> [--wall-ms N] [--status S] [--print]
+Context env: FACTORY_USAGE_RUN_ID, FACTORY_TARGET_NAME, FACTORY_USAGE_ROUND, FACTORY_USAGE_STEP.
+Storage: local/usage/<date>/{steps,agmsg,runs}.jsonl (FACTORY_USAGE_DIR overrides).
+"""
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import factory_usage as U  # noqa: E402
+
+
+def opt(args, name, default=None):
+    return args[args.index(name) + 1] if name in args else default
+
+
+def ctx():
+    return {"run_id": os.environ.get("FACTORY_USAGE_RUN_ID"), "target": os.environ.get("FACTORY_TARGET_NAME"),
+            "round": os.environ.get("FACTORY_USAGE_ROUND"), "step": os.environ.get("FACTORY_USAGE_STEP")}
+
+
+def filtered(args):
+    recs = U.read("steps", opt(args, "--date"))
+    for flag, key in (("--run", "run_id"), ("--target", "target")):
+        v = opt(args, flag)
+        if v:
+            recs = [r for r in recs if r.get(key) == v]
+    return recs
+
+
+def main(a):
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__); return 0
+    cmd, args = a[0], a[1:]
+    if cmd == "show":
+        recs = filtered(args)
+        if "--json" in args:
+            for r in recs:
+                print(json.dumps(r, ensure_ascii=False))
+            return 0
+        for r in recs:
+            tok = "tok=?" if r.get("total_tokens") is None else f"tok={r['input_tokens']}/{r['output_tokens']}"
+            print(f"{r['started_at'][:19]}  {str(r.get('run_id'))[:40]:40}  r{r.get('round') or '-'}  {r['step']:11} {r['provider']:11} "
+                  f"{U.fmt_ms(r['duration_ms']):>9}  {tok:22} exit={r.get('exit_code')} {r.get('stop_reason') or ''}")
+        return 0
+    if cmd == "summary":
+        by = tuple((opt(args, "--by") or "day,provider").split(","))
+        agg = U.summarize(filtered(args), by)
+        if "--json" in args:
+            print(json.dumps([{**dict(zip(by, k)), **v} for k, v in agg.items()], ensure_ascii=False, indent=2))
+        else:
+            print(U.table(agg, by))
+        return 0
+    if cmd == "agmsg":
+        rep = U.agmsg_report(opt(args, "--date"))
+        if "--json" in args:
+            print(json.dumps(rep, ensure_ascii=False, indent=2)); return 0
+        print(f"agmsg sends: {rep['send_count']} (ok {rep['send_ok']}), send time total {rep['send_duration_ms_total']}ms, max {rep['send_duration_ms_max']}ms")
+        if not rep["agents"]:
+            print("unread polls: none (FACTORY_AGMSG_TEAM unset?)")
+        for k, v in rep["agents"].items():
+            print(f"{k}: polls={v['polls']} backlog_peak={v['backlog_peak']} last_unread={v['last_unread']} "
+                  f"catchup_max_ms={v['catchup_duration_ms_max']} backlogged_since={v['still_backlogged_since']}")
+        for s in rep["steps"]:
+            print(f"  {s['run_id']} {s['step']} {s['agent']}: unread {s['unread_before']} -> {s['unread_after']}")
+        return 0
+    if cmd == "balance":
+        rec = U.ocgo_balance()
+        if "--snapshot" in args:
+            try:
+                U.append("balance", rec)
+            except Exception as e:
+                print(f"factory-usage: balance snapshot skipped: {e}", file=sys.stderr)
+        if "--quiet" in args:
+            return 0  # snapshot mode for runners: never fail
+        print(json.dumps(rec, ensure_ascii=False, indent=2) if "--json" in args else U.format_balance(rec))
+        return 0 if rec["ok"] else 3
+    # ---- hooks: swallow errors, always exit 0 ----
+    try:
+        if cmd == "oc-stats":
+            print(json.dumps(U.oc_stats()))
+        elif cmd == "record-step":
+            rf = opt(args, "--result-file")
+            text = Path(rf).read_text(errors="replace") if rf and Path(rf).exists() else ""
+            ob, oa = opt(args, "--oc-before"), opt(args, "--oc-after")
+            U.record_step(opt(args, "--provider"), opt(args, "--started"), opt(args, "--ended"), int(opt(args, "--duration-ms")),
+                          int(opt(args, "--exit")), text, json.loads(ob) if ob else None, json.loads(oa) if oa else None,
+                          [opt(args, "--notes")] if opt(args, "--notes") else None,
+                          cc_usage_text=(Path(opt(args, "--cc-usage-file")).read_text(errors="replace")
+                                         if opt(args, "--cc-usage-file") and Path(opt(args, "--cc-usage-file")).exists() else ""),
+                          **ctx())
+        elif cmd == "record":
+            c = ctx(); c["step"] = opt(args, "--step", c["step"])
+            import datetime as dt
+            s, e = opt(args, "--started"), opt(args, "--ended") or U.now_iso()
+            dur = opt(args, "--duration-ms")
+            if dur is None and s:
+                dur = int((dt.datetime.fromisoformat(e) - dt.datetime.fromisoformat(s)).total_seconds() * 1000)
+            U.record_step(opt(args, "--provider", "system"), s or e, e, int(dur or 0), int(opt(args, "--exit", "0")), "",
+                          notes=[opt(args, "--notes")] if opt(args, "--notes") else None, **c)
+        elif cmd == "agmsg-poll":
+            U.agmsg_poll(args[0] if args else "poll", **ctx())
+        elif cmd == "agmsg-send":
+            U.append("agmsg", {"ts": U.now_iso(), "event": "send", "team": os.environ.get("FACTORY_AGMSG_TEAM"),
+                               "duration_ms": int(opt(args, "--duration-ms", "0")), "exit_code": int(opt(args, "--exit", "0")),
+                               "run_id": os.environ.get("FACTORY_USAGE_RUN_ID"), "step": os.environ.get("FACTORY_USAGE_STEP")})
+        elif cmd == "run-summary":
+            wm = opt(args, "--wall-ms")
+            t = U.run_summary(args[0], int(wm) if wm else None, opt(args, "--status"))
+            if "--print" in args:
+                print(t, end="")
+        else:
+            print(__doc__); return 2
+    except Exception as e:  # usage tracking must never break a factory step
+        print(f"factory-usage: {cmd} skipped: {e}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

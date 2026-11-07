@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Health check: tools, versions, key *names*, isolation, Python 3.12. No secret values.
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+FAIL=0
+ok() { echo "OK  $*"; }
+bad() { echo "FAIL $*"; FAIL=1; }
+warn() { echo "WARN $*"; }
+
+echo "=== factory-doctor $(date -Iseconds) ==="
+
+# Tools
+for c in git python3 node dsh bwrap sudo timeout diff patch; do
+  if command -v "$c" >/dev/null; then ok "cmd $c ($($c --version 2>&1 | head -1 | cut -c1-60))"; else bad "cmd missing: $c"; fi
+done
+command -v python3.12 >/dev/null && ok "python3.12 $(python3.12 -V 2>&1)" || bad "python3.12 missing"
+command -v uv >/dev/null && ok "uv $(uv --version 2>&1)" || warn "uv missing (optional after 3.12 installed)"
+command -v agmsg >/dev/null && ok "agmsg present" || warn "agmsg missing"
+
+# DSH / profile
+if [[ -d "$HOME/.dsh/profiles/headless" ]]; then ok "dsh headless profile"; else bad "dsh headless profile missing"; fi
+CC_JS="$HOME/.dsh/profiles/headless/node_modules/@deepseek-ai/dsh-subagent-claude-code/lib/index.js"
+if [[ -f "$CC_JS" ]]; then
+  if grep -q 'FACTORY_CC_STEP' "$CC_JS" && grep -q 'makeCanUseTool' "$CC_JS"; then
+    ok "CC allowlist patch applied"
+    grep -q 'FACTORY_CC_USAGE_FILE' "$CC_JS" && ok "CC usage sidecar patch applied" || warn "CC usage sidecar patch missing (CC tokens will be null; run factory-setup)"
+  else
+    bad "CC allowlist patch NOT applied (run factory-setup)"
+  fi
+else
+  bad "dsh-subagent-claude-code missing"
+fi
+# CC model/effort pin (DECISIONS: claude-opus-5-5 + xhigh)
+PATCH_YML="$FACTORY_ROOT/config/factory.patch.yml"
+grep -qE '^\s*model: claude-opus-5-5\s*$' "$PATCH_YML" && ok "CC model pin claude-opus-5-5" || warn "CC model pin claude-opus-5-5 missing in factory.patch.yml"
+grep -q "CLAUDE_CODE_EFFORT_LEVEL: 'xhigh'" "$PATCH_YML" && ok "CC effort pin xhigh" || warn "CC effort pin xhigh missing in factory.patch.yml"
+[[ -f "$CC_JS" ]] && { grep -q 'claude-agent-sdk.init' "$CC_JS" && ok "CC init capture (effective model/effort) patch" || warn "CC init capture patch missing (run factory-setup)"; }
+[[ -f "$FACTORY_ROOT/plugin/cc-allowlist/allowlist.js" ]] && ok "allowlist.js" || bad "allowlist.js missing"
+
+# Keys present by name only
+for v in OPENCODE_GO_KEY CLAUDE_CODE_OAUTH_TOKEN; do
+  if [[ -n "${!v:-}" ]]; then ok "env $v is set"; else warn "env $v unset"; fi
+done
+if [[ -n "${DEEPSEEK_API_KEY:-}" ]]; then warn "env DEEPSEEK_API_KEY set but unused for OpenCode (prefer OPENCODE_GO_KEY)"; fi
+for v in FACTORY_GITHUB_TOKEN_GROK FACTORY_GITHUB_TOKEN_CC FACTORY_GITHUB_REPO; do
+  if [[ -n "${!v:-}" ]]; then ok "env $v set (github backend ready)"; else warn "env $v unset (ok for local backend)"; fi
+done
+echo "backend=${FACTORY_BACKEND:-local}"
+
+# Isolation
+id factory-oc >/dev/null 2>&1 && ok "user factory-oc" || bad "user factory-oc missing"
+[[ -x "$FACTORY_ROOT/bin/opencode-acp-isolated" ]] && ok "opencode-acp-isolated" || bad "launcher missing"
+[[ -f /etc/sudoers.d/factory-oc-acp ]] && ok "sudoers factory-oc-acp" || bad "sudoers missing"
+if sudo -n test -x /home/factory-oc/bin/opencode 2>/dev/null; then ok "factory-oc opencode"; else bad "factory-oc opencode missing"; fi
+command -v bwrap >/dev/null && ok "bwrap" || bad "bwrap missing"
+
+# Quick bwrap env probe (no network model call)
+WS=$(mktemp -d /tmp/factory-doctor-XXXXXX)
+echo hi > "$WS/x"
+export FACTORY_OC_API_KEY="${OPENCODE_GO_KEY:-dummy-for-doctor}"
+export FACTORY_OC_WORKSPACE="$WS"
+# Only run isolated env check if we have real key structure — use leak probe style inline
+if [[ -n "${OPENCODE_GO_KEY:-}" ]]; then
+  if sudo -n -u factory-oc true 2>/dev/null; then
+    ok "sudo -u factory-oc works"
+  else
+    warn "sudo -u factory-oc failed (may need root path)"
+  fi
+fi
+rm -rf "$WS"
+
+# Unit tests smoke
+export PYTHONPATH="$FACTORY_ROOT/lib${PYTHONPATH:+:$PYTHONPATH}"
+if python3 "$FACTORY_ROOT/local/tests/test_github_backend.py" >/tmp/factory-doctor-gh.txt 2>&1; then
+  ok "test_github_backend"
+else
+  bad "test_github_backend (see /tmp/factory-doctor-gh.txt)"
+fi
+if node "$FACTORY_ROOT/local/tests/test-cc-allowlist.mjs" >/tmp/factory-doctor-cc.txt 2>&1; then
+  ok "test-cc-allowlist"
+else
+  bad "test-cc-allowlist"
+fi
+
+# pstack skills (CC user + factory-oc)
+PIN_FILE="$FACTORY_ROOT/local/pstack-installed-sha"
+WANT_PIN="${FACTORY_PSTACK_PIN_SHA:-79b36d9b53a53c78e5ec26bf6ce7dade76686c87}"
+if [[ -f "$PIN_FILE" ]] && [[ "$(cat "$PIN_FILE")" == "$WANT_PIN" ]]; then
+  ok "pstack pin $WANT_PIN"
+else
+  bad "pstack pin missing/mismatch (run factory-pstack-install / factory-setup)"
+fi
+CC_SKILL="$HOME/.claude/skills/tdd/SKILL.md"
+[[ -f "$CC_SKILL" ]] && ok "pstack CC skill tdd" || bad "pstack CC skill tdd missing"
+OC_SKILL="/home/factory-oc/.agents/skills/tdd/SKILL.md"
+if sudo -n test -f "$OC_SKILL" 2>/dev/null; then ok "pstack OC skill tdd"; else bad "pstack OC skill tdd missing"; fi
+MANIFEST="$FACTORY_ROOT/config/pstack-skills.manifest"
+[[ -f "$MANIFEST" ]] && ok "pstack manifest" || bad "pstack manifest missing"
+
+if [[ "$FAIL" -eq 0 ]]; then
+  echo "=== factory-doctor: PASS ==="
+  exit 0
+fi
+echo "=== factory-doctor: FAIL ==="
+exit 1

@@ -1,0 +1,51 @@
+# Secrets & env
+.env
+.env.*
+*.pem
+*.key
+**/credentials*
+**/auth.json
+**/opencode.db*
+box-secrets*
+
+# Dependencies & caches
+node_modules/
+plugin/node_modules/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Runtime / local simulation state (regenerable)
+dry-runs/
+local/work/
+local/origin/*.git/
+local/status/
+local/labels/
+local/notify/
+local/logs/
+/var/
+*.log
+/tmp/
+
+# Upstream vendored reference (installed separately)
+tools/agmsg/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Python build
+dist/
+*.egg-info/
+plugin/cc-allowlist/vendor/node_modules
+local/prs/
+tools/pstack-claude/
+local/grok-hooks/
+local/updates/
+local/usage/

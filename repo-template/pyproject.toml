@@ -1,0 +1,16 @@
+[project]
+name = "csv2md"
+version = "0.0.0"
+description = "CSV to Markdown table CLI (stdlib only)"
+requires-python = ">=3.12"
+readme = "README.md"
+
+[project.scripts]
+csv2md = "csv2md.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

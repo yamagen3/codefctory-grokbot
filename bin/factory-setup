@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Idempotent factory host setup (no secrets printed).
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+
+echo "factory-setup: root=$FACTORY_ROOT"
+
+# Dirs
+mkdir -p "$FACTORY_ROOT/local"/{status,labels,notify,logs,prs,grok-hooks,origin,work,tests}
+
+# CC allowlist patch on profile-installed dsh-subagent-claude-code
+if [[ -x "$FACTORY_ROOT/scripts/apply-cc-allowlist-patch.sh" ]]; then
+  "$FACTORY_ROOT/scripts/apply-cc-allowlist-patch.sh"
+else
+  echo "factory-setup: WARN missing apply-cc-allowlist-patch.sh" >&2
+fi
+
+# Ensure vendor node_modules symlink for any leftover vendor copy
+VENDOR_NM="$FACTORY_ROOT/plugin/cc-allowlist/vendor/node_modules"
+PROFILE_NM="/home/box/.dsh/profiles/headless/node_modules"
+if [[ -d "$PROFILE_NM" ]]; then
+  mkdir -p "$(dirname "$VENDOR_NM")"
+  ln -sfn "$PROFILE_NM" "$VENDOR_NM"
+fi
+
+# Python 3.12 via uv if missing
+if ! command -v python3.12 >/dev/null 2>&1; then
+  if command -v uv >/dev/null 2>&1; then
+    echo "factory-setup: installing Python 3.12 via uv"
+    uv python install 3.12
+    PY=$(uv python find 3.12)
+    mkdir -p "$HOME/.local/bin"
+    ln -sfn "$PY" "$HOME/.local/bin/python3.12"
+  else
+    echo "factory-setup: WARN uv/python3.12 missing" >&2
+  fi
+fi
+
+# OpenCode isolation host pieces (user factory-oc, binary, config, sudoers, workspaces) — idempotent
+if [[ -x "$FACTORY_ROOT/bin/factory-oc-provision" ]]; then
+  "$FACTORY_ROOT/bin/factory-oc-provision" || echo "factory-setup: WARN factory-oc-provision failed" >&2
+fi
+
+# sudoers sanity (read-only check)
+if [[ -f /etc/sudoers.d/factory-oc-acp ]]; then
+  echo "factory-setup: sudoers factory-oc-acp present"
+else
+  echo "factory-setup: WARN /etc/sudoers.d/factory-oc-acp missing" >&2
+fi
+
+# opencode binary for factory-oc
+if sudo -n test -x /home/factory-oc/bin/opencode 2>/dev/null; then
+  echo "factory-setup: factory-oc opencode present"
+else
+  echo "factory-setup: WARN /home/factory-oc/bin/opencode missing" >&2
+fi
+
+# pstack skills for CC + factory-oc OpenCode (idempotent, pinned SHA)
+if [[ -x "$FACTORY_ROOT/bin/factory-pstack-install" ]]; then
+  "$FACTORY_ROOT/bin/factory-pstack-install"
+else
+  echo "factory-setup: WARN factory-pstack-install missing" >&2
+fi
+
+echo "factory-setup: done"

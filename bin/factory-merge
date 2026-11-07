@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Merge factory/<id> only when all four statuses success for head SHA.
+# FACTORY_BACKEND=local → git merge; github → PR merge API (requires prior factory-pr create).
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+export PYTHONPATH="${FACTORY_ROOT}/lib${PYTHONPATH:+:$PYTHONPATH}"
+REPO="${1:-}"; ID="${2:-}"
+[[ -n "$REPO" && -n "$ID" ]] || die "usage: factory-merge <repo> <id>"
+REPO="$(resolve_repo "$REPO")"
+cd "$REPO"
+git checkout "factory/${ID}"
+SHA=$(git rev-parse HEAD)
+factory-status required-ok "$REPO" "$SHA"
+BACKEND="${FACTORY_BACKEND:-local}"
+if [[ "$BACKEND" == "github" ]]; then
+  # ensure PR exists
+  if [[ ! -f "${FACTORY_PR_DIR:-$FACTORY_ROOT/local/prs}/id-${ID}.json" ]]; then
+    factory-pr create "$REPO" "$ID" "factory(${ID})" "auto"
+  fi
+  python3 -m factory_github pr-merge "$REPO" "$ID" "$SHA"
+else
+  python3 -m factory_github pr-merge "$REPO" "$ID" "$SHA"
+fi
+echo "factory-merge: merged factory/${ID} ($SHA) backend=${BACKEND}"

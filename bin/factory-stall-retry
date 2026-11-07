@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Stall timeout with one retry, then notify.
+# Usage: factory-stall-retry <label> -- <command...>
+# Env: FACTORY_STALL_TIMEOUT_SEC (default 3600)
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+
+LABEL="${1:-step}"; shift || true
+[[ "${1:-}" == "--" ]] || die "usage: factory-stall-retry <label> -- <command...>"
+shift
+
+TIMEOUT_SEC="${FACTORY_STALL_TIMEOUT_SEC:-3600}"
+ATTEMPT=1
+while [[ "$ATTEMPT" -le 2 ]]; do
+  echo "factory-stall-retry: ${LABEL} attempt=${ATTEMPT} timeout=${TIMEOUT_SEC}s"
+  set +e
+  timeout --signal=TERM --kill-after=30 "${TIMEOUT_SEC}" "$@"
+  EC=$?
+  set -e
+  if [[ "$EC" -eq 0 ]]; then exit 0; fi
+  if [[ "$EC" -eq 124 || "$EC" -eq 137 ]]; then
+    echo "factory-stall-retry: ${LABEL} stalled/timeout ec=${EC}" >&2
+    if [[ "$ATTEMPT" -eq 1 ]]; then
+      ATTEMPT=2
+      continue
+    fi
+    factory-notify stall "${LABEL} stalled after retry (timeout=${TIMEOUT_SEC}s ec=${EC})"
+    exit "$EC"
+  fi
+  exit "$EC"
+done

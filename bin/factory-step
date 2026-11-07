@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# factory-step — model-less DSH factory step (Claude Code Agent SDK or OpenCode ACP).
+# Usage:
+#   FACTORY_PROVIDER=claude-code factory-step [dsh opts…] <task…>
+#   FACTORY_PROVIDER=opencode    factory-step [dsh opts…] <task…>
+set -euo pipefail
+
+export PATH="${HOME}/.local/bin:${PATH}"
+
+FACTORY_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PATCH="${FACTORY_PATCH:-$FACTORY_ROOT/config/factory.patch.yml}"
+PROFILE="${FACTORY_PROFILE:-headless}"
+PROVIDER="${FACTORY_PROVIDER:-claude-code}"
+
+if [[ ! -f "$PATCH" ]]; then
+  echo "factory-step: missing patch: $PATCH" >&2
+  exit 2
+fi
+
+# Never let Anthropic API-key auth win over Claude OAuth for CC.
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN || true
+
+case "$PROVIDER" in
+  claude-code)
+    # Stash OAuth under a TOKEN-matching name so scrub strips ambient copies from children,
+    # then CC overlay re-injects only into the Claude Code child.
+    if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+      export FACTORY_CC_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN"
+    fi
+    # Keep DeepSeek / OC workspace away from the DSH parent and from CC.
+    unset DEEPSEEK_API_KEY OPENCODE_GO_KEY OPENCODE_API_KEY CLAUDE_CODE_OAUTH_TOKEN FACTORY_OC_WORKSPACE FACTORY_OC_API_KEY || true
+    ;;
+  opencode)
+    if [[ -z "${OPENCODE_GO_KEY:-}" && -z "${FACTORY_OC_API_KEY:-}" ]]; then
+      echo "factory-step: OPENCODE_GO_KEY required for provider=opencode" >&2
+      exit 2
+    fi
+    # Stash under KEY-matching name (scrubbed from ambient); ACP overlay maps to launcher.
+    export FACTORY_OC_API_KEY="${FACTORY_OC_API_KEY:-$OPENCODE_GO_KEY}"
+    # Strip Go/DeepSeek/CC secrets from DSH parent; only child gets the Go key.
+    unset OPENCODE_GO_KEY DEEPSEEK_API_KEY OPENCODE_API_KEY OPENCODE_GO_API_KEY OPENCODE_ZEN_API_KEY \
+      CLAUDE_CODE_OAUTH_TOKEN FACTORY_CC_OAUTH_TOKEN || true
+    if [[ -z "${FACTORY_OC_WORKSPACE:-}" ]]; then
+      FACTORY_OC_WORKSPACE="/var/factory/oc-workspaces/step-$(date +%Y%m%d-%H%M%S)-$$"
+      export FACTORY_OC_WORKSPACE
+      mkdir -p "$FACTORY_OC_WORKSPACE"
+    fi
+    rm -rf "${FACTORY_OC_WORKSPACE}/.git" 2>/dev/null || true
+    cd "$FACTORY_OC_WORKSPACE"
+    ;;
+  *)
+    echo "factory-step: unknown FACTORY_PROVIDER=$PROVIDER (use claude-code|opencode)" >&2
+    exit 2
+    ;;
+esac
+
+export FACTORY_PROVIDER="$PROVIDER"
+if [[ -n "${FACTORY_USAGE_DISABLE:-}" ]]; then
+  exec dsh --profile "$PROFILE" --patch "$PATCH" "$@"
+fi
+
+# Usage tracking (local/usage/<date>/steps.jsonl). Never changes the step's stdout or exit code.
+USAGE="$FACTORY_ROOT/bin/factory-usage"
+OC_BEFORE=""
+[[ "$PROVIDER" == opencode ]] && OC_BEFORE=$("$USAGE" oc-stats 2>/dev/null || true)
+"$USAGE" agmsg-poll before >/dev/null 2>&1 || true
+STARTED=$(date -Iseconds); T0=$(date +%s%3N)
+RESULT=$(mktemp /tmp/factory-step-result-XXXXXX)
+CC_USAGE=""
+if [[ "$PROVIDER" == claude-code ]]; then
+  CC_USAGE=$(mktemp /tmp/factory-step-ccusage-XXXXXX); export FACTORY_CC_USAGE_FILE="$CC_USAGE"
+fi
+set +e
+"${FACTORY_DSH_BIN:-dsh}" --profile "$PROFILE" --patch "$PATCH" "$@" | tee "$RESULT"
+EC=${PIPESTATUS[0]}
+set -e
+T1=$(date +%s%3N); ENDED=$(date -Iseconds)
+OC_AFTER=""
+[[ "$PROVIDER" == opencode ]] && OC_AFTER=$("$USAGE" oc-stats 2>/dev/null || true)
+"$USAGE" record-step --provider "$PROVIDER" --started "$STARTED" --ended "$ENDED" --duration-ms $((T1 - T0)) \
+  --exit "$EC" --result-file "$RESULT" ${CC_USAGE:+--cc-usage-file "$CC_USAGE"} ${OC_BEFORE:+--oc-before "$OC_BEFORE"} ${OC_AFTER:+--oc-after "$OC_AFTER"} >/dev/null 2>&1 || true
+"$USAGE" agmsg-poll after >/dev/null 2>&1 || true
+rm -f "$RESULT" ${CC_USAGE:+"$CC_USAGE"}
+exit "$EC"

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# CI: run unit + acceptance tests. Prefer python3.12 when available.
+# Usage: factory-ci <repo>
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+REPO="${1:-}"; [[ -n "$REPO" ]] || die "usage: factory-ci <repo>"
+REPO="$(resolve_repo "$REPO")"
+cd "$REPO"
+PY="${FACTORY_PYTHON:-}"
+if [[ -z "$PY" ]]; then
+  if command -v python3.12 >/dev/null; then PY=python3.12
+  else PY=python3
+  fi
+fi
+echo "factory-ci: using $PY ($($PY -V 2>&1))"
+export PYTHONPATH=src
+set +e
+$PY -m unittest discover -s tests/unit -v
+U=$?
+$PY -m unittest discover -s tests/acceptance -v
+A=$?
+set -e
+if [[ "$U" -ne 0 || "$A" -ne 0 ]]; then
+  echo "factory-ci: FAIL unit=$U acceptance=$A" >&2
+  exit 1
+fi
+echo "factory-ci: PASS"

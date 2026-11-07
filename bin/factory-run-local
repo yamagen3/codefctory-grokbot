@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Local end-to-end factory run against a bare origin (no GitHub).
+# Usage: factory-run-local <id> [brief...]
+# Env knobs:
+#   FACTORY_GROK_STUB=pass|fail (default pass)
+#   FACTORY_CLAUDE_GATE_STUB=pass|fail (unset = real CC)
+#   FACTORY_SKIP_CC_SPEC=1 — reuse existing spec on branch (tests)
+#   FACTORY_MAX_ROUNDS=3
+#   FACTORY_ORIGIN_REINIT=1 — wipe and re-scaffold the bare origin (default: reuse existing)
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+
+ID="${1:-}"; shift || true
+[[ -n "$ID" ]] || die "usage: factory-run-local <id> [brief...]"
+BRIEF="${*:-}"
+NAME="${FACTORY_TARGET_NAME:-}"
+[[ -n "$NAME" ]] || die "set FACTORY_TARGET_NAME (target bare-origin name, e.g. animal-trendcast)"
+[[ -n "$BRIEF" || "${FACTORY_SKIP_CC_SPEC:-}" == "1" ]] || die "usage: factory-run-local <id> <brief...> (or FACTORY_SKIP_CC_SPEC=1)"
+WORK="${FACTORY_WORK_DIR:-$FACTORY_ROOT/local/work/${ID}}"
+MAX="${FACTORY_MAX_ROUNDS:-3}"
+# Default stub=pass for local auto tests; real Grok review: FACTORY_GROK_MODE=pending and unset FACTORY_GROK_STUB.
+if [[ -z "${FACTORY_GROK_MODE:-}" && -z "${FACTORY_GROK_STUB:-}" ]]; then
+  export FACTORY_GROK_STUB=pass
+fi
+
+echo "=== factory-run-local id=$ID ==="
+# Usage tracking: every step in this run inherits run id + target; summary on any exit.
+export FACTORY_USAGE_RUN_ID="$ID" FACTORY_TARGET_NAME="$NAME"
+RUN_T0=$(date +%s%3N)
+usage_finish() {
+  local ec=$?
+  local st; case $ec in 0) st=merged ;; 2) st=grok-pending ;; *) st="exit-$ec" ;; esac
+  "$FACTORY_ROOT/bin/factory-usage" run-summary "$ID" --wall-ms $(( $(date +%s%3N) - RUN_T0 )) --status "$st" \
+    $([[ -z "${FACTORY_USAGE_QUIET:-}" ]] && echo --print) || true
+  "$FACTORY_ROOT/bin/factory-usage" balance --snapshot --quiet >/dev/null 2>&1 || true
+}
+trap usage_finish EXIT
+ORIGIN_BARE="${FACTORY_ORIGIN_ROOT:-$FACTORY_ROOT/local/origin}/${NAME}.git"
+# Never wipe an existing origin (init re-scaffolds). Force with FACTORY_ORIGIN_REINIT=1.
+if [[ ! -d "$ORIGIN_BARE" || "${FACTORY_ORIGIN_REINIT:-}" == "1" ]]; then
+  factory-local-origin init "$NAME" >/dev/null
+fi
+factory-local-origin clone "$NAME" "$WORK" >/dev/null
+cd "$WORK"
+
+if [[ "${FACTORY_SKIP_CC_SPEC:-}" != "1" ]]; then
+  echo "=== SPEC ==="
+  factory-stall-retry spec -- factory-spec-step "$WORK" "$ID" "$BRIEF"
+else
+  git checkout -B "factory/${ID}"
+fi
+
+echo "=== FREEZE spec/${ID} (local auto-approve; see DECISIONS.md) ==="
+# Ensure protected paths committed
+git add -A
+git -c user.email=factory@localhost -c user.name=factory commit -m "factory(${ID}): spec freeze" || true
+git tag -f "spec/${ID}"
+git push origin "factory/${ID}" || true
+git push origin "spec/${ID}" || true
+
+ROUND=0
+while true; do
+  ROUND=$((ROUND + 1))
+  export FACTORY_USAGE_ROUND="$ROUND"
+  if [[ "$ROUND" -gt "$MAX" ]]; then
+    factory-notify max-rounds "id=${ID} stopped after ${MAX} rounds"
+    echo "factory-run-local: STOP after $MAX rounds" >&2
+    exit 3
+  fi
+  factory-labels set-round "$WORK" "$ID" "$ROUND" >/dev/null
+  echo "=== ROUND $ROUND IMPL ==="
+  factory-stall-retry impl -- factory-impl-step "$WORK" "$ID" \
+    "Implement per spec/PRODUCT.md; make acceptance tests pass; stdlib only. Do not modify spec/, tests/acceptance/, or .github/."
+  SHA=$(git -C "$WORK" rev-parse HEAD)
+  git -C "$WORK" push origin "factory/${ID}" || true
+
+  echo "=== GUARD ==="
+  if factory-guard "$WORK" "$ID"; then
+    factory-status set "$WORK" "$SHA" guard success "ok"
+  else
+    factory-status set "$WORK" "$SHA" guard failure "protected paths changed"
+    echo "factory-run-local: guard failed round=$ROUND"
+    continue
+  fi
+
+  echo "=== CI ==="
+  if factory-ci "$WORK"; then
+    factory-status set "$WORK" "$SHA" ci success "ok"
+  else
+    factory-status set "$WORK" "$SHA" ci failure "tests failed"
+    echo "factory-run-local: ci failed round=$ROUND"
+    continue
+  fi
+
+  echo "=== GATE/CLAUDE ==="
+  if factory-gate-claude "$WORK" "$ID" "$SHA"; then
+    :
+  else
+    factory-status set "$WORK" "$SHA" gate/claude failure "gate"
+    echo "factory-run-local: gate/claude failed round=$ROUND"
+    continue
+  fi
+
+  echo "=== GATE/GROK ==="
+  set +e
+  factory-gate-grok "$WORK" "$ID" "$SHA"
+  GROK_EC=$?
+  set -e
+  if [[ "$GROK_EC" -eq 0 ]]; then
+    :
+  elif [[ "$GROK_EC" -eq 2 ]]; then
+    echo "factory-run-local: gate/grok PENDING sha=$SHA (bundle under local/grok-hooks/). Stop for Grok review."
+    echo "factory-run-local: record with: factory-gate-grok record $SHA success|failure \"reason\""
+    echo "factory-run-local: then merge with: factory-merge $WORK $ID"
+    exit 2
+  else
+    echo "factory-run-local: gate/grok failed round=$ROUND ec=$GROK_EC"
+    continue
+  fi
+
+  echo "=== MERGE ==="
+  factory-merge "$WORK" "$ID"
+  factory-notify merged "id=${ID} sha=$SHA rounds=$ROUND"
+  echo "factory-run-local: DONE merged id=$ID sha=$SHA rounds=$ROUND"
+  exit 0
+done
