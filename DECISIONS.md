@@ -59,3 +59,18 @@ Tool-body upgrades (DSH, OpenCode, Agent SDK) are **not** driven by “a newer v
 - 2026-11-05: **multi OpenCode（IMPL fan-out）** — `FACTORY_OC_PARALLEL`（既定 1、clamp 1..4）で `factory-impl-step` が N 個の隔離 WS + 専用 `FACTORY_OC_HOME` を並列起動し、acceptance 採点で勝者を選ぶ（OC exit 0 → 合格数 → 非空 patch → 低 index）。Candidate B（1 つの DSH plugin 呼び出し内で N activation）は不採用: DSH ACP は one-shot 前提でプロセス隔離も弱い。共有 `/home/factory-oc` 汚染を避けるため per-slot home を追加（未設定時は共有のまま）。WS/`FACTORY_OC_HOME` は realpath で prefix 検査（chown 脱出防止）。tar フォールバックは削除（空/失敗は非ゼロ）。試験: `local/tests/test_impl_parallel.sh`（mock factory-step）。
 
 - 2026-11-05: **IMPL 並列度は CC が SPEC で決める（parallel-first）** — 誰が 1 vs 4 を選ぶかは人間の env ではなく Claude Code。`factory-spec-step` が `spec/IMPL_STRATEGY.md`（先頭 `parallel: N`、1..4 + 短い日英 rationale）を書かせる。`factory-impl-step` の解決順: `FACTORY_OC_PARALLEL`（セット時のみ・試験/緊急上書き）→ `spec/IMPL_STRATEGY.md` → **欠落/不正時既定 2**（parallel-first、stderr 警告）。clamp 1..4。`impl-*-parallel.json` に `parallel_source`（`env`|`spec`|`default`）。FS allowlist は既に `spec/*` 許可。
+
+- 2026-11-07: **OpenCode reasoning effort は `max`（モデル ID ではない）**。ランタイムだけにあった `/home/factory-oc/.config/opencode/opencode.json` の `providers.opencode-go.models.deepseek-v4.1-flash.settings.reasoningEffort=max` を `factory_oc_opencode_json`（`bin/factory-common.sh`）へ移し、`factory-oc-provision` が再プロビジョン時に同じ文書を書く。モデル文字列は `opencode-go/deepseek-v4.1-flash` のまま。`…-max` や root `model` の `#max` は使わない（公式 config/models 文書は root 既定が `#variant` を保持しないと明記。schema は `#variant` 構文自体は許す）。`reasoningEffort` は schema の名前付き列挙ではなく `Config.Model.Settings` の追加プロパティで、[models 文書](https://opencode.ai/docs/models/) が `providers.<id>.models.<id>.settings.reasoningEffort` として示す。models.dev `opencode-go` / `deepseek-v4.1-flash` の effort は `low`/`high`/`max` のみで、別 ID `deepseek-v4.1-flash-max` は無い。`FACTORY_OC_MODEL` がこのモデル以外のときは従来の model+permission だけ（未確認モデルに max を付けない）。`permission: {"*":"allow"}` は維持。新規並列スロットは既存の `seed_oc_home` が共有 `.config/opencode/` をコピーするので追加の伝播機構は無い。既存スロット HOME はスナップショットのまま。セキュリティ更新方針（日次は security + patch/minor 自動、本体は承認）は不変。回帰は `local/tests/test_oc_provision_reasoning.sh`（オフライン。OpenCode は呼ばない。実応答は effort をエコーしないため、生成 JSON の検証に限る）。
+
+## 2026-11-07 — publication provenance（codefctory-grokbot）
+
+公開元はローカル factory HEAD `2da5ab4704b93f23f077b5983231e2a9967aa76d` のサニタイズスナップショット。リモート `yamagen3/codefctory-grokbot` を先に確認した: ブランチは `main` のみ、コミットは `7d316ca347f787b3924fda78fcc6e001f254b67d`（Initial commit、`README.md` のみ）。PR / Issue / 他ブランチは無し。目的の衝突は見当たらないため、この履歴を書き換えずにブランチへ統合した。
+
+ローカル専用としてスナップショットに含めず、リモートにも無かったもの（欠落は削除指示ではない）:
+
+- `local/` 一式。HEAD は `local/pstack-installed-sha` と `local/tests` のソーステスト 10 件を追跡していたが、handoff に従いアーカイブから除外した。この公開はそれらを再構成も削除もしない。今回追加する回帰テストは新規の tracked source であり、欠落した 10 件の代替一覧ではない。
+- 未コミットの `plugin/index.js` 5 行（`FACTORY_STALL_TIMEOUT_SEC` で activation timeout を上書き）。公開した plugin は HEAD のまま。リモートに対応物は無かった。
+- 未コミットの `targets/README.md` の animal-trendcast 行と、未追跡 `targets/animal-trendcast-scaffold/`（13 ファイル）。所有が未確認のため含めない。リモートに対応物は無かった。決定ログ上の 2026-11-04 animal-trendcast 記述は HEAD の文章として残す。
+- ランタイム / env / auth / log / usage / 鍵。鍵は供給されていない。`factory-doctor` の `dummy-for-doctor` と leak-check の `leak-canary` はプレースホルダ。
+
+希望構成のうち、スナップショット時点で既に HEAD にあり今回は変えていないもの: CC `claude-opus-5-5` + effort `xhigh`、Agent SDK `0.3.318`（`config/factory.patch.yml` と `config/headless.pnpm-workspace.yaml`）、IMPL 並列は CC の `spec/IMPL_STRATEGY.md`（欠落時 2、上限 4、`FACTORY_OC_PARALLEL` は上書き）、セキュリティ更新方針。

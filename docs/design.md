@@ -8,6 +8,24 @@ factory は実行環境を最新に保つ。DSH、Agent SDK / Claude Code、Open
 
 **OpenCode IMPL は parallel-first。** 並列度 N は人間が env で毎回いじるものではなく、SPEC 工程の Claude Code が `spec/IMPL_STRATEGY.md`（`parallel: N`）で決める。並列が効くところは前提として押し、N=1 は小さな逐次変更など本当に無駄なときだけ。
 
+**OpenCode の max は努力値であり、モデル ID ではない。** モデルは `opencode-go/deepseek-v4.1-flash` のまま。`factory-oc-provision` が共有 `opencode.json` に次を書く。
+
+```json
+"providers": {
+  "opencode-go": {
+    "models": {
+      "deepseek-v4.1-flash": {
+        "settings": { "reasoningEffort": "max" }
+      }
+    }
+  }
+}
+```
+
+`bin/factory-impl-step` の `seed_oc_home` がこの共有 `.config/opencode/` を新規スロット HOME へコピーする。再プロビジョンはファイル全体をこの内容で揃えるので、ランタイムだけに足した max は再構築で消えない。すでに存在するスロット HOME は作成時のスナップショットで、この変更では書き換えない。`FACTORY_OC_MODEL` で別モデルに上書きしたときは max を付けない（カタログ確認は上記モデルだけ）。`permission: {"*":"allow"}` とセキュリティ更新方針は変えない。
+
+根拠（2026-11-07）: [config schema](https://opencode.ai/config.json) の `providers` → `Config.Model.Settings`（`reasoningEffort` は追加プロパティ。root の非推奨 `provider` は使わない）。[config](https://opencode.ai/docs/config/) と [models](https://opencode.ai/docs/models/) は root `model` が `#variant` を保持しないと明記し、努力値は `providers.<id>.models.<id>.settings.reasoningEffort` に置く。[models.dev/api.json](https://models.dev/api.json) の `opencode-go` / `deepseek-v4.1-flash` の `reasoning_options` は effort `low` / `high` / `max`。同プロバイダに `deepseek-v4.1-flash-max` は無い。
+
 ## 1. 構成
 
 ```text
@@ -43,7 +61,7 @@ factory リポ（/workspace/factory）  オーケストレータ本体（OpenCod
 | Q12 | 実行単位 | 工程ごとに DSH を 1 回起動 |
 | Q13 | 第一ゲート | CC が受入れを先に書く。実行は ci。照合は `gate/claude` |
 | — | factory の置き場所 | **題材と分離**（`docs/layout.md`）。OpenCode の bwrap は factory をマウントしない |
-| — | OpenCode モデル | 有料 OpenCode Go。`opencode-go/deepseek-v4.1-flash`。Privacy Regions=**Global** 必須 |
+| — | OpenCode モデル | 有料 OpenCode Go。`opencode-go/deepseek-v4.1-flash`。Privacy Regions=**Global** 必須。推論の最大は別モデル ID ではなく `providers.opencode-go.models.deepseek-v4.1-flash.settings.reasoningEffort=max` |
 | — | API キー名 | box の `OPENCODE_GO_KEY` → 子の `OPENCODE_API_KEY`。`DEEPSEEK_API_KEY` は未使用 |
 | — | バックエンド切替 | `FACTORY_BACKEND=local\|github`（既定 local）。github はトークンプレースホルダ |
 
@@ -115,6 +133,7 @@ factory リポ（/workspace/factory）  オーケストレータ本体（OpenCod
 | バックエンド | `FACTORY_BACKEND=local` |
 | 使用量記録 | `local/usage/<date>/*.jsonl`（工程ごとの wall time / tokens、agmsg backlog）。`factory-usage summary` で集計 |
 | IMPL 並列 OpenCode | strategy 欠落時 **既定 2**（最大 4）。本番は CC の `spec/IMPL_STRATEGY.md`；`FACTORY_OC_PARALLEL` は試験/緊急上書き。勝者は acceptance 採点 |
+| OpenCode reasoning | モデル ID は `opencode-go/deepseek-v4.1-flash`。`reasoningEffort=max` を `factory-oc-provision` が共有 HOME に書き、新規スロットは `seed_oc_home` がコピー |
 
 ## 8. 未決定 → 決定済み / 残
 

@@ -2,7 +2,9 @@
 # Idempotent (re)provisioning of the OpenCode isolation host pieces (P3 design; see p3-log.md):
 #   user factory-oc (no sudo, uid FACTORY_OC_UID default 1001) + /home/factory-oc (700)
 #   /home/factory-oc/bin/opencode  = copy of the global @opencode/cli binary (checksum-verified)
-#   /home/factory-oc/.config/opencode/opencode.json  model opencode-go/deepseek-v4.1-flash, permission * allow
+#   /home/factory-oc/.config/opencode/opencode.json  model opencode-go/deepseek-v4.1-flash,
+#     permission * allow, providers.opencode-go.models.deepseek-v4.1-flash.settings.reasoningEffort=max
+#     (--print-config writes that JSON to stdout and exits before any system change)
 #   /etc/sudoers.d/factory-oc-acp  box may run ONLY bin/opencode-acp-isolated as root, with env_keep for the key stash
 #   /var/factory/oc-workspaces     workspace root
 #   /var/factory/oc-homes          per-slot HOME roots (FACTORY_OC_HOME)
@@ -12,6 +14,10 @@ set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
 U=factory-oc; H=/home/$U; UID_WANT="${FACTORY_OC_UID:-1001}"
 MODEL="${FACTORY_OC_MODEL:-opencode-go/deepseek-v4.1-flash}"
+if [[ "${1:-}" == "--print-config" ]]; then
+  factory_oc_opencode_json "$MODEL"
+  exit 0
+fi
 SRC="${FACTORY_OC_SRC_BIN:-$HOME/.local/lib/node_modules/@opencode/cli/bin/opencode.exe}"
 LAUNCHER="$FACTORY_ROOT/bin/opencode-acp-isolated"
 S="sudo -n"
@@ -32,7 +38,7 @@ if [[ "$($S sha256sum "$H/bin/opencode" 2>/dev/null | cut -d' ' -f1)" != "$(sha2
 fi
 
 CFG="$H/.config/opencode/opencode.json"
-WANT=$(printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "model": "%s",\n  "permission": { "*": "allow" }\n}\n' "$MODEL")
+WANT=$(factory_oc_opencode_json "$MODEL")
 if [[ "$($S cat "$CFG" 2>/dev/null || true)" != "$WANT" ]]; then
   printf '%s' "$WANT" | $S tee "$CFG" >/dev/null; $S chown "$U:$U" "$CFG"; $S chmod 600 "$CFG"
   say "wrote $CFG (model=$MODEL)"

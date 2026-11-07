@@ -32,3 +32,36 @@ resolve_repo() {
   [[ -d "$abs" ]] || die "resolve_repo: not a directory: $abs"
   printf '%s\n' "$abs"
 }
+
+# OpenCode config for the shared factory-oc home (and, via seed_oc_home, new slot homes).
+# Max is settings.reasoningEffort on opencode-go/deepseek-v4.1-flash. It is an effort
+# value from models.dev (low|high|max), not a model id and not a root #variant
+# (https://opencode.ai/docs/config/ : root model does not retain #variant;
+# https://opencode.ai/docs/models/ : providers.<id>.models.<id>.settings.reasoningEffort).
+# Other FACTORY_OC_MODEL values keep the previous model+permission document: max was
+# checked only for this catalog model.
+factory_oc_opencode_json() {
+  local model="${1:-${FACTORY_OC_MODEL:-opencode-go/deepseek-v4.1-flash}}"
+  if [[ "$model" == "opencode-go/deepseek-v4.1-flash" ]]; then
+    cat <<'EOF'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "opencode-go/deepseek-v4.1-flash",
+  "permission": { "*": "allow" },
+  "providers": {
+    "opencode-go": {
+      "models": {
+        "deepseek-v4.1-flash": {
+          "settings": {
+            "reasoningEffort": "max"
+          }
+        }
+      }
+    }
+  }
+}
+EOF
+  else
+    printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "model": "%s",\n  "permission": { "*": "allow" }\n}\n' "$model"
+  fi
+}
