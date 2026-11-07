@@ -18,6 +18,7 @@ if [[ -n "${FACTORY_CLAUDE_GATE_STUB:-}" ]]; then
     *) die "bad FACTORY_CLAUDE_GATE_STUB" ;;
   esac
 else
+  # Skill bodies for this step are appended by pstackQueryOverlay(), not copied here.
   TASK="You are the factory GATE/claude step. Compare the current working tree to spec/PRODUCT.md and tests/acceptance/. Reply with exactly one of these lines first:
 GATE: PASS
 or

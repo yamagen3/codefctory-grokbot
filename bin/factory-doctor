@@ -92,6 +92,17 @@ else
 fi
 CC_SKILL="$HOME/.claude/skills/tdd/SKILL.md"
 [[ -f "$CC_SKILL" ]] && ok "pstack CC skill tdd" || bad "pstack CC skill tdd missing"
+if command -v node >/dev/null; then
+  stage_skills="$(node --input-type=module -e "import { stageSkillNames } from '$FACTORY_ROOT/plugin/cc-allowlist/pstack-session.js'; for (const n of stageSkillNames()) console.log(n)" 2>/dev/null || true)"
+  if [[ -z "$stage_skills" ]]; then
+    bad "pstack stage skill list unreadable"
+  else
+    while IFS= read -r skill; do
+      [[ -n "$skill" ]] || continue
+      if [[ -f "$HOME/.claude/skills/$skill/SKILL.md" ]]; then ok "pstack CC stage skill $skill"; else bad "pstack CC stage skill $skill missing"; fi
+    done <<<"$stage_skills"
+  fi
+fi
 OC_SKILL="/home/factory-oc/.agents/skills/tdd/SKILL.md"
 if sudo -n test -f "$OC_SKILL" 2>/dev/null; then ok "pstack OC skill tdd"; else bad "pstack OC skill tdd missing"; fi
 MANIFEST="$FACTORY_ROOT/config/pstack-skills.manifest"

@@ -27,6 +27,8 @@ if [[ -f pyproject.toml ]]; then
   PKG_HINT=$(python3 -c "import re,pathlib; t=pathlib.Path('pyproject.toml').read_text(); m=re.search(r'(?m)^name\s*=\s*\"([^\"]+)\"', t); print(m.group(1) if m else '')" 2>/dev/null || true)
 fi
 
+# Skill bodies for this step are appended by pstackQueryOverlay() inside the
+# Agent SDK system prompt. Do not paste the skill library into this task.
 TASK="You are the factory SPEC step. Working directory is the product repo.
 
 Create or update ONLY under spec/ and tests/acceptance/:

@@ -3,6 +3,7 @@ import { MAX_TIMER_DELAY_MS } from "@deepseek-ai/dsh-timeout";
 import { NO_START_CAPABILITIES, assertPositiveFinite, assertUsableCwd, settleRunResult, subprocessRunHandle } from "@deepseek-ai/dsh-subagent";
 import { randomUUID } from "node:crypto";
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import { pstackQueryOverlay } from "/workspace/factory/plugin/cc-allowlist/pstack-session.js";
 import { brandString } from "@deepseek-ai/dsh-brand";
 import { scrubbedParentEnv } from "@deepseek-ai/dsh-subprocess";
 import { EventEmitter } from "node:events";
@@ -299,6 +300,7 @@ function claudeQueryOptions(spec, controller, capture, captureDiagnostic) {
 		abortController: controller,
 		cwd: spec.cwd,
 		...spec.model === void 0 ? {} : { model: spec.model },
+		...pstackQueryOverlay(),
 		env: {
 			...scrubbedParentEnv(),
 			...spec.env
