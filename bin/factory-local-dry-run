@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Fully local dry run of CSV→MD factory flow (no GitHub).
+# Usage: factory-local-dry-run [id]
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+
+ID="${1:-dry-$(date +%Y%m%d-%H%M%S)}"
+WORK="/workspace/factory/dry-runs/${ID}"
+TEMPLATE="/workspace/factory/repo-template"
+
+rm -rf "$WORK"
+mkdir -p "$WORK"
+cp -a "$TEMPLATE"/. "$WORK"/
+cd "$WORK"
+git init -b main
+git -c user.email=factory@localhost -c user.name=factory add -A
+git -c user.email=factory@localhost -c user.name=factory commit -m "scaffold"
+
+echo "=== SPEC STEP (CC) ==="
+factory-stall-retry spec -- factory-spec-step "$WORK" "$ID" \
+  "CSV to Markdown table CLI; stdlib only; columns from header row; empty cells allowed."
+
+echo "=== FREEZE TAG (local) ==="
+# Commit the CC spec output before freezing (same as factory-run-local). Without this the tag froze the
+# scaffold, and a spec step that deleted the placeholder test made impl drop spec/ as "protected" changes.
+git add -A
+git -c user.email=factory@localhost -c user.name=factory commit -m "factory(${ID}): spec freeze" || true
+git tag "spec/${ID}" || true
+
+echo "=== ROUND 1 IMPL (OpenCode isolated) ==="
+factory-round bump "$WORK" >/dev/null
+factory-stall-retry impl -- factory-impl-step "$WORK" "$ID" \
+  "Implement per spec/PRODUCT.md; make acceptance tests pass; stdlib only."
+
+echo "=== LOCAL TESTS ==="
+cd "$WORK"
+PYTHONPATH=src python3 -m unittest discover -s tests/unit -v || true
+PYTHONPATH=src python3 -m unittest discover -s tests/acceptance -v || true
+
+echo "=== GATE/CLAUDE (local, no status post) ==="
+factory-stall-retry gate -- factory-gate-claude "$WORK" "$ID" || true
+
+echo "factory-local-dry-run: done id=${ID} work=${WORK}"

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+export PYTHONPATH="${FACTORY_ROOT}/lib${PYTHONPATH:+:$PYTHONPATH}"
+CMD="${1:-}"; REPO="${2:-}"; ID="${3:-}"; N="${4:-}"; PR="${5:-}"
+[[ -n "$CMD" && -n "$REPO" && -n "$ID" ]] || die "usage: factory-labels set-round|get-round <repo> <id> [n] [pr]"
+REPO="$(resolve_repo "$REPO")"
+case "$CMD" in
+  set-round)
+    [[ -n "$N" ]] || die "need N"
+    exec python3 -m factory_github labels-set-round "$REPO" "$ID" "$N" ${PR:+"$PR"}
+    ;;
+  get-round)
+    exec python3 -m factory_github labels-get-round "$REPO" "$ID"
+    ;;
+  *) die "unknown $CMD" ;;
+esac

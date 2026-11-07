@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# Gate/grok: build review bundle; wait for Grok verdict (or stub/auto modes).
+# Usage:
+#   factory-gate-grok <repo> <id> [sha]          # prepare + wait/record path
+#   factory-gate-grok record <sha> success|failure <reason...>
+#   factory-gate-grok bundle <repo> <id> [sha]   # only write bundle
+#
+# Modes (FACTORY_GROK_MODE):
+#   wait   — default: write bundle, wait up to FACTORY_GROK_WAIT_SEC for result file
+#   stub   — FACTORY_GROK_STUB=pass|fail (tests)
+#   pending — write bundle + pending status, exit 2 immediately (orchestrator polls)
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+
+HOOK_DIR="${FACTORY_GROK_HOOK_DIR:-$FACTORY_ROOT/local/grok-hooks}"
+mkdir -p "$HOOK_DIR"
+
+cmd_record() {
+  local SHA="${1:-}" STATE_IN="${2:-}"; shift 2 || true
+  local REASON="${*:-}"
+  [[ -n "$SHA" && -n "$STATE_IN" ]] || die "usage: factory-gate-grok record <sha> success|failure <reason>"
+  local STATE
+  case "$STATE_IN" in
+    pass|success) STATE=success ;;
+    fail|failure) STATE=failure ;;
+    *) die "state must be success|failure" ;;
+  esac
+  local RESULT="$HOOK_DIR/result-${SHA}.json"
+  python3 - "$RESULT" "$SHA" "$STATE" "$REASON" <<'PY'
+import json,sys,datetime
+path,sha,state,reason=sys.argv[1:5]
+rec={"sha":sha,"state":state,"description":reason,"recorded_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),"recorder":"grok"}
+open(path,"w").write(json.dumps(rec,indent=2)+"\n")
+print(path)
+PY
+  # If a repo path was stored in pending, set status
+  local PENDING="$HOOK_DIR/pending-${SHA}.json"
+  local REPO=""
+  if [[ -f "$PENDING" ]]; then
+    REPO=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("repo",""))' "$PENDING")
+  fi
+  if [[ -n "$REPO" ]]; then
+    REPO="$(resolve_repo "$REPO")"
+    factory-status set "$REPO" "$SHA" gate/grok "$STATE" "${REASON:-grok}"
+  fi
+  # Usage: wall time from pending bundle to verdict (Grok review latency); tokens not observable -> null.
+  if [[ -f "$PENDING" ]]; then
+    local P_ID P_CREATED
+    P_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("id",""))' "$PENDING" 2>/dev/null || true)
+    P_CREATED=$(python3 -c 'import json,sys,datetime; print(datetime.datetime.fromisoformat(json.load(open(sys.argv[1]))["created_at"]).astimezone().isoformat())' "$PENDING" 2>/dev/null || true)
+    FACTORY_USAGE_RUN_ID="${FACTORY_USAGE_RUN_ID:-$P_ID}" "$FACTORY_ROOT/bin/factory-usage" record --step gate-grok --provider grok \
+      ${P_CREATED:+--started "$P_CREATED"} --exit "$([[ $STATE == success ]] && echo 0 || echo 1)" \
+      --notes "pending->record latency (includes queue wait); grok tokens not observable" >/dev/null 2>&1 || true
+  fi
+  echo "factory-gate-grok: recorded $STATE for $SHA"
+}
+
+write_bundle() {
+  local REPO ID SHA
+  REPO="$(resolve_repo "$1")"; ID="$2"; SHA="$3"
+  local BUNDLE_DIR="$HOOK_DIR/bundle-${SHA}"
+  rm -rf "$BUNDLE_DIR"
+  mkdir -p "$BUNDLE_DIR"
+  cd "$REPO"
+  {
+    echo "# gate/grok review bundle"
+    echo "id=$ID"
+    echo "sha=$SHA"
+    echo "branch=factory/${ID}"
+    echo "generated=$(date -Iseconds)"
+  } > "$BUNDLE_DIR/META.txt"
+
+  # Spec
+  if [[ -f spec/PRODUCT.md ]]; then cp spec/PRODUCT.md "$BUNDLE_DIR/PRODUCT.md"; fi
+  if [[ -f spec/OPEN_QUESTIONS.md ]]; then cp spec/OPEN_QUESTIONS.md "$BUNDLE_DIR/OPEN_QUESTIONS.md"; fi
+
+  # Diff vs spec tag (implementation-only since last freeze)
+  local BASE="spec/${ID}"
+  if git rev-parse -q --verify "$BASE^{commit}" >/dev/null; then
+    git diff "$BASE"...HEAD > "$BUNDLE_DIR/diff.patch" || true
+    git diff --stat "$BASE"...HEAD > "$BUNDLE_DIR/diff.stat.txt" || true
+  else
+    git show --stat HEAD > "$BUNDLE_DIR/diff.stat.txt" || true
+  fi
+
+  # Full diff vs merge-base with origin/main (or main) so re-freezes still show the whole PR
+  local MAIN_REF=""
+  if git rev-parse -q --verify origin/main >/dev/null; then
+    MAIN_REF=origin/main
+  elif git rev-parse -q --verify main >/dev/null; then
+    MAIN_REF=main
+  fi
+  if [[ -n "$MAIN_REF" ]]; then
+    local MERGE_BASE
+    MERGE_BASE=$(git merge-base "$MAIN_REF" HEAD 2>/dev/null || true)
+    if [[ -n "$MERGE_BASE" ]]; then
+      {
+        echo "main_ref=$MAIN_REF"
+        echo "merge_base=$MERGE_BASE"
+        echo "head=$SHA"
+      } > "$BUNDLE_DIR/diff.full.meta.txt"
+      git diff "$MERGE_BASE"...HEAD > "$BUNDLE_DIR/diff.full.patch" || true
+      git diff --stat "$MERGE_BASE"...HEAD > "$BUNDLE_DIR/diff.full.stat.txt" || true
+    else
+      echo "factory-gate-grok: WARN no merge-base with $MAIN_REF" >&2
+    fi
+  else
+    echo "factory-gate-grok: WARN no origin/main or main for full diff" >&2
+  fi
+
+  # Test results
+  set +e
+  FACTORY_PYTHON="${FACTORY_PYTHON:-python3.12}" factory-ci "$REPO" > "$BUNDLE_DIR/ci.out" 2>&1
+  echo $? > "$BUNDLE_DIR/ci.exit"
+  set -e
+
+  # Statuses so far + gate/claude
+  factory-status all "$REPO" "$SHA" > "$BUNDLE_DIR/statuses.json" 2>/dev/null || echo '{}' > "$BUNDLE_DIR/statuses.json"
+  if [[ -f /tmp/factory-gate-claude.json ]]; then
+    cp /tmp/factory-gate-claude.json "$BUNDLE_DIR/gate-claude.json" || true
+  fi
+
+  # README for reviewer
+  cat > "$BUNDLE_DIR/README.md" << RDEOF
+# gate/grok review for \`${SHA}\`
+
+1. Read \`PRODUCT.md\` and the diffs:
+   - \`diff.patch\` / \`diff.stat.txt\` — \`spec/<id>\`…HEAD (since last freeze)
+   - \`diff.full.patch\` / \`diff.full.stat.txt\` — merge-base(origin/main, HEAD)…HEAD (whole branch vs main; see \`diff.full.meta.txt\`)
+2. Skim \`ci.out\` (exit in \`ci.exit\`) and \`gate-claude.json\` / \`statuses.json\`.
+3. Record verdict:
+   \`\`\`
+   factory-gate-grok record ${SHA} success "short reason"
+   # or
+   factory-gate-grok record ${SHA} failure "short reason"
+   \`\`\`
+See also \`docs/gate-grok.md\`.
+RDEOF
+
+  echo "$BUNDLE_DIR"
+}
+
+CMD="${1:-}"
+if [[ "$CMD" == "record" ]]; then
+  shift
+  cmd_record "$@"
+  exit 0
+fi
+
+if [[ "$CMD" == "bundle" ]]; then
+  shift
+  REPO="${1:-}"; ID="${2:-}"; SHA="${3:-}"
+  [[ -n "$REPO" && -n "$ID" ]] || die "usage: factory-gate-grok bundle <repo> <id> [sha]"
+  REPO="$(resolve_repo "$REPO")"
+  cd "$REPO"
+  SHA="${SHA:-$(git rev-parse HEAD)}"
+  write_bundle "$REPO" "$ID" "$SHA"
+  exit 0
+fi
+
+REPO="${1:-}"; ID="${2:-}"; SHA="${3:-}"
+[[ -n "$REPO" && -n "$ID" ]] || die "usage: factory-gate-grok <repo> <id> [sha] | record | bundle"
+REPO="$(resolve_repo "$REPO")"
+cd "$REPO"
+SHA="${SHA:-$(git rev-parse HEAD)}"
+RESULT="$HOOK_DIR/result-${SHA}.json"
+PENDING="$HOOK_DIR/pending-${SHA}.json"
+
+MODE="${FACTORY_GROK_MODE:-}"
+if [[ -z "$MODE" ]]; then
+  if [[ -n "${FACTORY_GROK_STUB:-}" ]]; then MODE=stub
+  else MODE=wait
+  fi
+fi
+
+BUNDLE=$(write_bundle "$REPO" "$ID" "$SHA")
+echo "factory-gate-grok: bundle=$BUNDLE"
+
+python3 - "$PENDING" "$SHA" "$ID" "$REPO" "$BUNDLE" <<'PY'
+import json,sys,datetime
+path,sha,id_,repo,bundle=sys.argv[1:6]
+rec={"sha":sha,"id":id_,"repo":repo,"bundle":bundle,"status":"pending",
+     "instruction":"factory-gate-grok record <sha> success|failure <reason>",
+     "created_at":datetime.datetime.now(datetime.timezone.utc).isoformat()}
+open(path,"w").write(json.dumps(rec,indent=2)+"\n")
+PY
+
+case "$MODE" in
+  stub)
+    case "${FACTORY_GROK_STUB}" in
+      pass|success) factory-gate-grok record "$SHA" success "stub PASS" ;;
+      fail|failure) factory-gate-grok record "$SHA" failure "stub FAIL" ;;
+      *) die "FACTORY_GROK_STUB must be pass|fail" ;;
+    esac
+    ;;
+  pending)
+    factory-status set "$REPO" "$SHA" gate/grok pending "awaiting Grok"
+    echo "factory-gate-grok: pending Grok verdict (bundle=$BUNDLE)" >&2
+    exit 2
+    ;;
+  wait)
+    WAIT="${FACTORY_GROK_WAIT_SEC:-3600}"
+    POLL="${FACTORY_GROK_POLL_SEC:-2}"
+    echo "factory-gate-grok: waiting up to ${WAIT}s for $RESULT"
+    factory-status set "$REPO" "$SHA" gate/grok pending "awaiting Grok"
+    elapsed=0
+    while [[ "$elapsed" -lt "$WAIT" ]]; do
+      if [[ -f "$RESULT" ]]; then
+        break
+      fi
+      sleep "$POLL"
+      elapsed=$((elapsed + POLL))
+    done
+    if [[ ! -f "$RESULT" ]]; then
+      factory-status set "$REPO" "$SHA" gate/grok error "timeout waiting for Grok"
+      die "timeout waiting for Grok verdict ($WAIT s)"
+    fi
+    STATE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$RESULT")
+    DESC=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("description",""))' "$RESULT")
+    factory-status set "$REPO" "$SHA" gate/grok "$STATE" "${DESC:-grok}"
+    echo "factory-gate-grok: $STATE sha=$SHA"
+    [[ "$STATE" == "success" ]]
+    ;;
+  *) die "unknown FACTORY_GROK_MODE=$MODE" ;;
+esac

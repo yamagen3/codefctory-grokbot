@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Gate/claude: CC compares diff vs spec; records status via factory-status (local) or GH later.
+unset FACTORY_OC_WORKSPACE || true
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+
+REPO="${1:-}"; ID="${2:-}"; SHA="${3:-}"
+[[ -n "$REPO" && -n "$ID" ]] || die "usage: factory-gate-claude <repo> <id> [sha]"
+REPO="$(resolve_repo "$REPO")"
+cd "$REPO"
+SHA="${SHA:-$(git rev-parse HEAD)}"
+
+# Optional stub for spend-free tests
+if [[ -n "${FACTORY_CLAUDE_GATE_STUB:-}" ]]; then
+  case "$FACTORY_CLAUDE_GATE_STUB" in
+    pass|success) STATE=success; echo '{"text":"GATE: PASS\nstub"}' > /tmp/factory-gate-claude.json ;;
+    fail|failure) STATE=failure; echo '{"text":"GATE: FAIL\nstub"}' > /tmp/factory-gate-claude.json ;;
+    *) die "bad FACTORY_CLAUDE_GATE_STUB" ;;
+  esac
+else
+  TASK="You are the factory GATE/claude step. Compare the current working tree to spec/PRODUCT.md and tests/acceptance/. Reply with exactly one of these lines first:
+GATE: PASS
+or
+GATE: FAIL
+Then a short rationale. Do not modify files. Do not use AskUserQuestion."
+  # Read-only allowlist for gate
+  export FACTORY_CC_STEP=gate
+  factory-cc-fs-allowlist apply "$REPO" gate
+  set +e
+  FACTORY_USAGE_STEP=gate-claude FACTORY_USAGE_RUN_ID="${FACTORY_USAGE_RUN_ID:-$ID}" FACTORY_PROVIDER=claude-code factory-step --json "$TASK" | tee /tmp/factory-gate-claude.json
+  set -e
+  factory-cc-fs-allowlist restore "$REPO"
+  # Scrub ephemeral artifacts CC may drop while running tests (not product writes)
+  find "$REPO" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+  rm -f "$REPO/uv.lock" "$REPO/.coverage" 2>/dev/null || true
+  factory-cc-fs-allowlist verify "$REPO" gate || { factory-status set "$REPO" "$SHA" gate/claude failure "wrote files"; exit 1; }
+  STATE=failure
+  if python3 -c 'import json;from pathlib import Path;t=json.loads(Path("/tmp/factory-gate-claude.json").read_text()).get("text") or "";
+import sys; sys.exit(0 if any(l.strip()=="GATE: PASS" for l in t.splitlines()) else 1)'; then
+    STATE=success
+  fi
+fi
+
+factory-status set "$REPO" "$SHA" gate/claude "$STATE" "factory gate/claude"
+# Legacy GH path if tokens present
+TOKEN="${FACTORY_GITHUB_TOKEN_CC:-}"
+REPO_SLUG="${FACTORY_GITHUB_REPO:-}"
+if [[ -n "$TOKEN" && -n "$REPO_SLUG" ]]; then
+  curl -sS -X POST \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/${REPO_SLUG}/statuses/${SHA}" \
+    -d "{\"state\":\"${STATE}\",\"context\":\"gate/claude\",\"description\":\"factory gate/claude\"}" \
+    >/tmp/factory-gate-claude-status.json || true
+fi
+echo "factory-gate-claude: $STATE sha=$SHA"
+[[ "$STATE" == "success" ]]

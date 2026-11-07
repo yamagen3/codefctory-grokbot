@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Idempotent (re)provisioning of the OpenCode isolation host pieces (P3 design; see p3-log.md):
+#   user factory-oc (no sudo, uid FACTORY_OC_UID default 1001) + /home/factory-oc (700)
+#   /home/factory-oc/bin/opencode  = copy of the global @opencode/cli binary (checksum-verified)
+#   /home/factory-oc/.config/opencode/opencode.json  model opencode-go/deepseek-v4.1-flash, permission * allow
+#   /etc/sudoers.d/factory-oc-acp  box may run ONLY bin/opencode-acp-isolated as root, with env_keep for the key stash
+#   /var/factory/oc-workspaces     workspace root
+#   /var/factory/oc-homes          per-slot HOME roots (FACTORY_OC_HOME)
+# Auth: none stored. The launcher gives the child only OPENCODE_API_KEY (OpenCode Go reads it from env).
+# Never prints secrets. Needs passwordless sudo for box.
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+U=factory-oc; H=/home/$U; UID_WANT="${FACTORY_OC_UID:-1001}"
+MODEL="${FACTORY_OC_MODEL:-opencode-go/deepseek-v4.1-flash}"
+SRC="${FACTORY_OC_SRC_BIN:-$HOME/.local/lib/node_modules/@opencode/cli/bin/opencode.exe}"
+LAUNCHER="$FACTORY_ROOT/bin/opencode-acp-isolated"
+S="sudo -n"
+say() { echo "factory-oc-provision: $*"; }
+
+if ! id "$U" >/dev/null 2>&1; then
+  if getent passwd "$UID_WANT" >/dev/null; then $S useradd -m -s /bin/bash "$U"; else $S useradd -m -u "$UID_WANT" -s /bin/bash "$U"; fi
+  say "created user $U uid=$(id -u $U)"
+fi
+id -nG "$U" | tr ' ' '\n' | grep -qxE 'sudo|wheel|admin' && die "$U must not be in an admin group"
+$S mkdir -p "$H"/{bin,.config/opencode,.local/share/opencode,.cache,.agents/skills}
+$S chown -R "$U:$U" "$H"; $S chmod 700 "$H"
+
+[[ -x "$SRC" ]] || die "missing $SRC (npm i -g --prefix ~/.local @opencode/cli)"
+if [[ "$($S sha256sum "$H/bin/opencode" 2>/dev/null | cut -d' ' -f1)" != "$(sha256sum "$SRC" | cut -d' ' -f1)" ]]; then
+  $S install -o "$U" -g "$U" -m 755 "$SRC" "$H/bin/opencode"
+  say "installed $H/bin/opencode"
+fi
+
+CFG="$H/.config/opencode/opencode.json"
+WANT=$(printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "model": "%s",\n  "permission": { "*": "allow" }\n}\n' "$MODEL")
+if [[ "$($S cat "$CFG" 2>/dev/null || true)" != "$WANT" ]]; then
+  printf '%s' "$WANT" | $S tee "$CFG" >/dev/null; $S chown "$U:$U" "$CFG"; $S chmod 600 "$CFG"
+  say "wrote $CFG (model=$MODEL)"
+fi
+
+SUD=/etc/sudoers.d/factory-oc-acp
+TMP=$(mktemp)
+cat > "$TMP" <<SUDO
+# factory: box may launch ONLY the isolated OpenCode ACP wrapper as root (it drops to $U + bwrap).
+Defaults!$LAUNCHER env_keep+="FACTORY_OC_API_KEY FACTORY_OC_WORKSPACE FACTORY_OC_HOME OPENCODE_GO_KEY"
+$(id -un) ALL=(root) NOPASSWD: $LAUNCHER
+SUDO
+$S visudo -cf "$TMP" >/dev/null || { rm -f "$TMP"; die "sudoers syntax check failed"; }
+if ! $S cmp -s "$TMP" "$SUD" 2>/dev/null; then $S install -o root -g root -m 440 "$TMP" "$SUD"; say "wrote $SUD"; fi
+rm -f "$TMP"
+
+$S mkdir -p /var/factory/oc-workspaces /var/factory/oc-homes
+$S chmod 1777 /var/factory/oc-workspaces /var/factory/oc-homes
+command -v bwrap >/dev/null || die "bwrap missing (apt-get install bubblewrap)"
+say "ok"

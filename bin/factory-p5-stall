@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# P5-4: stall detection — short timeout, retry once, then notify.
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+export FACTORY_STALL_TIMEOUT_SEC=2
+set +e
+factory-stall-retry p5-stall -- bash -c 'sleep 30'
+EC=$?
+set -e
+if [[ "$EC" -ne 124 && "$EC" -ne 137 ]]; then
+  echo "P5-stall: unexpected ec=$EC" >&2
+  exit 1
+fi
+rg -n 'p5-stall|stall' "$FACTORY_ROOT/local/notify/NOTIFY.log" | tail -5
+echo "P5-stall: PASS ec=$EC with notify"

@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Extract/apply unified diff from OpenCode workspace → clean clone.
+# Refuses protected paths, binaries, and symlinks in the produced patch.
+# Usage:
+#   factory-patch-extract make <oc-workspace> <clean-tree> <out.patch>
+#   factory-patch-extract apply <clean-clone> <patch>
+#   factory-patch-extract check <patch>   # validate only
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+
+PROTECTED_PREFIXES=(spec/ tests/acceptance/ .github/)
+
+is_protected() {
+  local rel="$1"
+  for p in "${PROTECTED_PREFIXES[@]}"; do
+    [[ "$rel" == "$p"* || "$rel" == "${p%/}" ]] && return 0
+  done
+  return 1
+}
+
+# Validate a unified diff: no protected paths, no binary diffs, no symlink new files
+check_patch() {
+  local PATCH="$1"
+  [[ -f "$PATCH" ]] || die "missing patch $PATCH"
+  python3 - "$PATCH" <<'PY'
+import re, sys
+from pathlib import Path
+patch = Path(sys.argv[1]).read_text(errors="replace")
+protected = ("spec/", "tests/acceptance/", ".github/")
+errors = []
+# Binary markers
+for i, line in enumerate(patch.splitlines(), 1):
+    if "Binary files " in line and " differ" in line:
+        errors.append(f"L{i}: binary file diff refused: {line}")
+    if line.startswith("new mode 120") or line.startswith("new file mode 120"):
+        errors.append(f"L{i}: symlink mode refused: {line}")
+    m = re.match(r"^\+\+\+ [ab]/(.+)$", line)
+    if m:
+        path = m.group(1).strip()
+        if path == "/dev/null":
+            continue
+        # strip timestamp if present
+        path = path.split("\t")[0]
+        if any(path == p[:-1] or path.startswith(p) for p in protected):
+            errors.append(f"L{i}: protected path in patch: {path}")
+    m = re.match(r"^diff --git a/(.+) b/(.+)$", line)
+    if m:
+        for path in m.groups():
+            if any(path == p[:-1] or path.startswith(p) for p in protected):
+                errors.append(f"L{i}: protected path in diff --git: {path}")
+if errors:
+    print("factory-patch-extract: CHECK FAIL", file=sys.stderr)
+    for e in errors:
+        print(" ", e, file=sys.stderr)
+    sys.exit(1)
+print("factory-patch-extract: CHECK PASS")
+PY
+}
+
+scan_tree_symlinks_binaries() {
+  local ROOT="$1"
+  # Fail if OC tree introduced symlinks or obvious binaries under non-protected paths we would copy
+  python3 - "$ROOT" <<'PY'
+import os, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+bad = []
+skip_dirs = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv"}
+for dirpath, dirnames, filenames in os.walk(root):
+    # skip VCS / bytecode / caches (OC may leave these after running tests)
+    dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+    for name in filenames:
+        if name.endswith((".pyc", ".pyo", ".so")):
+            continue
+        p = Path(dirpath) / name
+        rel = str(p.relative_to(root)).replace("\\", "/")
+        if p.is_symlink():
+            bad.append(f"symlink: {rel}")
+            continue
+        # heuristic binary: NUL in first 8k
+        try:
+            data = p.read_bytes()[:8192]
+        except Exception:
+            continue
+        if b"\0" in data:
+            bad.append(f"binary: {rel}")
+
+if bad:
+    print("factory-patch-extract: tree contains refused entries:", file=sys.stderr)
+    for b in bad:
+        print(" ", b, file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+CMD="${1:-}"; shift || true
+case "$CMD" in
+  check)
+    check_patch "${1:-}"
+    ;;
+  make)
+    OC="${1:-}"; CLEAN="${2:-}"; OUT="${3:-}"
+    [[ -d "$OC" && -d "$CLEAN" && -n "$OUT" ]] || die "usage: factory-patch-extract make <oc> <clean> <out>"
+    scan_tree_symlinks_binaries "$OC"
+    TMP=$(mktemp -d /tmp/factory-patch-XXXXXX)
+    trap 'rm -rf "$TMP"' EXIT
+    mkdir -p "$TMP/a" "$TMP/b"
+    (cd "$CLEAN" && tar cf - --exclude .git --exclude __pycache__ --exclude .factory-round --exclude .factory-cc-fs-state --exclude tmp --exclude 'tmp.*' .) | (cd "$TMP/a" && tar xf -)
+    (cd "$OC" && tar cf - --exclude .git --exclude __pycache__ --exclude '.factory-oc-*' --exclude .factory-cc-fs-state --exclude tmp --exclude 'tmp.*' .) | (cd "$TMP/b" && tar xf -)
+    # Drop protected paths + orchestrator bookkeeping from BOTH trees so they never appear in the diff
+    for side in a b; do
+      rm -rf "$TMP/$side/spec" "$TMP/$side/tests/acceptance" "$TMP/$side/.github"
+      rm -f "$TMP/$side/.factory-round" "$TMP/$side/.factory-cc-fs-state"
+    done
+    set +e
+    # Use paths relative to TMP so diff headers are a/... b/...
+    (cd "$TMP" && diff -ruN a b > "$OUT")
+    EC=$?
+    set -e
+    if [[ "$EC" -gt 1 ]]; then die "diff failed ec=$EC"; fi
+    # Rewrite headers: +++ b/foo → +++ b/foo is fine; check_patch next
+    check_patch "$OUT"
+    echo "factory-patch-extract: wrote $OUT ($(wc -l < "$OUT") lines)"
+    ;;
+  apply)
+    REPO="${1:-}"; PATCH="${2:-}"
+    [[ -d "$REPO/.git" && -f "$PATCH" ]] || die "usage: factory-patch-extract apply <repo> <patch>"
+    check_patch "$PATCH"
+    cd "$REPO"
+    if git apply --check "$PATCH" 2>/dev/null; then
+      git apply "$PATCH"
+    elif git apply --check -p1 "$PATCH" 2>/dev/null; then
+      git apply -p1 "$PATCH"
+    else
+      # strip a/ b/ prefixes from diff -ruN; never prompt (OC recover / CI)
+      if patch -p1 --batch --forward --reject-file=- < "$PATCH" >/tmp/factory-patch-apply.out 2>&1; then
+        :
+      elif patch -p2 --batch --forward --reject-file=- < "$PATCH" >/tmp/factory-patch-apply.out 2>&1; then
+        :
+      else
+        cat /tmp/factory-patch-apply.out >&2 || true
+        die "patch apply failed"
+      fi
+    fi
+    # Final refuse if protected somehow changed
+    if git diff --name-only -- spec tests/acceptance .github 2>/dev/null | grep -q .; then
+      die "apply resulted in protected path changes"
+    fi
+    echo "factory-patch-extract: applied $PATCH"
+    ;;
+  *) die "usage: factory-patch-extract make|apply|check ..." ;;
+esac

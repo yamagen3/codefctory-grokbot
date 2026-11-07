@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Round counting via local sidecar (and future PR label round-N).
+# Usage: factory-round get|bump <repo> [pr]
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+
+CMD="${1:-}"; REPO="${2:-}"; PR="${3:-}"
+[[ -n "$CMD" && -n "$REPO" ]] || die "usage: factory-round get|bump <repo> [pr]"
+REPO="$(resolve_repo "$REPO")"
+SIDECAR="${REPO}/.factory-round"
+TOKEN="${FACTORY_GITHUB_TOKEN_GROK:-}"
+REPO_SLUG="${FACTORY_GITHUB_REPO:-}"
+
+get_local() { [[ -f "$SIDECAR" ]] && cat "$SIDECAR" || echo 0; }
+
+case "$CMD" in
+  get)
+    if [[ -n "$TOKEN" && -n "$REPO_SLUG" && -n "$PR" ]]; then
+      echo "factory-round: GitHub label read not implemented/tested yet" >&2
+    fi
+    get_local
+    ;;
+  bump)
+    CUR=$(get_local)
+    NEXT=$((CUR + 1))
+    if [[ "$NEXT" -gt 3 ]]; then
+      echo "factory-round: max rounds (3) exceeded" >&2
+      echo "$CUR"
+      exit 2
+    fi
+    echo "$NEXT" > "$SIDECAR"
+    if [[ -n "$TOKEN" && -n "$REPO_SLUG" && -n "$PR" ]]; then
+      echo "factory-round: GitHub label update not implemented/tested yet (would set round-${NEXT})" >&2
+    fi
+    echo "$NEXT"
+    ;;
+  *) die "unknown cmd $CMD" ;;
+esac

@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Paid OpenCode Go. Source: OPENCODE_GO_KEY (box) → FACTORY_OC_API_KEY stash → child OPENCODE_API_KEY.
+# Model: opencode-go/deepseek-v4.1-flash. Auth also under factory-oc home (shared or FACTORY_OC_HOME).
+
+OC_KEY="${OPENCODE_GO_KEY:-${FACTORY_OC_API_KEY:-${DEEPSEEK_API_KEY:-${OPENCODE_API_KEY:-}}}}"
+WS_IN="${FACTORY_OC_WORKSPACE:-}"
+OC_HOME_IN="${FACTORY_OC_HOME:-}"
+
+WS_ROOT="/var/factory/oc-workspaces"
+HOME_ROOT="/var/factory/oc-homes"
+SHARED_HOME="/home/factory-oc"
+
+die() { echo "opencode-acp-isolated: $*" >&2; exit 2; }
+
+# realpath must stay under prefix (resolves symlink escapes).
+require_under() {
+  local raw="$1" prefix="$2" label="$3"
+  [[ -n "$raw" ]] || die "$label empty"
+  [[ -d "$raw" ]] || die "$label must be an existing directory: $raw"
+  local real
+  real=$(realpath "$raw") || die "$label realpath failed: $raw"
+  case "$real" in
+    "$prefix"|"$prefix"/*) ;;
+    *) die "$label realpath '$real' not under ${prefix}/" ;;
+  esac
+  # Refuse if any path component under raw is a symlink that escaped before existence — realpath covers it.
+  printf '%s\n' "$real"
+}
+
+if [[ -z "$OC_KEY" ]]; then
+  die "OPENCODE_GO_KEY/FACTORY_OC_API_KEY missing"
+fi
+
+WS="$(require_under "$WS_IN" "$WS_ROOT" "FACTORY_OC_WORKSPACE")"
+export FACTORY_OC_WORKSPACE="$WS"
+
+OC_HOME=""
+if [[ -n "$OC_HOME_IN" ]]; then
+  [[ -d "$OC_HOME_IN" ]] || die "FACTORY_OC_HOME must be an existing directory: $OC_HOME_IN"
+  local_h=$(realpath "$OC_HOME_IN") || die "FACTORY_OC_HOME realpath failed: $OC_HOME_IN"
+  case "$local_h" in
+    "$HOME_ROOT"|"$HOME_ROOT"/*) ;;
+    "$WS"|"$WS"/*) ;;
+    *) die "FACTORY_OC_HOME realpath '$local_h' not under ${HOME_ROOT}/ or workspace ${WS}/" ;;
+  esac
+  OC_HOME="$local_h"
+  export FACTORY_OC_HOME="$OC_HOME"
+fi
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  chown -R factory-oc:factory-oc "$WS"
+  [[ -n "$OC_HOME" ]] && chown -R factory-oc:factory-oc "$OC_HOME"
+  rm -rf "$WS/.git"
+  export FACTORY_OC_API_KEY="$OC_KEY"
+  export FACTORY_OC_WORKSPACE="$WS"
+  PRESERVE="FACTORY_OC_API_KEY,FACTORY_OC_WORKSPACE"
+  if [[ -n "$OC_HOME" ]]; then
+    export FACTORY_OC_HOME="$OC_HOME"
+    PRESERVE="${PRESERVE},FACTORY_OC_HOME"
+  fi
+  exec sudo -n -u factory-oc --preserve-env="$PRESERVE" "$0"
+fi
+
+if [[ "$(id -un)" != "factory-oc" ]]; then
+  die "must run as factory-oc (via sudo)"
+fi
+
+# OC_KEY already captured from FACTORY_OC_API_KEY at top of this re-exec.
+# Re-read OC_HOME after possible re-exec (env preserved).
+OC_HOME="${FACTORY_OC_HOME:-}"
+unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN GITHUB_TOKEN GH_TOKEN \
+  GIT_ASKPASS GH_ASKPASS SAND_BOX_PERSISTENT_KEYRING CLOUD_AGENT_INJECTED_SECRET_NAMES \
+  FACTORY_CC_OAUTH_TOKEN DEEPSEEK_API_KEY OPENCODE_GO_KEY OPENCODE_GO_API_KEY OPENCODE_ZEN_API_KEY \
+  FACTORY_OC_API_KEY OPENCODE_API_KEY FACTORY_OC_HOME || true
+
+rm -rf "${WS}/.git" 2>/dev/null || true
+OC_BIN="${SHARED_HOME}/bin/opencode"
+[[ -x "$OC_BIN" ]] || die "missing $OC_BIN"
+
+# Home bind: shared /home/factory-oc, or per-slot FACTORY_OC_HOME (binary still from shared via ro-bind).
+HOME_ARGS=()
+if [[ -n "$OC_HOME" ]]; then
+  # Re-validate as factory-oc (defense in depth; root already checked).
+  case "$(realpath "$OC_HOME")" in
+    "$HOME_ROOT"|"$HOME_ROOT"/*|"$WS"|"$WS"/*) ;;
+    *) die "FACTORY_OC_HOME rejected after drop: $OC_HOME" ;;
+  esac
+  mkdir -p "${OC_HOME}/bin"
+  HOME_ARGS=(--bind "$OC_HOME" /home/factory-oc --ro-bind "$OC_BIN" /home/factory-oc/bin/opencode)
+else
+  HOME_ARGS=(--bind /home/factory-oc /home/factory-oc)
+fi
+
+exec bwrap \
+  --unshare-pid \
+  --unshare-uts \
+  --clearenv \
+  --ro-bind /usr /usr \
+  --ro-bind /bin /bin \
+  --ro-bind /sbin /sbin \
+  --ro-bind /lib /lib \
+  --ro-bind-try /lib64 /lib64 \
+  --ro-bind /etc/ssl /etc/ssl \
+  --ro-bind-try /etc/ca-certificates /etc/ca-certificates \
+  --ro-bind /etc/resolv.conf /etc/resolv.conf \
+  --ro-bind-try /etc/hosts /etc/hosts \
+  --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf \
+  --ro-bind /etc/passwd /etc/passwd \
+  --ro-bind /etc/group /etc/group \
+  --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache \
+  --ro-bind-try /etc/alternatives /etc/alternatives \
+  --dev /dev \
+  --proc /proc \
+  --tmpfs /tmp \
+  --tmpfs /var \
+  --tmpfs /run \
+  "${HOME_ARGS[@]}" \
+  --bind "$WS" "$WS" \
+  --chdir "$WS" \
+  --setenv HOME /home/factory-oc \
+  --setenv USER factory-oc \
+  --setenv LOGNAME factory-oc \
+  --setenv PATH /home/factory-oc/bin:/usr/bin:/bin \
+  --setenv XDG_CONFIG_HOME /home/factory-oc/.config \
+  --setenv XDG_DATA_HOME /home/factory-oc/.local/share \
+  --setenv XDG_CACHE_HOME /home/factory-oc/.cache \
+  --setenv OPENCODE_API_KEY "$OC_KEY" \
+  --setenv TERM dumb \
+  --setenv NO_COLOR 1 \
+  --setenv LANG C.UTF-8 \
+  "$OC_BIN" acp

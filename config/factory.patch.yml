@@ -1,0 +1,58 @@
+# Factory step: model-less orchestrator (design.md §11).
+# FACTORY_PROVIDER=claude-code|opencode selects the child backend.
+# OpenCode Go: OPENCODE_GO_KEY → FACTORY_OC_API_KEY stash → child OPENCODE_API_KEY.
+# Claude Code: FACTORY_CC_STEP=spec|gate selects canUseTool allowlist (plugin/cc-allowlist).
+
+- id: headless-runner
+  disabled: true
+
+- insert:
+    - id: subagent-claude-code
+      name: '/home/box/.dsh/profiles/headless/node_modules/@deepseek-ai/dsh-subagent-claude-code/lib/index.js'
+      config:
+        providerName: claude-code
+        # Pinned per user decision (DECISIONS 2026-11-05): Opus 5.5 at xhigh effort.
+        model: claude-opus-5-5
+        # acceptEdits + custom canUseTool (when FACTORY_CC_STEP set). Never bypassPermissions.
+        permissionMode: acceptEdits
+        env: !!js >
+          Object.fromEntries(
+            Object.entries({
+              CLAUDE_CODE_OAUTH_TOKEN:
+                process.env.FACTORY_CC_OAUTH_TOKEN || process.env.CLAUDE_CODE_OAUTH_TOKEN,
+              FACTORY_CC_STEP: process.env.FACTORY_CC_STEP,
+              CLAUDE_CODE_EFFORT_LEVEL: 'xhigh',
+            }).filter((entry) => typeof entry[1] === 'string' && entry[1].length > 0),
+          )
+
+    - id: subagent-acp-opencode
+      name: '/home/box/.dsh/profiles/headless/node_modules/@deepseek-ai/dsh-subagent-acp/lib/index.js'
+      config:
+        providerName: opencode
+        command: /usr/bin/sudo
+        args:
+          - '-n'
+          - /workspace/factory/bin/opencode-acp-isolated
+        permission: allow
+        env: !!js >
+          Object.fromEntries(
+            Object.entries({
+              FACTORY_OC_API_KEY: process.env.FACTORY_OC_API_KEY,
+              FACTORY_OC_WORKSPACE: process.env.FACTORY_OC_WORKSPACE,
+              FACTORY_OC_HOME: process.env.FACTORY_OC_HOME,
+              PATH: '/usr/bin:/bin',
+            }).filter((entry) => typeof entry[1] === 'string' && entry[1].length > 0),
+          )
+
+    - id: factory-orchestrator
+      name: '/workspace/factory/plugin/index.js'
+      inject: [headlessStartup]
+      config:
+        task: !!js ctx.headlessStartup.task
+        json: !!js ctx.headlessStartup.json
+        provider: !!js process.env.FACTORY_PROVIDER || 'claude-code'
+        cwd: !!js process.cwd()
+        timeoutMs: 1800000
+        dummyProvider: deepseek-official
+        dummyModel: deepseek-flash
+        label: factory-step

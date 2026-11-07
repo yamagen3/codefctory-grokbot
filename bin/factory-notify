@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Stop/stall notification: file + optional agmsg.
+# Usage: factory-notify <kind> <message...>
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+KIND="${1:-info}"; shift || true
+MSG="${*:-}"
+DIR="${FACTORY_NOTIFY_DIR:-$FACTORY_ROOT/local/notify}"
+mkdir -p "$DIR"
+TS=$(date -Iseconds)
+FILE="$DIR/${TS//[:]/-}-${KIND}.txt"
+{
+  echo "time=$TS"
+  echo "kind=$KIND"
+  echo "message=$MSG"
+} > "$FILE"
+echo "factory-notify: wrote $FILE" >&2
+# agmsg best-effort
+if [[ -n "${FACTORY_AGMSG_TEAM:-}" ]]; then
+  SEND="${FACTORY_AGMSG_SCRIPTS:-$HOME/.agents/skills/agmsg/scripts}/send.sh"
+  FROM="${FACTORY_AGMSG_FROM:-factory}"
+  TO="${FACTORY_AGMSG_TO:-factory}"
+  bash "$SEND" "$FACTORY_AGMSG_TEAM" "$FROM" "$TO" "[factory-notify:$KIND] $MSG" --force 2>/dev/null || true
+fi
+# Also append to combined log
+echo "$TS [$KIND] $MSG" >> "$DIR/NOTIFY.log"
+echo "$FILE"

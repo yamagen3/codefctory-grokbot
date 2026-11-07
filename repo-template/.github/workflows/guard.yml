@@ -1,0 +1,32 @@
+name: guard
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      # Same logic as bin/factory-guard — when factory scripts are available in CI image
+      # or vendored, invoke them. Local simulation runs bin/factory-guard directly.
+      - name: Guard protected paths vs spec tag
+        env:
+          ID: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          # Expect branch factory/<id>; derive id
+          REF="${{ github.event.pull_request.head.ref }}"
+          ID="${REF#factory/}"
+          BASE="spec/${ID}"
+          git fetch origin "refs/tags/${BASE}:refs/tags/${BASE}" || true
+          if ! git rev-parse -q --verify "${BASE}^{commit}" >/dev/null; then
+            echo "missing tag $BASE"; exit 1
+          fi
+          CHANGED=$(git diff --name-only "${BASE}"...HEAD -- spec tests/acceptance .github || true)
+          if [ -n "$CHANGED" ]; then
+            echo "protected paths changed:"; echo "$CHANGED"; exit 1
+          fi
+          echo "guard PASS"

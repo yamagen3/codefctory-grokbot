@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Create/reset a local bare origin and a working clone for product simulation.
+# Usage: factory-local-origin init <name>
+#        factory-local-origin clone <name> <workdir>
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+CMD="${1:-}"; NAME="${2:-}"; shift 2 || true
+ORIGIN_ROOT="${FACTORY_ORIGIN_ROOT:-$FACTORY_ROOT/local/origin}"
+TEMPLATE="${FACTORY_TEMPLATE:-$FACTORY_ROOT/repo-template}"
+mkdir -p "$ORIGIN_ROOT"
+case "$CMD" in
+  init)
+    [[ -n "$NAME" ]] || die "usage: factory-local-origin init <name>"
+    BARE="$ORIGIN_ROOT/${NAME}.git"
+    rm -rf "$BARE"
+    git init --bare -b main "$BARE"
+    TMP=$(mktemp -d)
+    cp -a "$TEMPLATE"/. "$TMP"/
+    cd "$TMP"
+    git init -b main
+    git -c user.email=factory@localhost -c user.name=factory add -A
+    git -c user.email=factory@localhost -c user.name=factory commit -m "scaffold: ${NAME}"
+    git remote add origin "$BARE"
+    git push -u origin main
+    rm -rf "$TMP"
+    echo "$BARE"
+    ;;
+  clone)
+    WD="${1:-}"
+    [[ -n "$NAME" && -n "$WD" ]] || die "usage: factory-local-origin clone <name> <workdir>"
+    BARE="$ORIGIN_ROOT/${NAME}.git"
+    [[ -d "$BARE" ]] || die "missing origin $BARE — run init first"
+    rm -rf "$WD"
+    git clone "$BARE" "$WD"
+    echo "$WD"
+    ;;
+  *) die "usage: factory-local-origin init|clone ..." ;;
+esac

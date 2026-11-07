@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# P5-2: tamper acceptance tests after freeze → guard must fail → no merge.
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+ID="p5-tamper-$$"
+NAME=csv2md-tamper
+WORK="$FACTORY_ROOT/local/work/${ID}"
+factory-local-origin init "$NAME" >/dev/null
+factory-local-origin clone "$NAME" "$WORK" >/dev/null
+cd "$WORK"
+mkdir -p spec tests/acceptance
+echo '# product' > spec/PRODUCT.md
+echo 'None.' > spec/OPEN_QUESTIONS.md
+printf '%s\n' 'import unittest' 'class T(unittest.TestCase):' '  def test_ok(self): self.assertTrue(True)' > tests/acceptance/test_cli.py
+git checkout -B "factory/${ID}"
+git add -A
+git -c user.email=factory@localhost -c user.name=factory commit -m "spec"
+git tag "spec/${ID}"
+printf '%s\n' 'x=1' > src/csv2md/convert.py
+git add -A
+git -c user.email=factory@localhost -c user.name=factory commit -m "impl"
+echo '# tampered' >> tests/acceptance/test_cli.py
+git add -A
+git -c user.email=factory@localhost -c user.name=factory commit -m "tamper acceptance"
+SHA=$(git rev-parse HEAD)
+set +e
+factory-guard "$WORK" "$ID"
+G=$?
+set -e
+if [[ "$G" -eq 0 ]]; then
+  echo "P5-tamper: FAIL guard should have failed" >&2
+  exit 1
+fi
+factory-status set "$WORK" "$SHA" guard failure "tamper"
+set +e
+factory-status required-ok "$WORK" "$SHA"
+R=$?
+set -e
+[[ "$R" -ne 0 ]] || die "required-ok should fail"
+echo "P5-tamper: PASS (guard failed, merge blocked)"

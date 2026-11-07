@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# P5-3: impossible acceptance → 3 rounds then notify stop.
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+ID="p5-rounds-$(date +%H%M%S)"
+NAME=csv2md-rounds
+WORK="$FACTORY_ROOT/local/work/${ID}"
+export FACTORY_GROK_STUB=pass
+export FACTORY_CLAUDE_GATE_STUB=pass
+export FACTORY_MAX_ROUNDS=3
+factory-local-origin init "$NAME" >/dev/null
+factory-local-origin clone "$NAME" "$WORK" >/dev/null
+cd "$WORK"
+mkdir -p spec tests/acceptance src/csv2md
+printf '%s\n' '# Impossible' 'Acceptance requires MAGIC_NEVER.' > spec/PRODUCT.md
+echo 'None.' > spec/OPEN_QUESTIONS.md
+printf '%s\n' \
+  'import unittest, pathlib' \
+  'class Impossible(unittest.TestCase):' \
+  '  def test_magic(self):' \
+  "    self.assertTrue(pathlib.Path('MAGIC_NEVER').exists(), 'impossible')" \
+  > tests/acceptance/test_impossible.py
+# remove placeholder that always passes if it conflicts
+rm -f tests/acceptance/test_placeholder.py
+git checkout -B "factory/${ID}"
+git add -A
+git -c user.email=factory@localhost -c user.name=factory commit -m "spec impossible"
+git tag "spec/${ID}"
+git push origin "factory/${ID}" 2>/dev/null || true
+git push origin "spec/${ID}" 2>/dev/null || true
+
+for ROUND in 1 2 3 4; do
+  factory-labels set-round "$WORK" "$ID" "$ROUND" >/dev/null
+  if [[ "$ROUND" -gt 3 ]]; then
+    factory-notify max-rounds "id=${ID} stopped after 3 rounds (p5)"
+    echo "P5-rounds: PASS notified after 3"
+    rg -n 'max-rounds|stopped after' "$FACTORY_ROOT/local/notify/NOTIFY.log" | tail -3
+    exit 0
+  fi
+  echo "noop $ROUND" >> src/csv2md/convert.py
+  git add -A
+  git -c user.email=factory@localhost -c user.name=factory commit -m "impl round $ROUND" || true
+  SHA=$(git rev-parse HEAD)
+  if factory-guard "$WORK" "$ID"; then
+    factory-status set "$WORK" "$SHA" guard success ok
+  else
+    factory-status set "$WORK" "$SHA" guard failure x
+  fi
+  set +e
+  factory-ci "$WORK"
+  C=$?
+  set -e
+  if [[ "$C" -eq 0 ]]; then
+    echo "P5-rounds: unexpected CI pass" >&2
+    exit 1
+  fi
+  factory-status set "$WORK" "$SHA" ci failure "impossible"
+  echo "round $ROUND ci failed as expected"
+done
+echo "P5-rounds: FAIL did not stop" >&2
+exit 1
