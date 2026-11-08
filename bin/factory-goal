@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Factory start convention. Not DSH /goal and not Claude Code /goal (docs/goal.md).
+# Usage: factory-goal <id> <objective...>
+# The objective is the factory-run-local brief: SPEC (CC) -> IMPL (OpenCode,
+# parallel from spec/IMPL_STRATEGY.md) -> guard -> ci -> gate/claude -> gate/grok.
+# FACTORY_GOAL_PRINT=1 prints the resolved id and objective and does not run.
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+ID="${1:-}"
+shift || true
+[[ -n "$ID" ]] || die "usage: factory-goal <id> <objective...>"
+OBJECTIVE="${*:-}"
+[[ -n "$OBJECTIVE" ]] || die "usage: factory-goal <id> <objective...> (objective required)"
+if [[ "${FACTORY_GOAL_PRINT:-}" == "1" ]]; then
+  printf 'id=%s\n' "$ID"
+  printf 'objective=%s\n' "$OBJECTIVE"
+  printf 'pipeline=factory-run-local\n'
+  exit 0
+fi
+exec "$(cd "$(dirname "$0")" && pwd)/factory-run-local" "$ID" "$OBJECTIVE"

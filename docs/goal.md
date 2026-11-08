@@ -1,6 +1,6 @@
-# `/goal` is not the factory start
+# Factory `/goal` convention
 
-Checked against the factory tree on `main` (`e73aebc`), DSH `0.2.2-rc.1` (the headless profile pin), Claude Code’s `/goal` document, Agent SDK `0.3.319` (`claudeCodeVersion` `2.1.319`), and pstack-claude `79b36d9`. These are different commands. None of them is the factory pipeline, so this tree does not add a `/goal` entry.
+Checked against the factory tree, DSH `0.2.2-rc.1`, Claude Code’s `/goal` document, Agent SDK `0.3.319` (`claudeCodeVersion` `2.1.319`), and pstack-claude `79b36d9`. DSH `/goal` and Claude Code `/goal` are real commands. Neither is available as the factory pipeline. `bin/factory-goal` is the factory convention for that pipeline. It is not a native DSH or Claude Code /goal invocation.
 
 ## Factory entry that already exists
 
@@ -28,12 +28,19 @@ So `dsh --profile headless "/goal …"` on this factory is not the DSH goal comm
 
 The pinned skill list has no `/goal` command. The port’s note on Cursor `/goal` is that it has no Claude Code equivalent inside pstack; that is a separate product from Claude Code’s own `/goal`.
 
-## What was not built
+## Factory convention entry
 
-A factory script named `/goal` or `factory-goal` that only forwards a brief would be a new meaning, not either documented command. It is not added. The standard local start remains `factory-run-local <id> <brief…>`.
+`bin/factory-goal <id> <objective...>` is the standard start. It execs `factory-run-local` with that id and the objective as the brief. It does not call `dsh`, `ctx.commands`, or `claude -p`. `FACTORY_GOAL_PRINT=1` prints `id`, `objective`, and `pipeline=factory-run-local` and does not run. `FACTORY_TARGET_NAME` is still required when the pipeline actually runs. An empty objective is rejected.
 
-Concrete alternatives, if a later change picks one:
+The objective is plain text, including when it contains the characters `/goal`. Example, which is also the agreed acceptance sentence for this change:
 
-1. Keep `factory-run-local` as the only start. The brief is the objective. This is the current pipeline.
-2. Mount an interactive DSH command adapter and use real `/goal` there. That drives DSH goal rounds, not this headless factory, and the factory patch currently disables the headless runner.
-3. Call `claude -p "/goal <condition>"` for a Claude Code completion loop. That is not spec → OpenCode → gates, and it is not how factory CC steps are launched.
+```text
+factory-goal <id> DeepSeek max setting persists after reprovision, and factory /goal entry is established and verified.
+```
+
+`factory-run-local` remains the pipeline. The native commands below are not used.
+
+## Native commands that were not invoked
+
+1. DSH interactive `/goal`. Headless does not dispatch it, and the factory patch does not mount a command adapter.
+2. `claude -p "/goal <condition>"`. That is a Claude Code completion loop, not spec → OpenCode → gates.

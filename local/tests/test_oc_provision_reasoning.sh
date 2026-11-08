@@ -72,8 +72,10 @@ python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["model"]=="open
 
 # The provisioner must compare the on-disk file to this same document, so a
 # rebuild does not drop max. Slot homes inherit by copying that directory.
-grep -q 'WANT=$(factory_oc_opencode_json "$MODEL")' "$ROOT/bin/factory-oc-provision" \
-  || fail "provisioner does not write factory_oc_opencode_json"
+grep -q 'factory_oc_write_config' "$ROOT/bin/factory-oc-provision" \
+  || fail "provisioner does not write through factory_oc_write_config"
+grep -q 'factory_oc_opencode_json' "$ROOT/bin/factory-common.sh" \
+  || fail "config writer does not build factory_oc_opencode_json"
 grep -q 'sudo -n cp -a /home/factory-oc/.config/opencode/. "$dest/.config/opencode/"' \
   "$ROOT/bin/factory-impl-step" \
   || fail "seed_oc_home no longer copies the shared OpenCode config"

@@ -98,3 +98,33 @@ if problems:
     raise SystemExit(1)
 '
 }
+
+# Compare-and-write the provisioned OpenCode document.
+# mode=file writes directly; mode=sudo is the box path (root-owned home).
+# Prints "wrote" or "unchanged". A file that lost max is replaced with the
+# document that contains reasoningEffort=max, so reprovision restores it.
+factory_oc_write_config() {
+  local dest="${1:-}" mode="${2:-file}"
+  local model="${FACTORY_OC_MODEL:-opencode-go/deepseek-v4.1-flash}"
+  local want current
+  [[ -n "$dest" ]] || die "factory_oc_write_config: dest required"
+  want=$(factory_oc_opencode_json "$model")
+  if [[ "$mode" == sudo ]]; then
+    current=$(sudo -n cat "$dest" 2>/dev/null || true)
+  else
+    current=$(cat "$dest" 2>/dev/null || true)
+  fi
+  if [[ "$current" == "$want" ]]; then
+    printf 'unchanged\n'
+    return 0
+  fi
+  if [[ "$mode" == sudo ]]; then
+    printf '%s' "$want" | sudo -n tee "$dest" >/dev/null
+    sudo -n chown factory-oc:factory-oc "$dest"
+    sudo -n chmod 600 "$dest"
+  else
+    mkdir -p "$(dirname "$dest")"
+    printf '%s' "$want" > "$dest"
+  fi
+  printf 'wrote\n'
+}
