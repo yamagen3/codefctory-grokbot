@@ -51,7 +51,9 @@ Brief: ${BRIEF}"
 export FACTORY_CC_STEP=spec
 factory-cc-fs-allowlist apply "$REPO" spec
 set +e
-FACTORY_USAGE_STEP=spec FACTORY_USAGE_RUN_ID="${FACTORY_USAGE_RUN_ID:-$ID}" FACTORY_PROVIDER=claude-code factory-step --json "$TASK" | tee /tmp/factory-spec-step.json
+# Native DSH /goal (ctx.commands.execute). The slash line is not the CC prompt.
+FACTORY_DSH_GOAL_LINE="/goal ${BRIEF}" \
+  FACTORY_USAGE_STEP=spec FACTORY_USAGE_RUN_ID="${FACTORY_USAGE_RUN_ID:-$ID}" FACTORY_PROVIDER=claude-code factory-step --json "$TASK" | tee /tmp/factory-spec-step.json
 EC=${PIPESTATUS[0]}
 set -e
 factory-cc-fs-allowlist restore "$REPO"
