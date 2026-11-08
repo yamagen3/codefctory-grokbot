@@ -65,3 +65,36 @@ EOF
     printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "model": "%s",\n  "permission": { "*": "allow" }\n}\n' "$model"
   fi
 }
+
+# Exit 0 when stdin is the factory OpenCode document with reasoningEffort=max.
+# Prints one reason on failure. Does not accept a missing field.
+factory_oc_config_problems() {
+  python3 -c '
+import json, sys
+raw = sys.stdin.read()
+try:
+    doc = json.loads(raw)
+except Exception as exc:
+    print(f"opencode.json is not JSON: {exc}")
+    raise SystemExit(1)
+problems = []
+model = doc.get("model")
+if model != "opencode-go/deepseek-v4.1-flash":
+    problems.append(f"model is {model!r}, want opencode-go/deepseek-v4.1-flash")
+if "deepseek-v4.1-flash-max" in raw:
+    problems.append("document contains a -max model id")
+def dig(obj, *keys):
+    cur = obj
+    for key in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+effort = dig(doc, "providers", "opencode-go", "models", "deepseek-v4.1-flash", "settings", "reasoningEffort")
+if effort != "max":
+    problems.append(f"reasoningEffort is {effort!r}, want max")
+if problems:
+    print("; ".join(problems))
+    raise SystemExit(1)
+'
+}

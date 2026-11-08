@@ -12,8 +12,8 @@ grep -q 'claude-opus-5-5' "$ROOT/config/factory.patch.yml" || fail "CC model pin
 grep -q "CLAUDE_CODE_EFFORT_LEVEL: 'xhigh'" "$ROOT/config/factory.patch.yml" || fail "CC effort pin missing"
 grep -q 'permissionMode: acceptEdits' "$ROOT/config/factory.patch.yml" || fail "permissionMode changed"
 grep -q 'permissionMode: bypassPermissions' "$ROOT/config/factory.patch.yml" && fail "permissionMode switched to bypass"
-grep -q "'@anthropic-ai/claude-agent-sdk': 0.3.318" "$ROOT/config/headless.pnpm-workspace.yaml" \
-  || fail "Agent SDK pin changed"
+grep -q "'@anthropic-ai/claude-agent-sdk': 0.3.319" "$ROOT/config/headless.pnpm-workspace.yaml" \
+  || fail "Agent SDK pin is not the approved 0.3.319"
 grep -q 'opencode-go/deepseek-v4.1-flash' "$ROOT/bin/factory-common.sh" || fail "OC model default changed"
 grep -q 'reasoningEffort": "max"' "$ROOT/bin/factory-common.sh" || fail "OC max effort missing"
 grep -q 'auto-apply only small patch/security fixes' "$ROOT/DECISIONS.md" || fail "security-update policy text missing"

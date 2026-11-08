@@ -19,7 +19,7 @@ DSH-installed skills do not inherit into Claude Code.
 |---|---|
 | DSH `~/.agents/skills` | agmsg scripts for the factory plugin. The Claude subagent never reads this tree. |
 | DSH `subagent-claude-code` | One Agent SDK `query()` per run. Official provider README: it omits `settingSources`, so the SDK's own default applies. It does not copy skill files into the prompt. |
-| Agent SDK 0.3.318 `settingSources` | Omitted: user + project + local, matching the CLI. `[]` disables filesystem settings. `['user']` is only `~/.claude/` (and not the product repo's `.claude/`). Typed in `@anthropic-ai/claude-agent-sdk@0.3.318`. |
+| Agent SDK `settingSources` | Omitted: user + project + local, matching the CLI. `[]` disables filesystem settings. `['user']` is only `~/.claude/` (and not the product repo's `.claude/`). The same comment is in `sdk.d.ts` for 0.3.318 and for the approved 0.3.319 package. |
 | Skills once a source loads | Claude Code sees skill *descriptions* and loads a body when the model invokes the Skill tool. A file on disk is not yet an instruction the model has read. |
 | Session `cwd` | The product repo (`request.cwd`). Project skills would be `<repo>/.claude/skills`, which factory does not install. |
 | Child `HOME` | The provider passes scrubbed parent env plus the factory env overlay (OAuth token, `FACTORY_CC_STEP`, effort). User skills resolve from that process home, not from `cwd`. This cloud checkout cannot see the box user's home. |

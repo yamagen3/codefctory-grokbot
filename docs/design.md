@@ -26,6 +26,10 @@ factory は実行環境を最新に保つ。DSH、Agent SDK / Claude Code、Open
 
 根拠（2026-11-07）: [config schema](https://opencode.ai/config.json) の `providers` → `Config.Model.Settings`（`reasoningEffort` は追加プロパティ。root の非推奨 `provider` は使わない）。[config](https://opencode.ai/docs/config/) と [models](https://opencode.ai/docs/models/) は root `model` が `#variant` を保持しないと明記し、努力値は `providers.<id>.models.<id>.settings.reasoningEffort` に置く。[models.dev/api.json](https://models.dev/api.json) の `opencode-go` / `deepseek-v4.1-flash` の `reasoning_options` は effort `low` / `high` / `max`。同プロバイダに `deepseek-v4.1-flash-max` は無い。
 
+**開始コマンドは `factory-run-local <id> <brief>` のまま。** DSH 0.2.2-rc.1 の `/goal` は対話 UI のコマンドで、headless は `ctx.commands` を消費しない。Claude Code の `/goal` は CC セッション内の完了条件ループで、factory の SPEC→OpenCode→gates ではない。どちらにも合わせた新しい `/goal` は足していない。根拠は `docs/goal.md`。
+
+**OpenCode の max が実行時ファイルから消えたら doctor は失敗する。** `factory-oc-provision --print-config` と、factory-oc がいるときの `/home/factory-oc/.config/opencode/opencode.json` の両方で `reasoningEffort=max` を要求する。欠落は既定扱いしない。承認済み Agent SDK は `0.3.319`（同梱 Claude Code `2.1.319`）。`config/headless.pnpm-workspace.yaml` の写しをそれに合わせた。この変更はインストールしない。
+
 **pstack は手法であり、モデルではない。** DSH の `~/.agents/skills` は CC に継承されない。スキルファイルを `~/.claude/skills` に置くだけでは SPEC/gate のプロンプトに本文は入らない。CC 子の Agent SDK `query()` には `pstackQueryOverlay()` を足す。`settingSources: ['user']` でユーザー技能だけを読み、SPEC と gate だけが段階ごとの SKILL.md 本文を `systemPrompt` 追記で受け取る。poteto-mode の SessionStart 自動ルート（サブエージェントとモデル振分）は使わない。詳細は `docs/pstack-cc.md`。CC は `claude-opus-5-5` / `xhigh`、OpenCode は Flash max、並列度は CC の `spec/IMPL_STRATEGY.md` のまま。
 
 ## 1. 構成

@@ -75,6 +75,9 @@
 - [x] CC が SPEC で `spec/IMPL_STRATEGY.md`（`parallel: N`）を決め、IMPL は parallel-first（欠落時既定 2；env は上書き）。
 - [x] OpenCode Go の max reasoning を `factory-oc-provision` の既定 opencode.json に固定（`settings.reasoningEffort=max`。再プロビジョンと新規スロット HOME が継承。既存スロットはスナップショットのまま）。
 - [x] CC SPEC/gate が pstack 段階スキル本文を Agent SDK options で受け取る（`pstackQueryOverlay`）。poteto-mode 自動ルートは不採用。box 上の実セッション確認は `factory-setup` 後。
+- [x] doctor が OpenCode `reasoningEffort=max` の欠落を FAIL する（ソース既定と live `opencode.json`）。
+- [x] 承認済み SDK 写しを 0.3.319 / Claude Code 2.1.319 に合わせた（インストールは box 側）。
+- [x] `/goal` は factory 開始口にしない（`docs/goal.md`）。開始は `factory-run-local`。
 - [ ] 他の並列化候補（multi-candidate gate、multi-run など）— SPEC/IMPL 以外も parallel-first で検討。
 - [ ] OpenCode egress 制限（`--unshare-net` + opencode.ai だけ通す proxy）。並列時のトークン混線（stats 差分）も悪化し得る。
 - [ ] launcher を root 所有の libexec へ移し checksum 照合（sudoers が box 書込可能スクリプトを root 実行している問題）。
