@@ -65,3 +65,66 @@ EOF
     printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "model": "%s",\n  "permission": { "*": "allow" }\n}\n' "$model"
   fi
 }
+
+# Exit 0 when stdin is the factory OpenCode document with reasoningEffort=max.
+# Prints one reason on failure. Does not accept a missing field.
+factory_oc_config_problems() {
+  python3 -c '
+import json, sys
+raw = sys.stdin.read()
+try:
+    doc = json.loads(raw)
+except Exception as exc:
+    print(f"opencode.json is not JSON: {exc}")
+    raise SystemExit(1)
+problems = []
+model = doc.get("model")
+if model != "opencode-go/deepseek-v4.1-flash":
+    problems.append(f"model is {model!r}, want opencode-go/deepseek-v4.1-flash")
+if "deepseek-v4.1-flash-max" in raw:
+    problems.append("document contains a -max model id")
+def dig(obj, *keys):
+    cur = obj
+    for key in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+effort = dig(doc, "providers", "opencode-go", "models", "deepseek-v4.1-flash", "settings", "reasoningEffort")
+if effort != "max":
+    problems.append(f"reasoningEffort is {effort!r}, want max")
+if problems:
+    print("; ".join(problems))
+    raise SystemExit(1)
+'
+}
+
+# Compare-and-write the provisioned OpenCode document.
+# mode=file writes directly; mode=sudo is the box path (root-owned home).
+# Prints "wrote" or "unchanged". A file that lost max is replaced with the
+# document that contains reasoningEffort=max, so reprovision restores it.
+factory_oc_write_config() {
+  local dest="${1:-}" mode="${2:-file}"
+  local model="${FACTORY_OC_MODEL:-opencode-go/deepseek-v4.1-flash}"
+  local want current
+  [[ -n "$dest" ]] || die "factory_oc_write_config: dest required"
+  want=$(factory_oc_opencode_json "$model")
+  if [[ "$mode" == sudo ]]; then
+    current=$(sudo -n cat "$dest" 2>/dev/null || true)
+  else
+    current=$(cat "$dest" 2>/dev/null || true)
+  fi
+  if [[ "$current" == "$want" ]]; then
+    printf 'unchanged\n'
+    return 0
+  fi
+  if [[ "$mode" == sudo ]]; then
+    printf '%s' "$want" | sudo -n tee "$dest" >/dev/null
+    sudo -n chown factory-oc:factory-oc "$dest"
+    sudo -n chmod 600 "$dest"
+  else
+    mkdir -p "$(dirname "$dest")"
+    printf '%s' "$want" > "$dest"
+  fi
+  printf 'wrote\n'
+}

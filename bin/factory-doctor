@@ -54,6 +54,35 @@ id factory-oc >/dev/null 2>&1 && ok "user factory-oc" || bad "user factory-oc mi
 if sudo -n test -x /home/factory-oc/bin/opencode 2>/dev/null; then ok "factory-oc opencode"; else bad "factory-oc opencode missing"; fi
 command -v bwrap >/dev/null && ok "bwrap" || bad "bwrap missing"
 
+# OpenCode max is part of the provisioned document. A live file that lost it
+# must fail; absence is not treated as the default.
+if "$FACTORY_ROOT/bin/factory-oc-provision" --print-config | factory_oc_config_problems >/tmp/factory-doctor-oc-src.txt 2>&1; then
+  ok "provision default reasoningEffort=max"
+else
+  bad "provision default lost reasoningEffort=max ($(tr '\n' ' ' </tmp/factory-doctor-oc-src.txt))"
+fi
+if id factory-oc >/dev/null 2>&1; then
+  OC_CFG=/home/factory-oc/.config/opencode/opencode.json
+  if sudo -n test -f "$OC_CFG" 2>/dev/null; then
+    if sudo -n cat "$OC_CFG" | factory_oc_config_problems >/tmp/factory-doctor-oc-live.txt 2>&1; then
+      ok "live OC reasoningEffort=max"
+    else
+      bad "live OC config lost reasoningEffort=max ($(tr '\n' ' ' </tmp/factory-doctor-oc-live.txt)); run factory-oc-provision"
+    fi
+  else
+    bad "live OC opencode.json missing (runtime config lost; run factory-oc-provision)"
+  fi
+fi
+
+# Approved Agent SDK pin. Checked only when the profile package is installed.
+SDK_JSON="$HOME/.dsh/profiles/headless/node_modules/@anthropic-ai/claude-agent-sdk/package.json"
+if [[ -f "$SDK_JSON" ]]; then
+  sdk_ver=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version") or "")' "$SDK_JSON")
+  cc_ver=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("claudeCodeVersion") or "")' "$SDK_JSON")
+  [[ "$sdk_ver" == "0.3.319" ]] && ok "Agent SDK $sdk_ver" || bad "Agent SDK is ${sdk_ver:-unknown}, approved pin is 0.3.319"
+  [[ "$cc_ver" == "2.1.319" ]] && ok "Claude Code $cc_ver" || bad "bundled Claude Code is ${cc_ver:-unknown}, approved is 2.1.319"
+fi
+
 # Quick bwrap env probe (no network model call)
 WS=$(mktemp -d /tmp/factory-doctor-XXXXXX)
 echo hi > "$WS/x"

@@ -18,6 +18,11 @@ if [[ "${1:-}" == "--print-config" ]]; then
   factory_oc_opencode_json "$MODEL"
   exit 0
 fi
+if [[ "${1:-}" == "--apply-config" ]]; then
+  [[ -n "${2:-}" ]] || die "usage: factory-oc-provision --apply-config <file>"
+  FACTORY_OC_MODEL="$MODEL" factory_oc_write_config "$2" file
+  exit 0
+fi
 SRC="${FACTORY_OC_SRC_BIN:-$HOME/.local/lib/node_modules/@opencode/cli/bin/opencode.exe}"
 LAUNCHER="$FACTORY_ROOT/bin/opencode-acp-isolated"
 S="sudo -n"
@@ -38,9 +43,8 @@ if [[ "$($S sha256sum "$H/bin/opencode" 2>/dev/null | cut -d' ' -f1)" != "$(sha2
 fi
 
 CFG="$H/.config/opencode/opencode.json"
-WANT=$(factory_oc_opencode_json "$MODEL")
-if [[ "$($S cat "$CFG" 2>/dev/null || true)" != "$WANT" ]]; then
-  printf '%s' "$WANT" | $S tee "$CFG" >/dev/null; $S chown "$U:$U" "$CFG"; $S chmod 600 "$CFG"
+# Same writer as --apply-config. Reprovision replaces a max-less file; it does not drop max.
+if [[ "$(FACTORY_OC_MODEL="$MODEL" factory_oc_write_config "$CFG" sudo)" == wrote ]]; then
   say "wrote $CFG (model=$MODEL)"
 fi
 
