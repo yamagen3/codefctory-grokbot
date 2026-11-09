@@ -99,19 +99,23 @@ if problems:
 '
 }
 
-# Claude Code's built-in /goal for the SPEC step. The whole prompt is the
-# condition: CC keeps turns until an evaluator, which only reads the transcript,
-# judges it met or impossible. DSH /goal is not used.
-# https://code.claude.com/docs/en/goal
+# Claude Code's built-in /goal for the SPEC step. The condition is only the
+# first line: the docs cap it at 4,000 characters
+# (https://code.claude.com/docs/en/goal). The brief and the rest of the SPEC
+# instructions follow that line, in full, so a long brief is not truncated and
+# is not stuffed into the condition. DSH /goal is not used.
 factory_cc_spec_prompt() {
   local brief="${1:-}" pkg="${2:-unknown}" turns="${FACTORY_CC_GOAL_TURNS:-12}"
+  local condition prompt
   [[ -n "$brief" ]] || die "factory_cc_spec_prompt: brief required"
   [[ "$turns" =~ ^[1-9][0-9]*$ ]] || die "factory_cc_spec_prompt: turn bound must be a positive integer"
-  cat <<EOF
-/goal Freeze a testable spec for the brief, or stop after ${turns} turns.
-Prove it in the final reply by quoting the CLI invocation from spec/PRODUCT.md, the first line of spec/IMPL_STRATEGY.md in the form parallel: N where N is an integer from 1 to 4, one tests/acceptance path, and whether spec/OPEN_QUESTIONS.md says None or lists questions. The evaluator only reads this transcript, so unquoted files are not proof. Do not implement the product.
+  condition="/goal Freeze spec/PRODUCT.md, tests/acceptance, spec/OPEN_QUESTIONS.md, and spec/IMPL_STRATEGY.md whose first line is parallel: N with N from 1 to 4. Prove it by quoting those in the final reply. Do not implement src/. Or stop after ${turns} turns."
+  [[ "${#condition}" -le 4000 ]] || die "factory_cc_spec_prompt: /goal condition is ${#condition} characters; Claude Code allows 4000"
+  prompt="${condition}
 
-You are the factory SPEC step. Working directory is the product repo.
+You are the factory SPEC step. Working directory is the product repo."
+  cat <<EOF
+${prompt}
 
 Create or update ONLY under spec/ and tests/acceptance/:
 - spec/PRODUCT.md — concise, testable product spec (Python stdlib only unless the brief explicitly allows deps; target Python 3.12+). Include CLI invocation, I/O, errors, and constraints.
