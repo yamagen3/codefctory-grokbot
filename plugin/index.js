@@ -8,7 +8,6 @@ import { randomUUID } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import z from '@deepseek-ai/schemastery'
 import { brandString } from '@deepseek-ai/dsh-brand'
-import { configureDshGoal } from './dsh-goal.js'
 
 export const name = 'factory-orchestrator'
 
@@ -146,34 +145,6 @@ async function run(ctx, config, io) {
   const agent = handle.agent
 
   const controller = new AbortController()
-  const goalLine = process.env.FACTORY_DSH_GOAL_LINE
-  if (goalLine) {
-    try {
-      const configured = await configureDshGoal({
-        commands: ctx.commands ?? ctx.get?.('commands'),
-        goals: ctx.goals ?? ctx.get?.('goals'),
-        agent,
-        line: goalLine,
-        signal: controller.signal,
-        prompt: task,
-      })
-      io.stderr.write(`factory: DSH /goal configured phase=${configured.phase} activation=${configured.activation} objective=${JSON.stringify(configured.objective)}\n`)
-    } catch (error) {
-      agmsgProgress('end', `DSH /goal failed: ${error?.message || error}`)
-      io.stderr.write(`factory: DSH /goal failed: ${error?.message || error}\n`)
-      if (json) {
-        io.stdout.write(`${JSON.stringify({
-          stopReason: 'error',
-          output: [],
-          diagnostic: String(error?.message || error),
-        })}\n`)
-      }
-      try { await handle.dispose() } catch { /* ignore */ }
-      io.exit(1)
-      return
-    }
-  }
-
   const timer = setTimeout(() => {
     io.stderr.write(`factory: timeout after ${timeoutMs}ms — aborting child\n`)
     controller.abort(new Error(`factory-orchestrator: step timed out after ${timeoutMs}ms`))
