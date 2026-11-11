@@ -24,8 +24,11 @@ factory_dsh_profile_nm() {
 
 # Render config/factory.patch.yml for this host.
 # Tokens: __FACTORY_ROOT__ and __FACTORY_DSH_NM__.
-# Legacy absolute paths are rewritten the same way, and left untouched when they
-# already match this host (HOME=/home/box, root /workspace/factory).
+# Legacy absolute paths are rewritten first, then tokens are expanded.
+# The new root may itself start with /workspace/factory (factory.v2 or factory/extra).
+# Expanding tokens first would let the legacy pass rewrite those new paths again.
+# A path boundary is / or end, not '.': /workspace/factory.v2 is a different directory.
+# When the host already is /home/box and /workspace/factory, the text is unchanged.
 factory_render_patch() {
   local src="${1:?}" dest="${2:?}"
   local nm
@@ -34,15 +37,15 @@ factory_render_patch() {
 import pathlib, re, sys
 src, dest, root, nm = sys.argv[1:]
 text = pathlib.Path(src).read_text()
-text = text.replace("__FACTORY_ROOT__", root).replace("__FACTORY_DSH_NM__", nm)
 
 def sub_exact(text, old, new):
     if not old or old == new:
         return text
-    return re.sub(re.escape(old) + r"(?![A-Za-z0-9_-])", lambda _m: new, text)
+    return re.sub(re.escape(old) + r"(?![A-Za-z0-9_.-])", lambda _m: new, text)
 
 text = sub_exact(text, "/workspace/factory", root)
 text = sub_exact(text, "/home/box/.dsh/profiles/headless/node_modules", nm)
+text = text.replace("__FACTORY_ROOT__", root).replace("__FACTORY_DSH_NM__", nm)
 pathlib.Path(dest).write_text(text)
 PY
 }

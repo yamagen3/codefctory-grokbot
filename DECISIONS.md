@@ -73,7 +73,7 @@ Tool-body upgrades (DSH, OpenCode, Agent SDK) are **not** driven by “a newer v
 - 2026-11-11: **fresh clone は `/home/box` と `/workspace/factory` を前提にしない。** 元ホスト（HOME=`/home/box`、root `/workspace/factory`）では解決結果が従来のパスと同じになる。
   - `FACTORY_ROOT` 未設定時は `bin/factory-common.sh` の位置（`<checkout>/bin` の親）から決める。`factory-local-dry-run`、Python の usage/github/update、`plugin/index.js`（`import.meta.url`、env が優先）も同じ。
   - DSH の headless `node_modules` は `$HOME/.dsh/profiles/headless/node_modules`（`FACTORY_DSH_PROFILE_NM` で上書き）。`factory-setup` の vendor symlink と `apply-cc-allowlist-patch.sh` の既定 PKG はこれ。
-  - `config/factory.patch.yml` は YAML なので env を展開しない。パスは `__FACTORY_ROOT__` と `__FACTORY_DSH_NM__`。`factory-step` が一時ファイルへ描画してから `dsh --patch` する。CC の `claude-opus-5-5` と `CLAUDE_CODE_EFFORT_LEVEL: xhigh` はリテラルのまま。
+  - `config/factory.patch.yml` は YAML なので env を展開しない。パスは `__FACTORY_ROOT__` と `__FACTORY_DSH_NM__`。`factory-step` が一時ファイルへ描画してから `dsh --patch` する。古いリテラル（`/workspace/factory` と `/home/box/.dsh/...`）はトークン展開の前に一度だけ置換する。先にトークンを展開すると、root が `/workspace/factory.v2` や `/workspace/factory/extra` のとき新しいパスがもう一度書き換わる。パス境界は `/` または終端で、`.` は別ディレクトリ名（`factory.v2`）として残す。CC の `claude-opus-5-5` と `CLAUDE_CODE_EFFORT_LEVEL: xhigh` はリテラルのまま。
   - CC パッチが DSH パッケージへ書き込む import も適用時に checkout の絶対パスへ置換する（snippet は `__FACTORY_ROOT__`）。
   - leak-check の 14 項目は維持。隠す対象は起動ユーザーの HOME と factory checkout。checkout が `/workspace` 配下のときは `/workspace` 自体も非マウントのまま。
   - `factory-impl-step` のワークスペース返却 chown は起動ユーザー（元ホストでは `box`）。

@@ -49,6 +49,30 @@ grep -q '/home/box/.dsh/profiles/headless/node_modules/@deepseek-ai/dsh-subagent
 grep -q '/workspace/factory/plugin/index.js' "$ORIG" || fail "original host root did not render the historical plugin path"
 rm -f "$ORIG"
 
+# A root that starts with the legacy prefix must not be rewritten a second time.
+DOT="$(mktemp /tmp/factory-patch-dot-XXXXXX.yml)"
+render_one /home/factory /workspace/factory.v2 "$DOT"
+grep -Fq '/workspace/factory.v2/plugin/index.js' "$DOT" || fail "dot-suffix root missing"
+grep -Fq '/workspace/factory.v2/bin/opencode-acp-isolated' "$DOT" || fail "dot-suffix launcher missing"
+grep -Fq '/workspace/factory.v2.v2' "$DOT" && fail "dot-suffix root was rewritten twice"
+rm -f "$DOT"
+NEST="$(mktemp /tmp/factory-patch-nest-XXXXXX.yml)"
+render_one /home/factory /workspace/factory/extra "$NEST"
+grep -Fq '/workspace/factory/extra/plugin/index.js' "$NEST" || fail "nested root missing"
+grep -Fq '/workspace/factory/extra/extra' "$NEST" && fail "nested root was rewritten twice"
+rm -f "$NEST"
+# A file that still has the old literals is rewritten once, including a dot-suffix root.
+LEG_SRC="$(mktemp /tmp/factory-patch-leg-XXXXXX.yml)"
+LEG="$(mktemp /tmp/factory-patch-legout-XXXXXX.yml)"
+printf '%s\n' "plugin: /workspace/factory/plugin/index.js" "nm: /home/box/.dsh/profiles/headless/node_modules/pkg" > "$LEG_SRC"
+env -u FACTORY_DSH_PROFILE_NM HOME=/home/factory FACTORY_ROOT=/workspace/factory.v2 \
+  bash -c 'source "$1/bin/factory-common.sh"; factory_render_patch "$2" "$3"' \
+  bash "$ROOT" "$LEG_SRC" "$LEG"
+grep -Fq 'plugin: /workspace/factory.v2/plugin/index.js' "$LEG" || fail "legacy literal was not rewritten once"
+grep -Fq '/workspace/factory.v2.v2' "$LEG" && fail "legacy literal dot-suffix was rewritten twice"
+grep -Fq 'nm: /home/factory/.dsh/profiles/headless/node_modules/pkg' "$LEG" || fail "legacy DSH literal was not rewritten"
+rm -f "$LEG_SRC" "$LEG"
+
 # Common derives the checkout when FACTORY_ROOT is unset.
 derived="$(env -u FACTORY_ROOT bash -c 'source "'"$ROOT"'/bin/factory-common.sh"; printf %s "$FACTORY_ROOT"')"
 [[ "$derived" == "$ROOT" ]] || fail "FACTORY_ROOT derived as $derived, want $ROOT"
