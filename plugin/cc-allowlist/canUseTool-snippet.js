@@ -12,7 +12,7 @@
 				};
 			}
 			try {
-				const { makeCanUseTool } = await import("/workspace/factory/plugin/cc-allowlist/allowlist.js");
+				const { makeCanUseTool } = await import("__FACTORY_ROOT__/plugin/cc-allowlist/allowlist.js");
 				const decide = makeCanUseTool(step, spec.cwd);
 				const result = await decide(toolName, input);
 				if (result.behavior === "deny") {

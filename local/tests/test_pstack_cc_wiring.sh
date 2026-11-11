@@ -25,10 +25,10 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/pkg"
 python3 - "$ROOT/plugin/cc-allowlist/vendor/index.js" "$tmp/pkg/index.js" <<'PY'
-import pathlib, sys
+import pathlib, re, sys
 src, dest = sys.argv[1:]
 text = pathlib.Path(src).read_text()
-text = text.replace('import { pstackQueryOverlay } from "/workspace/factory/plugin/cc-allowlist/pstack-session.js";\n', '')
+text = re.sub(r'import \{ pstackQueryOverlay \} from "[^"]*pstack-session\.js";\n', '', text)
 old = "\t\t...pstackQueryOverlay(),\n"
 if text.count(old) != 1:
     raise SystemExit(f"expected one vendor spread, found {text.count(old)}")

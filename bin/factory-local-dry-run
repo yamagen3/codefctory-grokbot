@@ -5,8 +5,8 @@ set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
 
 ID="${1:-dry-$(date +%Y%m%d-%H%M%S)}"
-WORK="/workspace/factory/dry-runs/${ID}"
-TEMPLATE="/workspace/factory/repo-template"
+WORK="$FACTORY_ROOT/dry-runs/${ID}"
+TEMPLATE="$FACTORY_ROOT/repo-template"
 
 rm -rf "$WORK"
 mkdir -p "$WORK"

@@ -59,15 +59,16 @@
 ## 使用量記録（factory-usage, 2026-11-05）
 - [x] JSONL 記録・`factory-usage show|summary|agmsg`・run 終了サマリ・テスト。
 - [x] CC tokens: subagent パッチの usage sidecar で記録（modelUsage）。[ ] DSH 上流に usage 素通しを要望（パッチ依存を外すため）。
-- [ ] OpenCode tokens は stats 差分のため、OC 工程が同時に走ると混ざる（notes に記録）。
+- [x] 並列 IMPL の OpenCode tokens はスロットの `FACTORY_OC_HOME` の stats 差分（共有 home を同時に読むと 0 または混線になる）。`impl-sN` は `step=impl` + `oc_slot`。`oc_model` / `oc_reasoning_effort` はスロットの opencode.json。
+- [ ] 共有 `/home/factory-oc` を同時に使う工程（`FACTORY_OC_HOME` なし）の stats 差分は今も混ざる。egress 制限とあわせて残る。
 - [ ] agmsg unread プローブは内部 API（`lib/storage.sh` の `storage_list_unread`）依存。存在しない team でも 0 を返すため、team/agent 名の誤りを検出できない。
 - [ ] `factory-local-dry-run` は run summary を出さない（factory-step 単位の記録のみ）。
 - [x] OpenCode Go 残量 `factory-usage balance`（zen/go/v1/usage）。CC 残量は非公式 API 不使用のため対象外。
 - [ ] OC Go の percent は粗い（実 tokens が動いても 0% のまま）。精度が必要なら tokens 側（stats 差分）を正とする。
 - [x] CC を claude-opus-5-5 + xhigh にピン（SDK 0.3.318 / claude 2.1.318、実 pong で cc_effort=xhigh 確認）。
 - [x] box 部分初期化からの OpenCode 隔離復旧（`factory-oc-provision`、doctor PASS / OC pong / leak 14/14）。
-- [ ] `plugin/node_modules` の自動復旧（`npm ci`）を factory-setup に入れるか検討。
-- [ ] `factory-step` は plugin import 失敗時も dsh が exit 0 を返し得る（出力なしで成功扱い）。
+- [x] `plugin/node_modules` は `factory-setup` が `npm ci --omit=dev` で入れる。doctor は `@deepseek-ai/schemastery` 欠落を FAIL。
+- [x] `factory-step` は plugin が `factory: step end` を出さず stdout も空なら exit 1（dsh が import 失敗を 0 で返しても成功扱いにしない）。
 - [ ] DSH が SDK ピンを上げたら `config/headless.pnpm-workspace.yaml` の overrides を外す（DSH のピン ≥ override なら不要）。
 
 ## multi OpenCode / 隔離 follow-ups（2026-11-05）

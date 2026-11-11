@@ -2,13 +2,15 @@
 # FACTORY_PROVIDER=claude-code|opencode selects the child backend.
 # OpenCode Go: OPENCODE_GO_KEY → FACTORY_OC_API_KEY stash → child OPENCODE_API_KEY.
 # Claude Code: FACTORY_CC_STEP=spec|gate selects canUseTool allowlist (plugin/cc-allowlist).
+# __FACTORY_ROOT__ and __FACTORY_DSH_NM__ are rendered by factory-step (factory_render_patch)
+# from the checkout and $HOME/.dsh/profiles/headless/node_modules. CC pins stay literal.
 
 - id: headless-runner
   disabled: true
 
 - insert:
     - id: subagent-claude-code
-      name: '/home/box/.dsh/profiles/headless/node_modules/@deepseek-ai/dsh-subagent-claude-code/lib/index.js'
+      name: '__FACTORY_DSH_NM__/@deepseek-ai/dsh-subagent-claude-code/lib/index.js'
       config:
         providerName: claude-code
         # Pinned per user decision (DECISIONS 2026-11-05): Opus 5.5 at xhigh effort.
@@ -26,13 +28,13 @@
           )
 
     - id: subagent-acp-opencode
-      name: '/home/box/.dsh/profiles/headless/node_modules/@deepseek-ai/dsh-subagent-acp/lib/index.js'
+      name: '__FACTORY_DSH_NM__/@deepseek-ai/dsh-subagent-acp/lib/index.js'
       config:
         providerName: opencode
         command: /usr/bin/sudo
         args:
           - '-n'
-          - /workspace/factory/bin/opencode-acp-isolated
+          - __FACTORY_ROOT__/bin/opencode-acp-isolated
         permission: allow
         env: !!js >
           Object.fromEntries(
@@ -45,7 +47,7 @@
           )
 
     - id: factory-orchestrator
-      name: '/workspace/factory/plugin/index.js'
+      name: '__FACTORY_ROOT__/plugin/index.js'
       inject: [headlessStartup]
       config:
         task: !!js ctx.headlessStartup.task

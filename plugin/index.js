@@ -6,10 +6,17 @@
  */
 import { randomUUID } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import z from '@deepseek-ai/schemastery'
 import { brandString } from '@deepseek-ai/dsh-brand'
 
 export const name = 'factory-orchestrator'
+
+// plugin/index.js → repo root. FACTORY_ROOT from factory-step wins; this fallback
+// is the checkout that contains the plugin (original host: /workspace/factory).
+const FACTORY_ROOT = process.env.FACTORY_ROOT
+  || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
 /** Core services required before the one-shot activation can start. */
 export const inject = ['agents', 'subagents']
@@ -55,7 +62,7 @@ function agmsgProgress(phase, detail) {
   const body = `[factory] ${phase}: ${detail}`
   // Always append to local progress log (no secrets).
   try {
-    const dir = process.env.FACTORY_AGMSG_LOG_DIR || '/workspace/factory/local/logs'
+    const dir = process.env.FACTORY_AGMSG_LOG_DIR || path.join(FACTORY_ROOT, 'local/logs')
     spawnSync('bash', ['-lc', `mkdir -p "${dir}" && echo "$(date -Iseconds) ${body.replace(/"/g, '\\"')}" >> "${dir}/agmsg-progress.log"`], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: process.env,
@@ -80,7 +87,7 @@ function agmsgProgress(phase, detail) {
   }
   // Usage: send count/duration (local/usage/<date>/agmsg.jsonl). Best effort.
   try {
-    const root = process.env.FACTORY_ROOT || '/workspace/factory'
+    const root = FACTORY_ROOT
     spawnSync(`${root}/bin/factory-usage`, ['agmsg-send', '--duration-ms', String(Date.now() - t0), '--exit', String(status)], {
       stdio: ['ignore', 'ignore', 'ignore'],
       env: process.env,
