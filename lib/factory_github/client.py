@@ -25,7 +25,11 @@ def _now() -> str:
 
 
 def _factory_root() -> Path:
-    return Path(os.environ.get("FACTORY_ROOT", "/workspace/factory"))
+    env = os.environ.get("FACTORY_ROOT")
+    if env:
+        return Path(env)
+    # lib/factory_github/client.py → repo root. Original host: /workspace/factory.
+    return Path(__file__).resolve().parents[2]
 
 
 @dataclass

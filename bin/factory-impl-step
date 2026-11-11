@@ -49,9 +49,13 @@ echo "factory-impl-step: parallel=${PARALLEL} source=${PARALLEL_SOURCE}"
 PROMPT="${*:-Implement per spec/PRODUCT.md so tests/acceptance pass. Stdlib only. Minimal changes. Do not modify spec/ or tests/acceptance/ or .github/.}"
 STEP_BIN="${FACTORY_STEP_BIN:-factory-step}"
 LOG_DIR="${FACTORY_ROOT}/local/logs"
-mkdir -p "$LOG_DIR" /var/factory/oc-workspaces
-sudo -n mkdir -p /var/factory/oc-homes 2>/dev/null || mkdir -p /var/factory/oc-homes 2>/dev/null || true
-sudo -n chmod 1777 /var/factory/oc-homes 2>/dev/null || chmod 1777 /var/factory/oc-homes 2>/dev/null || true
+mkdir -p "$LOG_DIR"
+# Workspace and slot-home roots are root-owned on a normal host. Fall back to sudo
+# when the invoking user cannot create them (original host already has both).
+mkdir -p /var/factory/oc-workspaces /var/factory/oc-homes 2>/dev/null \
+  || sudo -n mkdir -p /var/factory/oc-workspaces /var/factory/oc-homes
+sudo -n chmod 1777 /var/factory/oc-workspaces /var/factory/oc-homes 2>/dev/null \
+  || chmod 1777 /var/factory/oc-workspaces /var/factory/oc-homes 2>/dev/null || true
 
 RUN_TAG="impl-${ID}-$$"
 SEED=$(mktemp -d /tmp/factory-seed-XXXXXX)
@@ -164,7 +168,11 @@ for i in $(seq 1 "$PARALLEL"); do
   else
     EC_LIST+=(1)
   fi
-  sudo -n chown -R box:box "${WS_LIST[$idx]}" 2>/dev/null || true
+  # Hand the workspace back to the invoking user (original host: box). `|| true` keeps a
+  # missing sudo from failing the step; the name is not hardcoded.
+  host_user="${SUDO_USER:-$(id -un)}"
+  host_group="$(id -gn "$host_user" 2>/dev/null || id -gn)"
+  sudo -n chown -R "${host_user}:${host_group}" "${WS_LIST[$idx]}" 2>/dev/null || true
   find "${WS_LIST[$idx]}" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
   find "${WS_LIST[$idx]}" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete 2>/dev/null || true
 done

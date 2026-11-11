@@ -70,6 +70,18 @@ Tool-body upgrades (DSH, OpenCode, Agent SDK) are **not** driven by “a newer v
 - 2026-11-08: **OpenCode max の欠落は doctor が拒否する。** プロビジョン既定と、factory-oc がいるときの共有 `opencode.json` の両方で `providers.opencode-go.models.deepseek-v4.1-flash.settings.reasoningEffort=max` を要求する。ファイルが無い、または effort が max でないときは FAIL（黙って既定扱いにしない）。試験 `local/tests/test_oc_reasoning_guard.sh`。再適用は既存の `factory-oc-provision`。このクラウド編集は box の稼働ファイルを書かない。
 - 2026-11-08: **承認済み Agent SDK は 0.3.319（同梱 Claude Code 2.1.319）。** npm の package.json `claudeCodeVersion` が 2.1.319 であることを確認した。`config/headless.pnpm-workspace.yaml` の写しを 0.3.318 から 0.3.319 に合わせ、0.3.318 のまま残して後から戻すことがないようにした。インストールはしていない。0.3.319 より先へは上げない。プロファイルに package.json があるとき doctor はその版を要求する。`settingSources` の 0.3.319 `sdk.d.ts` 注記は 0.3.318 と同じ（省略時は全ソース）。
 
+- 2026-11-11: **fresh clone は `/home/box` と `/workspace/factory` を前提にしない。** 元ホスト（HOME=`/home/box`、root `/workspace/factory`）では解決結果が従来のパスと同じになる。
+  - `FACTORY_ROOT` 未設定時は `bin/factory-common.sh` の位置（`<checkout>/bin` の親）から決める。`factory-local-dry-run`、Python の usage/github/update、`plugin/index.js`（`import.meta.url`、env が優先）も同じ。
+  - DSH の headless `node_modules` は `$HOME/.dsh/profiles/headless/node_modules`（`FACTORY_DSH_PROFILE_NM` で上書き）。`factory-setup` の vendor symlink と `apply-cc-allowlist-patch.sh` の既定 PKG はこれ。
+  - `config/factory.patch.yml` は YAML なので env を展開しない。パスは `__FACTORY_ROOT__` と `__FACTORY_DSH_NM__`。`factory-step` が一時ファイルへ描画してから `dsh --patch` する。CC の `claude-opus-5-5` と `CLAUDE_CODE_EFFORT_LEVEL: xhigh` はリテラルのまま。
+  - CC パッチが DSH パッケージへ書き込む import も適用時に checkout の絶対パスへ置換する（snippet は `__FACTORY_ROOT__`）。
+  - leak-check の 14 項目は維持。隠す対象は起動ユーザーの HOME と factory checkout。checkout が `/workspace` 配下のときは `/workspace` 自体も非マウントのまま。
+  - `factory-impl-step` のワークスペース返却 chown は起動ユーザー（元ホストでは `box`）。
+- 2026-11-11: **公開時に落とされていた `local/tests` 10 件を戻した。** doctor が実行する `test_github_backend.py` と `test-cc-allowlist.mjs` を含む。`local/origin/*.git` は gitignore のまま。`test_resolve_repo.sh` と `test_gate_grok_full_diff.sh` は自分で bare origin を作る。テスト内の root はスクリプト位置から決める。
+- 2026-11-11: **`factory-setup` は `plugin/` で `npm ci --omit=dev` する。** `plugin/node_modules` は gitignore。無いと `@deepseek-ai/schemastery` の import に失敗する。doctor は欠落を FAIL する。DSH の claude-code パッケージがまだ無いホストでは allowlist パッチは WARN してスキップ（プロファイル導入後の再実行で適用）。
+- 2026-11-11: **`factory-step` はプラグインが走らなければ非ゼロ。** dsh は plugin import 失敗時に stdout 空・stderr 警告だけで exit 0 になり得る。`factory: step end` が無く stdout も空なら exit 1 と理由を出す。`factory: step end … exit=N` を dsh が 0 のまま返したときも N を使う。使用量記録の失敗では工程を落とさない。
+- 2026-11-11: **並列 IMPL の OpenCode 使用量。** `FACTORY_USAGE_STEP=impl-sN` は `step=impl` と `oc_slot=N`（以前は allowlist 外なので `other`）。stats は `FACTORY_OC_HOME` の DB を読む（bwrap がその home を `/home/factory-oc` に bind するため。未設定時は共有 `/home/factory-oc` のまま）。スロット home で before が取れず after があるときは 0 基線で差分する。共有 home では before 失敗を寿命合計で埋めない。`oc_model` と `oc_reasoning_effort` は使った `opencode.json` から読む。読めなければフィールドを付けない（推測しない）。OC のモデル ID と `reasoningEffort=max` のピンは変えない。
+
 ## 2026-11-07 — publication provenance（codefctory-grokbot）
 
 公開元はローカル factory HEAD `2da5ab4704b93f23f077b5983231e2a9967aa76d` のサニタイズスナップショット。リモート `yamagen3/codefctory-grokbot` を先に確認した: ブランチは `main` のみ、コミットは `7d316ca347f787b3924fda78fcc6e001f254b67d`（Initial commit、`README.md` のみ）。PR / Issue / 他ブランチは無し。目的の衝突は見当たらないため、この履歴を書き換えずにブランチへ統合した。

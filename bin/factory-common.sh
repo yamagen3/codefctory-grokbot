@@ -2,8 +2,50 @@
 # Shared helpers for factory orchestrator scripts (local + future GitHub).
 set -euo pipefail
 
-FACTORY_ROOT="${FACTORY_ROOT:-/workspace/factory}"
+# Checkout root. FACTORY_ROOT wins when set. Otherwise this file lives in <root>/bin,
+# which on the original host is /workspace/factory and elsewhere is the clone path.
+if [[ -z "${FACTORY_ROOT:-}" ]]; then
+  _factory_common_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  FACTORY_ROOT="$(cd "$_factory_common_dir/.." && pwd)"
+fi
+unset _factory_common_dir
+export FACTORY_ROOT
 export PATH="${HOME}/.local/bin:${FACTORY_ROOT}/bin:${PATH}"
+
+# DSH headless profile node_modules for the invoking user.
+# Original host: HOME=/home/box, so this is /home/box/.dsh/profiles/headless/node_modules.
+factory_dsh_profile_nm() {
+  if [[ -n "${FACTORY_DSH_PROFILE_NM:-}" ]]; then
+    printf '%s\n' "$FACTORY_DSH_PROFILE_NM"
+  else
+    printf '%s\n' "${HOME}/.dsh/profiles/headless/node_modules"
+  fi
+}
+
+# Render config/factory.patch.yml for this host.
+# Tokens: __FACTORY_ROOT__ and __FACTORY_DSH_NM__.
+# Legacy absolute paths are rewritten the same way, and left untouched when they
+# already match this host (HOME=/home/box, root /workspace/factory).
+factory_render_patch() {
+  local src="${1:?}" dest="${2:?}"
+  local nm
+  nm="$(factory_dsh_profile_nm)"
+  python3 - "$src" "$dest" "$FACTORY_ROOT" "$nm" <<'PY'
+import pathlib, re, sys
+src, dest, root, nm = sys.argv[1:]
+text = pathlib.Path(src).read_text()
+text = text.replace("__FACTORY_ROOT__", root).replace("__FACTORY_DSH_NM__", nm)
+
+def sub_exact(text, old, new):
+    if not old or old == new:
+        return text
+    return re.sub(re.escape(old) + r"(?![A-Za-z0-9_-])", lambda _m: new, text)
+
+text = sub_exact(text, "/workspace/factory", root)
+text = sub_exact(text, "/home/box/.dsh/profiles/headless/node_modules", nm)
+pathlib.Path(dest).write_text(text)
+PY
+}
 
 die() { echo "factory: $*" >&2; exit 1; }
 require_cmd() { command -v "$1" >/dev/null || die "missing command: $1"; }

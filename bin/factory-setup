@@ -3,10 +3,19 @@
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
 
-echo "factory-setup: root=$FACTORY_ROOT"
+echo "factory-setup: root=$FACTORY_ROOT home=$HOME"
 
 # Dirs
 mkdir -p "$FACTORY_ROOT/local"/{status,labels,notify,logs,prs,grok-hooks,origin,work,tests}
+
+# Plugin deps are gitignored. A fresh clone cannot load @deepseek-ai/schemastery until this runs.
+# npm ci is idempotent: a second setup reinstalls the lockfile and leaves the same tree.
+if [[ -f "$FACTORY_ROOT/plugin/package-lock.json" ]] && command -v npm >/dev/null; then
+  echo "factory-setup: plugin deps (npm ci)"
+  (cd "$FACTORY_ROOT/plugin" && npm ci --omit=dev)
+else
+  echo "factory-setup: WARN npm or plugin/package-lock.json missing; plugin deps not installed" >&2
+fi
 
 # CC allowlist patch on profile-installed dsh-subagent-claude-code
 if [[ -x "$FACTORY_ROOT/scripts/apply-cc-allowlist-patch.sh" ]]; then
@@ -17,7 +26,7 @@ fi
 
 # Ensure vendor node_modules symlink for any leftover vendor copy
 VENDOR_NM="$FACTORY_ROOT/plugin/cc-allowlist/vendor/node_modules"
-PROFILE_NM="/home/box/.dsh/profiles/headless/node_modules"
+PROFILE_NM="$(factory_dsh_profile_nm)"
 if [[ -d "$PROFILE_NM" ]]; then
   mkdir -p "$(dirname "$VENDOR_NM")"
   ln -sfn "$PROFILE_NM" "$VENDOR_NM"

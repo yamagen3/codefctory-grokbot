@@ -56,8 +56,15 @@ def main(a):
             return 0
         for r in recs:
             tok = "tok=?" if r.get("total_tokens") is None else f"tok={r['input_tokens']}/{r['output_tokens']}"
+            extra = ""
+            if r.get("oc_slot") is not None:
+                extra += f" slot=s{r['oc_slot']}"
+            if r.get("oc_model"):
+                extra += f" oc={r['oc_model']}"
+                if r.get("oc_reasoning_effort"):
+                    extra += f"/{r['oc_reasoning_effort']}"
             print(f"{r['started_at'][:19]}  {str(r.get('run_id'))[:40]:40}  r{r.get('round') or '-'}  {r['step']:11} {r['provider']:11} "
-                  f"{U.fmt_ms(r['duration_ms']):>9}  {tok:22} exit={r.get('exit_code')} {r.get('stop_reason') or ''}")
+                  f"{U.fmt_ms(r['duration_ms']):>9}  {tok:22} exit={r.get('exit_code')} {r.get('stop_reason') or ''}{extra}")
         return 0
     if cmd == "summary":
         by = tuple((opt(args, "--by") or "day,provider").split(","))

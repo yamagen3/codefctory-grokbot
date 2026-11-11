@@ -7,11 +7,20 @@ concurrent steps). Tokens are never invented: null + token_source="source_missin
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
 
-ROOT = Path(os.environ.get("FACTORY_ROOT", "/workspace/factory"))
+def _default_root() -> Path:
+    env = os.environ.get("FACTORY_ROOT")
+    if env:
+        return Path(env)
+    # lib/factory_usage.py → repo root. Original host: /workspace/factory.
+    return Path(__file__).resolve().parents[1]
+
+
+ROOT = _default_root()
 STEPS = ("spec", "impl", "gate-claude", "gate-grok", "other")
 PROVIDERS = ("claude-code", "opencode", "grok", "agmsg", "system")
 
@@ -128,19 +137,88 @@ def last_json_line(text):
 
 
 # ---- OpenCode: lifetime stats delta (DSH's ACP result carries no usage) ----
-def oc_stats():
+def oc_stats_home():
+    """Shared /home/factory-oc, or the parallel slot home when FACTORY_OC_HOME is set.
+    The launcher bind-mounts the slot home as /home/factory-oc inside bwrap, so that
+    slot's stats DB is on the host at FACTORY_OC_HOME, not in the shared home.
+    """
+    return os.environ.get("FACTORY_OC_HOME") or "/home/factory-oc"
+
+
+def oc_stats_argv():
     cmd = os.environ.get("FACTORY_USAGE_OC_STATS_CMD")
-    argv = (["bash", "-c", cmd] if cmd else
-            ["sudo", "-n", "-u", "factory-oc", "env", "HOME=/home/factory-oc", "XDG_DATA_HOME=/home/factory-oc/.local/share",
-             "XDG_CONFIG_HOME=/home/factory-oc/.config", "/home/factory-oc/bin/opencode", "stats", "--all", "--json", "--standalone"])
+    if cmd:
+        return ["bash", "-c", cmd]
+    home = oc_stats_home()
+    return ["sudo", "-n", "-u", "factory-oc", "env", f"HOME={home}",
+            f"XDG_DATA_HOME={home}/.local/share", f"XDG_CONFIG_HOME={home}/.config",
+            "/home/factory-oc/bin/opencode", "stats", "--all", "--json", "--standalone"]
+
+
+def oc_stats():
     try:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=60, cwd="/tmp")
+        p = subprocess.run(oc_stats_argv(), capture_output=True, text=True, timeout=60, cwd="/tmp")
         d = json.loads(p.stdout)
         t = d["tokens"]
         return {"input": t.get("input"), "output": t.get("output"), "reasoning": t.get("reasoning"),
                 "cache_read": (t.get("cache") or {}).get("read"), "prompts": d.get("prompts")}
     except Exception:
         return None
+
+
+def _read_text_maybe_sudo(path: Path):
+    try:
+        if path.is_file() and os.access(path, os.R_OK):
+            return path.read_text()
+    except OSError:
+        pass
+    try:
+        chk = subprocess.run(["sudo", "-n", "test", "-f", str(path)], capture_output=True, timeout=5)
+        if chk.returncode != 0:
+            return None
+        p = subprocess.run(["sudo", "-n", "cat", str(path)], capture_output=True, text=True, timeout=5)
+        if p.returncode == 0 and p.stdout.strip():
+            return p.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return None
+
+
+def oc_configured():
+    """(model, reasoningEffort) from the OpenCode config this step used.
+    Missing or unreadable config returns (None, None). Values are not invented.
+    """
+    raw = _read_text_maybe_sudo(Path(oc_stats_home()) / ".config/opencode/opencode.json")
+    if not raw:
+        return None, None
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, None
+    model = doc.get("model") if isinstance(doc.get("model"), str) else None
+    effort = None
+    if isinstance(model, str) and "/" in model:
+        provider, mid = model.split("/", 1)
+        cur = doc.get("providers")
+        for key in (provider, "models", mid, "settings", "reasoningEffort"):
+            if not isinstance(cur, dict):
+                cur = None
+                break
+            cur = cur.get(key)
+        if isinstance(cur, str):
+            effort = cur
+    return model, effort
+
+
+def normalize_step(raw):
+    """Stable step label. Parallel IMPL slots are impl-sN; those stay step=impl plus a slot number."""
+    if raw in STEPS:
+        return raw, None
+    if isinstance(raw, str):
+        m = re.fullmatch(r"impl-s(\d+)", raw)
+        if m:
+            return "impl", int(m.group(1))
+    return "other", None
 
 
 def oc_delta(before, after):
@@ -165,31 +243,48 @@ def record_step(provider, started_at, ended_at, duration_ms, exit_code, result_t
             note.append("effort not reported by SDK init (unverified)")
         if cextra.get("cc_effort") and cextra["cc_effort"] != want:
             note.append(f"effort downgrade: requested {want}, effective {cextra['cc_effort']}")
-    if src == "source_missing" and provider == "opencode" and oc_before is not None:
-        dlt = oc_delta(oc_before, oc_after)
-        if dlt and dlt.get("input") is not None:
-            i, o, src = dlt["input"], dlt["output"], "opencode-stats-delta"
-            if dlt.get("reasoning") is not None:
-                extra["reasoning_tokens"] = dlt["reasoning"]
-            if dlt.get("cache_read") is not None:
-                extra["cache_read_tokens"] = dlt["cache_read"]
-            if dlt.get("prompts") not in (None, 1):
-                note.append(f"oc-stats delta spans {dlt.get('prompts')} prompts (concurrent OpenCode steps?)")
+    if src == "source_missing" and provider == "opencode":
+        # A fresh slot home has no stats DB yet, so the before probe is null while after
+        # has this slot's tokens. Treat that before as zero. The shared home does not:
+        # a failed before there must not turn a lifetime total into this step's usage.
+        if oc_before is None and isinstance(oc_after, dict) and os.environ.get("FACTORY_OC_HOME"):
+            oc_before = {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0, "prompts": 0}
+            note.append("oc-stats before missing on slot home; delta from zero baseline")
+        if oc_before is not None:
+            dlt = oc_delta(oc_before, oc_after)
+            if dlt and dlt.get("input") is not None:
+                i, o, src = dlt["input"], dlt["output"], "opencode-stats-delta"
+                if dlt.get("reasoning") is not None:
+                    extra["reasoning_tokens"] = dlt["reasoning"]
+                if dlt.get("cache_read") is not None:
+                    extra["cache_read_tokens"] = dlt["cache_read"]
+                if dlt.get("prompts") not in (None, 1):
+                    note.append(f"oc-stats delta spans {dlt.get('prompts')} prompts (concurrent OpenCode steps?)")
+    if provider == "opencode":
+        oc_model, oc_effort = oc_configured()
+        if oc_model:
+            extra["oc_model"] = oc_model
+        if oc_effort:
+            extra["oc_reasoning_effort"] = oc_effort
     if src == "source_missing":
         note.append("source_missing: " + {"claude-code": "no SDK usage sidecar (patch missing or step failed before a result)",
                                            "opencode": "ACP result has no usage and opencode stats unavailable"}.get(provider, "no usage in result"))
     total = (i + o) if isinstance(i, int) and isinstance(o, int) else None
+    raw_step = ctx.get("step")
+    step, oc_slot = normalize_step(raw_step)
     rec = {
         "run_id": ctx.get("run_id") or None, "target": ctx.get("target") or None,
         "round": int(ctx["round"]) if str(ctx.get("round") or "").isdigit() else None,
-        "step": ctx.get("step") if ctx.get("step") in STEPS else "other",
+        "step": step,
         "provider": provider, "started_at": started_at, "ended_at": ended_at, "duration_ms": duration_ms,
         "input_tokens": i, "output_tokens": o, "total_tokens": total, **extra, "token_source": src,
         "stop_reason": (res or {}).get("stopReason"), "exit_code": exit_code,
         "notes": "; ".join(note) or None,
     }
-    if ctx.get("step") and ctx.get("step") not in STEPS:
-        rec["notes"] = "; ".join(filter(None, [rec["notes"], f"step label={ctx['step']}"]))
+    if oc_slot is not None:
+        rec["oc_slot"] = oc_slot
+    if raw_step and step == "other" and raw_step not in STEPS:
+        rec["notes"] = "; ".join(filter(None, [rec["notes"], f"step label={raw_step}"]))
     append("steps", rec)
     return rec
 

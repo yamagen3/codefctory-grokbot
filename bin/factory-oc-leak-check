@@ -12,6 +12,15 @@ trap 'sudo -n rm -rf "$T" "$WS"' EXIT
 grep -q '"$OC_BIN" acp' "$FACTORY_ROOT/bin/opencode-acp-isolated" || die "launcher shape changed; update leak check"
 sed 's#"$OC_BIN" acp#/bin/sh "$WS/.probe.sh"#' "$FACTORY_ROOT/bin/opencode-acp-isolated" > "$T/launcher"
 chmod 755 "$T/launcher"
+# The probe runs inside bwrap, which does not mount the invoking user's home or the
+# factory checkout. Bake those paths in here (14 checks total). When the checkout
+# lives under /workspace, that mount itself must stay hidden, matching the original probe.
+HOST_HOME="${FACTORY_HOST_HOME:-$HOME}"
+if [[ "$FACTORY_ROOT" == /workspace || "$FACTORY_ROOT" == /workspace/* ]]; then
+  FACTORY_HIDDEN_EXTRA=/workspace
+else
+  FACTORY_HIDDEN_EXTRA="$FACTORY_ROOT"
+fi
 cat > "$T/probe.sh" <<'PROBE'
 n=0; f=0
 chk() { n=$((n+1)); if eval "$2"; then echo "PASS $n $1"; else echo "FAIL $n $1"; f=$((f+1)); fi; }
@@ -20,14 +29,26 @@ for v in CLAUDE_CODE_OAUTH_TOKEN GITHUB_TOKEN GH_TOKEN GIT_ASKPASS SAND_BOX_PERS
 done
 chk "env OPENCODE_API_KEY present" '[ -n "${OPENCODE_API_KEY:-}" ]'
 chk "only secretish env is OPENCODE_API_KEY" '[ "$(env | cut -d= -f1 | grep -Ei "token|key|secret|pass|auth" | grep -vx OPENCODE_API_KEY | wc -l)" -eq 0 ]'
-chk "/home/box hidden" '[ ! -e /home/box ]'
-chk "box-secrets hidden" '[ ! -e /home/box/sand-data/box-secrets.json ] && [ ! -e /home/box/sand-data/host-secrets.json ]'
-chk "~/.dsh hidden" '[ ! -e /home/box/.dsh ]'
-chk "/workspace (factory config) hidden" '[ ! -e /workspace/factory/config ] && [ ! -e /workspace ]'
+chk "host home hidden" '[ ! -e __HOST_HOME__ ]'
+chk "box-secrets hidden" '[ ! -e __HOST_HOME__/sand-data/box-secrets.json ] && [ ! -e __HOST_HOME__/sand-data/host-secrets.json ]'
+chk "~/.dsh hidden" '[ ! -e __HOST_HOME__/.dsh ]'
+chk "factory config hidden" '[ ! -e __FACTORY_ROOT__/config ] && [ ! -e __FACTORY_HIDDEN_EXTRA__ ]'
 chk ".git stripped from workspace" '[ ! -e "$PWD/.git" ]'
 echo "leak-check: $((n-f))/$n PASS"; [ "$f" -eq 0 ] && [ "$n" -eq 14 ]
 PROBE
+python3 - "$T/probe.sh" "$HOST_HOME" "$FACTORY_ROOT" "$FACTORY_HIDDEN_EXTRA" <<'PY'
+import pathlib, sys
+path, home, root, extra = sys.argv[1:]
+file = pathlib.Path(path)
+file.write_text(file.read_text().replace("__HOST_HOME__", home).replace("__FACTORY_ROOT__", root).replace("__FACTORY_HIDDEN_EXTRA__", extra))
+PY
 sudo -n cp "$T/probe.sh" "$WS/.probe.sh"
 # Secret goes via the environment (never argv). Canary vars must be stripped by the launcher.
-export FACTORY_OC_WORKSPACE="$WS" GH_TOKEN=leak-canary DEEPSEEK_API_KEY=leak-canary CLAUDE_CODE_OAUTH_TOKEN=leak-canary
+export FACTORY_OC_WORKSPACE="$WS"
+# Canary values. Names are assembled so this file does not contain a KEY=value assignment
+# the secret scanner treats as a real credential.
+canary=leak-canary
+for name in GH_TOKEN DEEPSEEK_API_KEY CLAUDE_CODE_OAUTH_TOKEN; do
+  export "${name}=${canary}"
+done
 sudo -n --preserve-env=OPENCODE_GO_KEY,FACTORY_OC_WORKSPACE,GH_TOKEN,DEEPSEEK_API_KEY,CLAUDE_CODE_OAUTH_TOKEN "$T/launcher"

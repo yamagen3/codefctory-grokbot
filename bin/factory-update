@@ -30,7 +30,7 @@ import urllib.request
 from pathlib import Path
 
 HOME = Path.home()
-ROOT = Path(os.environ.get("FACTORY_ROOT", "/workspace/factory"))
+ROOT = Path(os.environ["FACTORY_ROOT"]) if os.environ.get("FACTORY_ROOT") else Path(__file__).resolve().parents[1]
 UPD = Path(os.environ.get("FACTORY_UPDATE_DIR", ROOT / "local/updates"))
 PREFIX = Path(os.environ.get("FACTORY_UPDATE_NPM_PREFIX", HOME / ".local"))
 PROFILE = HOME / ".dsh/profiles/headless"

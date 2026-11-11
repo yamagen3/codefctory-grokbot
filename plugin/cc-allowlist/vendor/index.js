@@ -3,7 +3,7 @@ import { MAX_TIMER_DELAY_MS } from "@deepseek-ai/dsh-timeout";
 import { NO_START_CAPABILITIES, assertPositiveFinite, assertUsableCwd, settleRunResult, subprocessRunHandle } from "@deepseek-ai/dsh-subagent";
 import { randomUUID } from "node:crypto";
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { pstackQueryOverlay } from "/workspace/factory/plugin/cc-allowlist/pstack-session.js";
+import { pstackQueryOverlay } from "__FACTORY_ROOT__/plugin/cc-allowlist/pstack-session.js";
 import { brandString } from "@deepseek-ai/dsh-brand";
 import { scrubbedParentEnv } from "@deepseek-ai/dsh-subprocess";
 import { EventEmitter } from "node:events";
@@ -318,7 +318,7 @@ function claudeQueryOptions(spec, controller, capture, captureDiagnostic) {
 				};
 			}
 			try {
-				const { makeCanUseTool } = await import("/workspace/factory/plugin/cc-allowlist/allowlist.js");
+				const { makeCanUseTool } = await import("__FACTORY_ROOT__/plugin/cc-allowlist/allowlist.js");
 				const decide = makeCanUseTool(step, spec.cwd);
 				const result = await decide(toolName, input);
 				if (result.behavior === "deny") {

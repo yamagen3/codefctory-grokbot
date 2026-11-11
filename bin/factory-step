@@ -4,18 +4,24 @@
 #   FACTORY_PROVIDER=claude-code factory-step [dsh opts…] <task…>
 #   FACTORY_PROVIDER=opencode    factory-step [dsh opts…] <task…>
 set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
 
-export PATH="${HOME}/.local/bin:${PATH}"
-
-FACTORY_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PATCH="${FACTORY_PATCH:-$FACTORY_ROOT/config/factory.patch.yml}"
+PATCH_SRC="${FACTORY_PATCH:-$FACTORY_ROOT/config/factory.patch.yml}"
 PROFILE="${FACTORY_PROFILE:-headless}"
 PROVIDER="${FACTORY_PROVIDER:-claude-code}"
 
-if [[ ! -f "$PATCH" ]]; then
-  echo "factory-step: missing patch: $PATCH" >&2
+if [[ ! -f "$PATCH_SRC" ]]; then
+  echo "factory-step: missing patch: $PATCH_SRC" >&2
   exit 2
 fi
+# DSH does not expand the path tokens in factory.patch.yml. Render a temp copy
+# so plugin and profile paths follow this checkout and $HOME.
+PATCH="$(mktemp /tmp/factory-patch-XXXXXX.yml)"
+RESULT=""
+ERR=""
+CC_USAGE=""
+trap 'rm -f "$PATCH" ${RESULT:+"$RESULT"} ${ERR:+"$ERR"} ${CC_USAGE:+"$CC_USAGE"}' EXIT
+factory_render_patch "$PATCH_SRC" "$PATCH"
 
 # Never let Anthropic API-key auth win over Claude OAuth for CC.
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN || true
@@ -55,30 +61,58 @@ case "$PROVIDER" in
 esac
 
 export FACTORY_PROVIDER="$PROVIDER"
-if [[ -n "${FACTORY_USAGE_DISABLE:-}" ]]; then
-  exec dsh --profile "$PROFILE" --patch "$PATCH" "$@"
-fi
+export FACTORY_ROOT
 
-# Usage tracking (local/usage/<date>/steps.jsonl). Never changes the step's stdout or exit code.
+# Usage tracking (local/usage/<date>/steps.jsonl). A usage failure never changes the step's stdout or exit code.
+# A plugin that never runs must. dsh can exit 0 with empty stdout and only a warning when the
+# orchestrator fails to load (missing plugin deps) or when it ignores the plugin's exit.
 USAGE="$FACTORY_ROOT/bin/factory-usage"
-OC_BEFORE=""
-[[ "$PROVIDER" == opencode ]] && OC_BEFORE=$("$USAGE" oc-stats 2>/dev/null || true)
-"$USAGE" agmsg-poll before >/dev/null 2>&1 || true
-STARTED=$(date -Iseconds); T0=$(date +%s%3N)
 RESULT=$(mktemp /tmp/factory-step-result-XXXXXX)
-CC_USAGE=""
-if [[ "$PROVIDER" == claude-code ]]; then
-  CC_USAGE=$(mktemp /tmp/factory-step-ccusage-XXXXXX); export FACTORY_CC_USAGE_FILE="$CC_USAGE"
+ERR=$(mktemp /tmp/factory-step-err-XXXXXX)
+if [[ -z "${FACTORY_USAGE_DISABLE:-}" ]]; then
+  OC_BEFORE=""
+  [[ "$PROVIDER" == opencode ]] && OC_BEFORE=$("$USAGE" oc-stats 2>/dev/null || true)
+  "$USAGE" agmsg-poll before >/dev/null 2>&1 || true
+  if [[ "$PROVIDER" == claude-code ]]; then
+    CC_USAGE=$(mktemp /tmp/factory-step-ccusage-XXXXXX); export FACTORY_CC_USAGE_FILE="$CC_USAGE"
+  fi
 fi
+STARTED=$(date -Iseconds); T0=$(date +%s%3N)
 set +e
-"${FACTORY_DSH_BIN:-dsh}" --profile "$PROFILE" --patch "$PATCH" "$@" | tee "$RESULT"
-EC=${PIPESTATUS[0]}
+"${FACTORY_DSH_BIN:-dsh}" --profile "$PROFILE" --patch "$PATCH" "$@" \
+  > >(tee "$RESULT") 2> >(tee "$ERR" >&2)
+EC=$?
+wait || true
 set -e
 T1=$(date +%s%3N); ENDED=$(date -Iseconds)
-OC_AFTER=""
-[[ "$PROVIDER" == opencode ]] && OC_AFTER=$("$USAGE" oc-stats 2>/dev/null || true)
-"$USAGE" record-step --provider "$PROVIDER" --started "$STARTED" --ended "$ENDED" --duration-ms $((T1 - T0)) \
-  --exit "$EC" --result-file "$RESULT" ${CC_USAGE:+--cc-usage-file "$CC_USAGE"} ${OC_BEFORE:+--oc-before "$OC_BEFORE"} ${OC_AFTER:+--oc-after "$OC_AFTER"} >/dev/null 2>&1 || true
-"$USAGE" agmsg-poll after >/dev/null 2>&1 || true
-rm -f "$RESULT" ${CC_USAGE:+"$CC_USAGE"}
+# The orchestrator always logs "factory: step end" before it exits. Missing that line with
+# empty stdout means the plugin never ran (import failure is the observed case).
+if ! grep -q 'factory: step end ' "$ERR"; then
+  if [[ "$EC" -eq 0 && ! -s "$RESULT" ]]; then
+    echo "factory-step: ERROR plugin or step failed to load or run (dsh exited 0 with empty stdout and no factory step result)." >&2
+    if [[ -s "$ERR" ]]; then
+      echo "factory-step: dsh stderr:" >&2
+      cat "$ERR" >&2
+    else
+      echo "factory-step: dsh produced no stderr. Run factory-setup so plugin/ gets npm ci." >&2
+    fi
+    EC=1
+  elif [[ "$EC" -eq 0 ]] && grep -Eq 'factory: (startActivation failed|activation rejected|DSH /goal failed)' "$ERR"; then
+    echo "factory-step: ERROR step failed to run (see factory: lines above) but dsh exited 0." >&2
+    EC=1
+  fi
+else
+  plugin_ec=$(sed -n 's/.*factory: step end .* exit=\([0-9][0-9]*\).*/\1/p' "$ERR" | tail -1)
+  if [[ -n "${plugin_ec:-}" && "$plugin_ec" != 0 && "$EC" -eq 0 ]]; then
+    echo "factory-step: ERROR step failed (plugin exit=${plugin_ec}) but dsh exited 0." >&2
+    EC=$plugin_ec
+  fi
+fi
+if [[ -z "${FACTORY_USAGE_DISABLE:-}" ]]; then
+  OC_AFTER=""
+  [[ "$PROVIDER" == opencode ]] && OC_AFTER=$("$USAGE" oc-stats 2>/dev/null || true)
+  "$USAGE" record-step --provider "$PROVIDER" --started "$STARTED" --ended "$ENDED" --duration-ms $((T1 - T0)) \
+    --exit "$EC" --result-file "$RESULT" ${CC_USAGE:+--cc-usage-file "$CC_USAGE"} ${OC_BEFORE:+--oc-before "$OC_BEFORE"} ${OC_AFTER:+--oc-after "$OC_AFTER"} >/dev/null 2>&1 || true
+  "$USAGE" agmsg-poll after >/dev/null 2>&1 || true
+fi
 exit "$EC"
