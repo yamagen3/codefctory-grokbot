@@ -77,7 +77,10 @@
 - [x] CC SPEC/gate が pstack 段階スキル本文を Agent SDK options で受け取る（`pstackQueryOverlay`）。poteto-mode 自動ルートは不採用。box 上の実セッション確認は `factory-setup` 後。
 - [x] doctor が OpenCode `reasoningEffort=max` の欠落を FAIL する（ソース既定と live `opencode.json`）。
 - [x] 承認済み SDK 写しを 0.3.319 / Claude Code 2.1.319 に合わせた（インストールは box 側）。
-- [x] SPEC は DSH `commands.execute("/goal …")` で goal を設定する。`factory-goal` ラッパは削除。ライブ session log は box。
+- [x] SPEC の CC プロンプトは Claude Code `/goal <条件>`（DSH `/goal` は親だけなので不使用）。
+- [ ] CC `/goal` が Agent SDK `persistSession: false` の query で複数 turn するか未検証。box では素の `/goal` が CC の usage 応答（0 model turn）になることだけ確認。
+- [ ] CC が `/goal` 条件を先頭行だけとるか、プロンプト全体とるかは未再確認。ソースは条件を先頭行（4,000 文字以内）に固定し、brief 全文はその後に残す。
+- [ ] OpenCode に `/goal` 相当は無い。IMPL は通常プロンプトのまま。同等の完了条件を OC に渡すかは未決。
 - [x] `factory_oc_write_config` が max 無しの opencode.json を max 付きへ置き換え、2 回目は unchanged。
 - [ ] 他の並列化候補（multi-candidate gate、multi-run など）— SPEC/IMPL 以外も parallel-first で検討。
 - [ ] OpenCode egress 制限（`--unshare-net` + opencode.ai だけ通す proxy）。並列時のトークン混線（stats 差分）も悪化し得る。

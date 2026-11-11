@@ -99,6 +99,43 @@ if problems:
 '
 }
 
+# Claude Code's built-in /goal for the SPEC step. The condition is only the
+# first line: the docs cap it at 4,000 characters
+# (https://code.claude.com/docs/en/goal). The brief and the rest of the SPEC
+# instructions follow that line, in full, so a long brief is not truncated and
+# is not stuffed into the condition. DSH /goal is not used.
+factory_cc_spec_prompt() {
+  local brief="${1:-}" pkg="${2:-unknown}" turns="${FACTORY_CC_GOAL_TURNS:-12}"
+  local condition prompt
+  [[ -n "$brief" ]] || die "factory_cc_spec_prompt: brief required"
+  [[ "$turns" =~ ^[1-9][0-9]*$ ]] || die "factory_cc_spec_prompt: turn bound must be a positive integer"
+  condition="/goal Freeze spec/PRODUCT.md, tests/acceptance, spec/OPEN_QUESTIONS.md, and spec/IMPL_STRATEGY.md whose first line is parallel: N with N from 1 to 4. Prove it by quoting those in the final reply. Do not implement src/. Or stop after ${turns} turns."
+  [[ "${#condition}" -le 4000 ]] || die "factory_cc_spec_prompt: /goal condition is ${#condition} characters; Claude Code allows 4000"
+  prompt="${condition}
+
+You are the factory SPEC step. Working directory is the product repo."
+  cat <<EOF
+${prompt}
+
+Create or update ONLY under spec/ and tests/acceptance/:
+- spec/PRODUCT.md — concise, testable product spec (Python stdlib only unless the brief explicitly allows deps; target Python 3.12+). Include CLI invocation, I/O, errors, and constraints.
+- tests/acceptance/ — real unittest acceptance tests that encode frozen behavior (may fail until implemented). Prefer fixtures under tests/acceptance/fixtures/ with no secrets.
+- spec/OPEN_QUESTIONS.md — open questions for the human (bullet list). If none, write: None.
+- spec/IMPL_STRATEGY.md — decide OpenCode IMPL parallelism for this run. First line MUST be machine-readable:
+    parallel: <N>
+  where N is an integer 1..4 (cap 4). Below that, write a short Japanese and/or English rationale.
+
+  Parallel-first guidance (you decide N; humans do not set it via env):
+  - Prefer N≥2 when the work can usefully diverge (multiple approaches, independent modules, flaky single-shot risk).
+  - Use N=1 only when the change is tiny/sequential or parallelism would waste OpenCode Go quota without benefit.
+  - Be concrete about why this N fits THIS product/spec.
+
+Do not implement the product under src/ beyond what already exists as a scaffold. Do not modify .github/. Keep changes minimal.
+Package/CLI name hint from pyproject: ${pkg}
+Brief: ${brief}
+EOF
+}
+
 # Compare-and-write the provisioned OpenCode document.
 # mode=file writes directly; mode=sudo is the box path (root-owned home).
 # Prints "wrote" or "unchanged". A file that lost max is replaced with the
