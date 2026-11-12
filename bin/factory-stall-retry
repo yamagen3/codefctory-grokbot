@@ -10,6 +10,7 @@ LABEL="${1:-step}"; shift || true
 shift
 
 TIMEOUT_SEC="${FACTORY_STALL_TIMEOUT_SEC:-3600}"
+export FACTORY_STALL_TIMEOUT_SEC="$TIMEOUT_SEC"
 ATTEMPT=1
 while [[ "$ATTEMPT" -le 2 ]]; do
   echo "factory-stall-retry: ${LABEL} attempt=${ATTEMPT} timeout=${TIMEOUT_SEC}s"

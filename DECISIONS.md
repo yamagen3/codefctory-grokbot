@@ -95,3 +95,9 @@ Tool-body upgrades (DSH, OpenCode, Agent SDK) are **not** driven by “a newer v
 - ランタイム / env / auth / log / usage / 鍵。鍵は供給されていない。`factory-doctor` の `dummy-for-doctor` と leak-check の `leak-canary` はプレースホルダ。
 
 希望構成のうち、スナップショット時点で既に HEAD にあり今回は変えていないもの: CC `claude-opus-5-5` + effort `xhigh`、Agent SDK `0.3.318`（`config/factory.patch.yml` と `config/headless.pnpm-workspace.yaml`）、IMPL 並列は CC の `spec/IMPL_STRATEGY.md`（欠落時 2、上限 4、`FACTORY_OC_PARALLEL` は上書き）、セキュリティ更新方針。
+
+## 2026-11-13 — Fable 改善ループ第 1 回
+- **Grok の記録で自動続行する。** `factory-gate-grok record` は既定で `factory-continue <sha>` を呼ぶ。対象は `pending` モードで作られた pending 記録だけ（`wait`/stub は `--force` 時のみ）。merge は従来通り 4 チェック green が必要。人が `factory-merge` を打つ待ちを無くすため。`FACTORY_GROK_AUTO_CONTINUE=0` で無効化。sandbox 化（F5）までは、判定ファイルを書ける box ユーザーの権限が自動 merge の信頼境界になる点を TODO に残す。
+- **step timeout は stall 予算から決める。** 優先順は `FACTORY_STEP_TIMEOUT_MS` → `FACTORY_STALL_TIMEOUT_SEC`（余白 max(60s, 10%)）→ config。タイムアウトは exit 124（stall-retry の再試行対象）。2026-11-05 の決定（plugin が `FACTORY_STALL_TIMEOUT_SEC` を読む）を実装した。
+- **未知の CC step は deny。** 以前は spec の allowlist にフォールバックしていた。決定ログは tool 名と決定だけ（入力は秘密を含み得る）。
+- **拡張性は設計提案のみ。** `docs/extensibility.md`。Codex など新エージェントは専用ユーザー・鍵・sudoers+bwrap・leak-check 対象が前提で、オーナー承認と認証情報が必要。モデル設定は変更しない。

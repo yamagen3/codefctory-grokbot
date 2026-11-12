@@ -53,6 +53,12 @@ PY
       --notes "pending->record latency (includes queue wait); grok tokens not observable" >/dev/null 2>&1 || true
   fi
   echo "factory-gate-grok: recorded $STATE for $SHA"
+  # Continue the pipeline automatically unless opted out. Never change record's exit status.
+  if [[ "${FACTORY_GROK_AUTO_CONTINUE:-1}" == "1" && -f "$PENDING" ]]; then
+    local CONTINUE_RC=0
+    "$FACTORY_ROOT/bin/factory-continue" "$SHA" || CONTINUE_RC=$?
+    echo "factory-gate-grok: factory-continue exit=$CONTINUE_RC"
+  fi
 }
 
 write_bundle() {
@@ -176,10 +182,10 @@ fi
 BUNDLE=$(write_bundle "$REPO" "$ID" "$SHA")
 echo "factory-gate-grok: bundle=$BUNDLE"
 
-python3 - "$PENDING" "$SHA" "$ID" "$REPO" "$BUNDLE" <<'PY'
+python3 - "$PENDING" "$SHA" "$ID" "$REPO" "$BUNDLE" "$MODE" <<'PY'
 import json,sys,datetime
-path,sha,id_,repo,bundle=sys.argv[1:6]
-rec={"sha":sha,"id":id_,"repo":repo,"bundle":bundle,"status":"pending",
+path,sha,id_,repo,bundle,mode=sys.argv[1:7]
+rec={"sha":sha,"id":id_,"repo":repo,"bundle":bundle,"mode":mode,"status":"pending",
      "instruction":"factory-gate-grok record <sha> success|failure <reason>",
      "created_at":datetime.datetime.now(datetime.timezone.utc).isoformat()}
 open(path,"w").write(json.dumps(rec,indent=2)+"\n")

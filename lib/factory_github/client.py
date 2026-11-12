@@ -8,8 +8,12 @@ Env:
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import re
+import subprocess
+import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -107,17 +111,52 @@ class LocalBackend(Backend):
         return json.loads(p.read_text()) if p.exists() else {}
 
     def status_set(self, repo: str, sha: str, context: str, state: str, description: str = "") -> dict:
+        if not re.fullmatch(r"[0-9A-Za-z]{4,64}", sha):
+            raise ValueError(f"bad sha {sha!r}")
         if state not in ("success", "failure", "pending", "error"):
             raise ValueError(f"bad state {state}")
-        data = self._read_status(sha)
-        entry = {"state": state, "description": description, "updated_at": _now()}
-        data[context] = entry
-        self._status_path(sha).write_text(json.dumps(data, indent=2) + "\n")
-        # best-effort git notes
-        notes = self._status_path(sha).read_text()
-        os.system(
-            f'git -C "{repo}" notes --ref=refs/notes/factory-statuses add -f -m {json.dumps(notes)} {sha} >/dev/null 2>&1'
-        )
+        with open(self.status_dir / ".lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            data = self._read_status(sha)
+            entry = {"state": state, "description": description, "updated_at": _now()}
+            data[context] = entry
+            text = json.dumps(data, indent=2) + "\n"
+            tmp_path: Optional[Path] = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    "w", dir=self.status_dir, prefix=f".{sha}.", suffix=".tmp", delete=False
+                ) as tmp:
+                    tmp_path = Path(tmp.name)
+                    tmp.write(text)
+                os.replace(tmp_path, self._status_path(sha))
+            except BaseException:
+                if tmp_path is not None:
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+                raise
+            # best-effort git notes
+            try:
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        repo,
+                        "notes",
+                        "--ref=refs/notes/factory-statuses",
+                        "add",
+                        "-f",
+                        "-m",
+                        text,
+                        sha,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            except OSError:
+                pass
         return entry
 
     def status_get(self, repo: str, sha: str, context: Optional[str] = None) -> Any:
@@ -203,7 +242,11 @@ class LocalBackend(Backend):
         # push local origin if any
         remotes = subprocess.run(["git", "-C", repo, "remote"], capture_output=True, text=True)
         if "origin" in remotes.stdout.split():
-            subprocess.run(["git", "-C", repo, "push", "origin", "main"], check=False)
+            pushed = subprocess.run(
+                ["git", "-C", repo, "push", "origin", "main"], capture_output=True, text=True
+            )
+            if pushed.returncode != 0:
+                raise RuntimeError(f"push origin main failed: {pushed.stderr[-400:]}")
         pr = self.pr_find(id_) or {}
         if pr:
             pr["state"] = "merged"

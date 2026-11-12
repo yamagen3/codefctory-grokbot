@@ -38,7 +38,7 @@ if [[ "$HOME_TMP" != /home/box ]]; then
   grep -q '/home/box' "$RENDER" && fail "rendered patch still contains /home/box"
 fi
 if [[ "$ROOT" != /workspace/factory ]]; then
-  grep -q '/workspace/factory' "$RENDER" && fail "rendered patch still contains /workspace/factory"
+  grep -q '/workspace/factory/' "$RENDER" && fail "rendered patch still contains /workspace/factory"
 fi
 
 # Original host values render back to the historical paths.

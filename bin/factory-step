@@ -107,6 +107,7 @@ else
     echo "factory-step: ERROR step failed (plugin exit=${plugin_ec}) but dsh exited 0." >&2
     EC=$plugin_ec
   fi
+  [[ "${plugin_ec:-}" == 124 ]] && EC=124
 fi
 if [[ -z "${FACTORY_USAGE_DISABLE:-}" ]]; then
   OC_AFTER=""

@@ -10,6 +10,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import z from '@deepseek-ai/schemastery'
 import { brandString } from '@deepseek-ai/dsh-brand'
+import { resolveTimeoutMs, exitCodeFor } from './step-timeout.js'
 
 export const name = 'factory-orchestrator'
 
@@ -40,18 +41,12 @@ export const Config = z.object({
   label: z.string().default('factory-step'),
 })
 
-const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000
-
 function textFromOutput(output) {
   if (!Array.isArray(output)) return ''
   return output
     .filter((block) => block && block.type === 'text' && typeof block.text === 'string')
     .map((block) => block.text)
     .join('')
-}
-
-function exitCodeFor(stopReason) {
-  return stopReason === 'completed' ? 0 : 1
 }
 
 /**
@@ -125,7 +120,7 @@ async function run(ctx, config, io) {
   const task = await resolveTask(config)
   const cwd = await resolveCwd(ctx, config.cwd)
   const provider = config.provider || 'claude-code'
-  const timeoutMs = Number.isFinite(config.timeoutMs) ? config.timeoutMs : DEFAULT_TIMEOUT_MS
+  const timeoutMs = resolveTimeoutMs(config.timeoutMs, process.env)
   const label = config.label || 'factory-step'
   const json = config.json === true
 
@@ -152,7 +147,9 @@ async function run(ctx, config, io) {
   const agent = handle.agent
 
   const controller = new AbortController()
+  let timedOut = false
   const timer = setTimeout(() => {
+    timedOut = true
     io.stderr.write(`factory: timeout after ${timeoutMs}ms — aborting child\n`)
     controller.abort(new Error(`factory-orchestrator: step timed out after ${timeoutMs}ms`))
   }, timeoutMs)
@@ -196,6 +193,18 @@ async function run(ctx, config, io) {
     io.stderr.write(`factory: activation rejected: ${error?.message || error}\n`)
     try { await activation.dispose() } catch { /* ignore */ }
     try { await handle.dispose() } catch { /* ignore */ }
+    if (timedOut) {
+      io.stderr.write('factory: step end stopReason=timeout exit=124\n')
+      if (json) {
+        io.stdout.write(`${JSON.stringify({
+          stopReason: 'timeout',
+          output: [],
+          diagnostic: String(error?.message || error),
+        })}\n`)
+      }
+      io.exit(124)
+      return
+    }
     if (json) {
       io.stdout.write(`${JSON.stringify({
         stopReason: 'error',
@@ -220,8 +229,9 @@ async function run(ctx, config, io) {
     io.stderr.write(`factory: parent dispose warning: ${error?.message || error}\n`)
   }
 
-  const stopReason = result?.stopReason ?? 'error'
-  const code = exitCodeFor(stopReason)
+  const raw = result?.stopReason ?? 'error'
+  const code = exitCodeFor(raw, timedOut)
+  const stopReason = code === 124 ? 'timeout' : raw
   const text = textFromOutput(result?.output)
   io.stderr.write(`factory: step end stopReason=${stopReason} exit=${code}\n`)
   agmsgProgress('end', `stopReason=${stopReason} exit=${code}`)
