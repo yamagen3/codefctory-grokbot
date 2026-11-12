@@ -49,3 +49,4 @@ tools/pstack-claude/
 local/grok-hooks/
 local/updates/
 local/usage/
+local/runs/

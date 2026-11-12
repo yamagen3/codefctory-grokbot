@@ -20,6 +20,19 @@ RESULT="$HOOK_DIR/result-${SHA}.json"
 MARKER="$HOOK_DIR/continued-${SHA}.json"
 LOCK="$HOOK_DIR/.continue-${SHA}.lock"
 
+already_done() {
+  [[ -f "$MARKER" ]] || return 1
+  local OUTCOME STATE
+  OUTCOME=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("outcome",""))' "$MARKER" 2>/dev/null || true)
+  if [[ "$OUTCOME" == "rejected" && -f "$RESULT" ]]; then
+    STATE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("state",""))' "$RESULT" 2>/dev/null || true)
+    if [[ "$STATE" == "success" ]]; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
 [[ -f "$PENDING" ]] || die "no pending record for $SHA"
 
 MODE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("mode",""))' "$PENDING")
@@ -27,7 +40,7 @@ if [[ "$MODE" != "pending" && "$FORCE" != "1" ]]; then
   echo "factory-continue: not applicable for $SHA (mode=${MODE:-unknown}; use --force to override)"
   exit 0
 fi
-if [[ -f "$MARKER" ]]; then
+if already_done; then
   echo "factory-continue: already continued for $SHA ($MARKER)"
   exit 0
 fi
@@ -43,14 +56,21 @@ if ! flock -n 9; then
   exit 0
 fi
 # Recheck under the lock: another process may have finished between the checks above.
-if [[ -f "$MARKER" ]]; then
+if already_done; then
   echo "factory-continue: already continued for $SHA ($MARKER)"
   exit 0
 fi
 
 ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("id",""))' "$PENDING")
 REPO=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("repo",""))' "$PENDING")
-[[ -n "$ID" && -n "$REPO" ]] || die "pending record $PENDING is missing id/repo"
+if [[ -z "$ID" || -z "$REPO" ]]; then
+  factory-notify continue-error "sha=${SHA} reason=missing id/repo" >/dev/null || true
+  die "pending record $PENDING is missing id/repo"
+fi
+if [[ ! -d "$REPO" ]]; then
+  factory-notify continue-error "sha=${SHA} reason=repo not found: ${REPO}" >/dev/null || true
+  exit 1
+fi
 REPO="$(resolve_repo "$REPO")"
 
 CURRENT=$(git -C "$REPO" rev-parse -q --verify "refs/heads/factory/${ID}" 2>/dev/null || true)

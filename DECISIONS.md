@@ -101,3 +101,9 @@ Tool-body upgrades (DSH, OpenCode, Agent SDK) are **not** driven by “a newer v
 - **step timeout は stall 予算から決める。** 優先順は `FACTORY_STEP_TIMEOUT_MS` → `FACTORY_STALL_TIMEOUT_SEC`（余白 max(60s, 10%)）→ config。タイムアウトは exit 124（stall-retry の再試行対象）。2026-11-05 の決定（plugin が `FACTORY_STALL_TIMEOUT_SEC` を読む）を実装した。
 - **未知の CC step は deny。** 以前は spec の allowlist にフォールバックしていた。決定ログは tool 名と決定だけ（入力は秘密を含み得る）。
 - **拡張性は設計提案のみ。** `docs/extensibility.md`。Codex など新エージェントは専用ユーザー・鍵・sudoers+bwrap・leak-check 対象が前提で、オーナー承認と認証情報が必要。モデル設定は変更しない。
+
+## 2026-11-13 — Fable 改善ループ第 2 回
+- **Grok の wait タイムアウトはラウンドを消費しない。** 既定 `FACTORY_GROK_ON_WAIT_TIMEOUT=park`：pending 記録を `mode=pending` に書き換え、status `pending`、`grok-pending` 通知、exit 2。後から来た判定は `factory-continue` が処理する。
+- **gate/claude の終了コード契約。** 0 pass、1 fail（FAIL 行が 1 つでもあれば fail）、75 判定なし（インフラ側）、124 timeout。run-local は 75 を 1 回だけ再試行し、なお 75/124/137 なら `gate-unavailable` 通知で exit 75（IMPL ラウンドを消費しない）。
+- **失敗理由の持ち越し。** `local/runs/<id>/feedback-r<N>.md`（末尾 60 行・4000 byte、秘密らしき行は伏字）を次ラウンドの IMPL プロンプト末尾に付ける。第 1 ラウンドのプロンプトは従来と同一。
+- **`factory-inbox` は仕組みのみ。** 締切・既定動作のポリシーは未決（TODO）。

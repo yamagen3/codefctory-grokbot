@@ -18,6 +18,9 @@ NAME="${FACTORY_TARGET_NAME:-}"
 [[ -n "$BRIEF" || "${FACTORY_SKIP_CC_SPEC:-}" == "1" ]] || die "usage: factory-run-local <id> <brief...> (or FACTORY_SKIP_CC_SPEC=1)"
 WORK="${FACTORY_WORK_DIR:-$FACTORY_ROOT/local/work/${ID}}"
 MAX="${FACTORY_MAX_ROUNDS:-3}"
+RUN_DIR="${FACTORY_RUNS_DIR:-$FACTORY_ROOT/local/runs}/${ID}"
+mkdir -p "$RUN_DIR"
+STAGE=setup
 # Default stub=pass for local auto tests; real Grok review: FACTORY_GROK_MODE=pending and unset FACTORY_GROK_STUB.
 if [[ -z "${FACTORY_GROK_MODE:-}" && -z "${FACTORY_GROK_STUB:-}" ]]; then
   export FACTORY_GROK_STUB=pass
@@ -29,6 +32,7 @@ export FACTORY_USAGE_RUN_ID="$ID" FACTORY_TARGET_NAME="$NAME"
 RUN_T0=$(date +%s%3N)
 usage_finish() {
   local ec=$?
+  case $ec in 0|2|3|75) ;; *) factory-notify run-aborted "id=${ID} exit=${ec} round=${ROUND:-0} stage=${STAGE:-setup}" >/dev/null 2>&1 || true ;; esac
   local st; case $ec in 0) st=merged ;; 2) st=grok-pending ;; *) st="exit-$ec" ;; esac
   "$FACTORY_ROOT/bin/factory-usage" run-summary "$ID" --wall-ms $(( $(date +%s%3N) - RUN_T0 )) --status "$st" \
     $([[ -z "${FACTORY_USAGE_QUIET:-}" ]] && echo --print) || true
@@ -45,12 +49,15 @@ cd "$WORK"
 
 if [[ "${FACTORY_SKIP_CC_SPEC:-}" != "1" ]]; then
   echo "=== SPEC ==="
+  STAGE=spec
   factory-stall-retry spec -- factory-spec-step "$WORK" "$ID" "$BRIEF"
 else
+  STAGE=spec
   git checkout -B "factory/${ID}"
 fi
 
 echo "=== FREEZE spec/${ID} (local auto-approve; see DECISIONS.md) ==="
+STAGE=spec
 # Ensure protected paths committed
 git add -A
 git -c user.email=factory@localhost -c user.name=factory commit -m "factory(${ID}): spec freeze" || true
@@ -69,39 +76,69 @@ while true; do
   fi
   factory-labels set-round "$WORK" "$ID" "$ROUND" >/dev/null
   echo "=== ROUND $ROUND IMPL ==="
-  factory-stall-retry impl -- factory-impl-step "$WORK" "$ID" \
-    "Implement per spec/PRODUCT.md; make acceptance tests pass; stdlib only. Do not modify spec/, tests/acceptance/, or .github/."
+  STAGE=impl
+  IMPL_PROMPT="Implement per spec/PRODUCT.md; make acceptance tests pass; stdlib only. Do not modify spec/, tests/acceptance/, or .github/."
+  IMPL_PROMPT+="$(factory-feedback prompt "$ID" "$ROUND")"
+  factory-stall-retry impl -- factory-impl-step "$WORK" "$ID" "$IMPL_PROMPT"
   SHA=$(git -C "$WORK" rev-parse HEAD)
   git -C "$WORK" push origin "factory/${ID}" || true
 
   echo "=== GUARD ==="
-  if factory-guard "$WORK" "$ID"; then
+  STAGE=guard
+  GUARD_LOG="$RUN_DIR/guard-r${ROUND}.log"
+  if factory-guard "$WORK" "$ID" >"$GUARD_LOG" 2>&1; then
+    cat "$GUARD_LOG"
     factory-status set "$WORK" "$SHA" guard success "ok"
   else
+    cat "$GUARD_LOG"
     factory-status set "$WORK" "$SHA" guard failure "protected paths changed"
     echo "factory-run-local: guard failed round=$ROUND"
+    factory-feedback write "$ID" "$ROUND" guard "protected paths changed" "$GUARD_LOG"
     continue
   fi
 
   echo "=== CI ==="
-  if factory-ci "$WORK"; then
+  STAGE=ci
+  CI_LOG="$RUN_DIR/ci-r${ROUND}.log"
+  if factory-ci "$WORK" >"$CI_LOG" 2>&1; then
+    cat "$CI_LOG"
     factory-status set "$WORK" "$SHA" ci success "ok"
   else
+    cat "$CI_LOG"
     factory-status set "$WORK" "$SHA" ci failure "tests failed"
     echo "factory-run-local: ci failed round=$ROUND"
+    factory-feedback write "$ID" "$ROUND" ci "tests failed" "$CI_LOG"
     continue
   fi
 
   echo "=== GATE/CLAUDE ==="
-  if factory-gate-claude "$WORK" "$ID" "$SHA"; then
-    :
-  else
-    factory-status set "$WORK" "$SHA" gate/claude failure "gate"
-    echo "factory-run-local: gate/claude failed round=$ROUND"
-    continue
+  STAGE=gate-claude
+  set +e
+  factory-stall-retry gate-claude -- factory-gate-claude "$WORK" "$ID" "$SHA"
+  GATE_EC=$?
+  if [[ "$GATE_EC" -eq 75 ]]; then
+    factory-stall-retry gate-claude -- factory-gate-claude "$WORK" "$ID" "$SHA"
+    GATE_EC=$?
   fi
+  set -e
+  case "$GATE_EC" in
+    0)
+      ;;
+    75|124|137)
+      factory-status set "$WORK" "$SHA" gate/claude error "gate unavailable"
+      factory-notify gate-unavailable "id=${ID} sha=${SHA} exit=${GATE_EC}"
+      exit 75
+      ;;
+    *)
+      factory-status set "$WORK" "$SHA" gate/claude failure "gate"
+      echo "factory-run-local: gate/claude failed round=$ROUND"
+      factory-feedback write "$ID" "$ROUND" gate-claude "gate/claude rejected the change" "${FACTORY_GATE_CLAUDE_OUT:-/tmp/factory-gate-claude.json}"
+      continue
+      ;;
+  esac
 
   echo "=== GATE/GROK ==="
+  STAGE=gate-grok
   set +e
   factory-gate-grok "$WORK" "$ID" "$SHA"
   GROK_EC=$?
@@ -115,10 +152,26 @@ while true; do
     exit 2
   else
     echo "factory-run-local: gate/grok failed round=$ROUND ec=$GROK_EC"
+    GROK_RESULT="${FACTORY_GROK_HOOK_DIR:-$FACTORY_ROOT/local/grok-hooks}/result-${SHA}.json"
+    GROK_DESC=$(python3 - "$GROK_RESULT" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        rec = json.load(fh)
+    desc = rec.get("description") if isinstance(rec, dict) else None
+except Exception:
+    desc = None
+print(desc or "gate/grok failed")
+PY
+)
+    factory-feedback write "$ID" "$ROUND" gate-grok "$GROK_DESC"
     continue
   fi
 
   echo "=== MERGE ==="
+  STAGE=merge
   factory-merge "$WORK" "$ID"
   factory-notify merged "id=${ID} sha=$SHA rounds=$ROUND"
   echo "factory-run-local: DONE merged id=$ID sha=$SHA rounds=$ROUND"

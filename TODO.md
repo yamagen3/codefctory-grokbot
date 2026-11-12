@@ -108,3 +108,18 @@
 - [ ] F13: `factory-update` の結果を通知、run と update の flock 共有、docs の acceptance ≥18 と既定 10 の不一致。
 - [ ] 【要判断】max rounds 後の自動 re-spec を新 run id で 1 回許すか。
 - [ ] 【要認証情報】GitHub backend の PAT 2 本とブランチ保護（既存項目）。
+
+## Fable レビュー第 2 回（2026-11-13）由来
+- [x] R2-T1: Grok 判定の孤立防止（wait タイムアウトは既定で park＝pending 化して exit 2、`grok-pending` 通知、sha 検証と短縮 sha 解決、rejected 後の success 再記録で merge、continue のエラー通知）。`FACTORY_GROK_ON_WAIT_TIMEOUT=fail` で旧動作。
+- [x] R2-T2: gate/claude は step exit を見る（0 pass / 1 fail / 75 判定なし / 124 timeout）、FAIL 行が優先、allowlist を trap で復元、出力先 `FACTORY_GATE_CLAUDE_OUT`。
+- [x] R2-T3: 失敗ラウンドの理由を次ラウンドの IMPL プロンプトへ（`bin/factory-feedback`、`local/runs/<id>/`、秘密らしき行は伏字）。run が 0/2/3/75 以外で終わると `run-aborted` 通知。gate 不通（75/124/137）は IMPL ラウンドを消費せず exit 75。
+- [x] R2-T4: `factory-inbox list|count|check|ack`（Grok/人間が「工場が何を待っているか」を一目で見る。仕組みのみ）。
+- [x] R2-T5: test_fresh_paths の境界、patch 抽出の cache/venv 除外、LocalBackend の sha 検証を全経路に、docs/layout.md の受入閾値。
+- [ ] R2-F7: `pr_merge` が origin を fetch せずにローカル main へ merge（長い pending 後は push 失敗で止まる）。【要判断】移動した main への自動 merge は merge 結果の CI で足りるか、rebase + gate 再実行か。
+- [ ] R2-F8: pending 中に同じ id を再実行すると work clone を消す（後の判定が continue-stale になる）。
+- [ ] R2-F9: Grok 拒否（exit 4）後に次ラウンドを自動開始（state.json + `--resume`、feedback を再利用）。
+- [ ] R2-F10 / F13: `factory-update` 結果の通知と run との flock 共有。
+- [ ] R2-F11: 並列 IMPL のプロセスグループ kill・固定 /tmp ログ・敗者 workspace 削除、全スロット timeout 時の exit 124（要テスト）。
+- [ ] R2-F12: キューと worker。
+- [ ] V11: CC allowlist の決定ログを `local/logs`（0600）へ（現在は内容は安全化済みだが /tmp の world-readable）。
+- [ ] 【要判断】inbox の締切ポリシー（沈黙＝続行にするか）。
