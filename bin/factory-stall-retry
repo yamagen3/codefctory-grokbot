@@ -12,6 +12,7 @@ shift
 TIMEOUT_SEC="${FACTORY_STALL_TIMEOUT_SEC:-3600}"
 export FACTORY_STALL_TIMEOUT_SEC="$TIMEOUT_SEC"
 ATTEMPT=1
+WAITS=0
 while [[ "$ATTEMPT" -le 2 ]]; do
   echo "factory-stall-retry: ${LABEL} attempt=${ATTEMPT} timeout=${TIMEOUT_SEC}s"
   set +e
@@ -19,6 +20,22 @@ while [[ "$ATTEMPT" -le 2 ]]; do
   EC=$?
   set -e
   if [[ "$EC" -eq 0 ]]; then exit 0; fi
+  if [[ "$EC" -eq 75 ]]; then
+    if [[ "${FACTORY_PROVIDER_WAIT:-1}" == "0" || "$WAITS" -ge 2 ]]; then
+      exit 75
+    fi
+    # Only a recorded provider limit is waited out; any other exit 75 (parked verdict,
+    # no gate verdict) keeps its meaning and returns at once.
+    if "$FACTORY_ROOT/bin/factory-provider-state" check claude-code >/dev/null 2>&1; then
+      exit 75
+    fi
+    WAITS=$((WAITS + 1))
+    echo "factory-stall-retry: ${LABEL} claude-code limited; waiting for reset (wait ${WAITS}/2)" >&2
+    if "$FACTORY_ROOT/bin/factory-provider-state" wait claude-code; then
+      continue
+    fi
+    exit 75
+  fi
   if [[ "$EC" -eq 124 || "$EC" -eq 137 ]]; then
     echo "factory-stall-retry: ${LABEL} stalled/timeout ec=${EC}" >&2
     if [[ "$ATTEMPT" -eq 1 ]]; then

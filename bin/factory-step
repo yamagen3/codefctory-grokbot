@@ -63,6 +63,20 @@ esac
 export FACTORY_PROVIDER="$PROVIDER"
 export FACTORY_ROOT
 
+PROVIDER_STATE="$FACTORY_ROOT/bin/factory-provider-state"
+if [[ "$PROVIDER" == "claude-code" && "${FACTORY_PROVIDER_IGNORE_LIMIT:-0}" != "1" ]]; then
+  PROVIDER_CHECK=""
+  PROVIDER_EC=0
+  PROVIDER_CHECK=$("$PROVIDER_STATE" check claude-code 2>/dev/null) || PROVIDER_EC=$?
+  if [[ "$PROVIDER_EC" -eq 75 ]]; then
+    read -r _ _ LIMITED_ISO <<<"$PROVIDER_CHECK" || true
+    LIMITED_ISO="${LIMITED_ISO:-unknown}"
+    echo "factory-step: claude-code limited until $LIMITED_ISO; parked (exit 75)" >&2
+    "$FACTORY_ROOT/bin/factory-notify" provider-limited "claude-code limited until $LIMITED_ISO" >/dev/null 2>&1 || true
+    exit 75
+  fi
+fi
+
 # Usage tracking (local/usage/<date>/steps.jsonl). A usage failure never changes the step's stdout or exit code.
 # A plugin that never runs must. dsh can exit 0 with empty stdout and only a warning when the
 # orchestrator fails to load (missing plugin deps) or when it ignores the plugin's exit.
@@ -108,6 +122,26 @@ else
     EC=$plugin_ec
   fi
   [[ "${plugin_ec:-}" == 124 ]] && EC=124
+fi
+if [[ "$PROVIDER" == "claude-code" && -n "$CC_USAGE" && -f "$CC_USAGE" ]]; then
+  CLASSIFY=""
+  CLASSIFY_EC=0
+  CLASSIFY=$("$PROVIDER_STATE" classify "$CC_USAGE" 2>/dev/null) || CLASSIFY_EC=$?
+  if [[ "$CLASSIFY_EC" -eq 0 && "$CLASSIFY" == limited\ * ]]; then
+    read -r _ RESET_EPOCH LIMIT_REASON <<<"$CLASSIFY" || true
+    RESET_EPOCH="${RESET_EPOCH:-0}"
+    LIMIT_REASON="${LIMIT_REASON:-usage_limit}"
+    "$PROVIDER_STATE" mark claude-code "$RESET_EPOCH" "$LIMIT_REASON" >/dev/null 2>&1 || true
+    PROVIDER_CHECK=""
+    PROVIDER_CHECK=$("$PROVIDER_STATE" check claude-code 2>/dev/null) || true
+    read -r _ _ LIMITED_ISO <<<"$PROVIDER_CHECK" || true
+    LIMITED_ISO="${LIMITED_ISO:-@$RESET_EPOCH}"
+    echo "factory-step: claude-code limited until $LIMITED_ISO; parked (exit 75)" >&2
+    "$FACTORY_ROOT/bin/factory-notify" provider-limited "claude-code limited until $LIMITED_ISO" >/dev/null 2>&1 || true
+    EC=75
+  elif [[ "$CLASSIFY_EC" -eq 0 && "$CLASSIFY" == "ok" && "$EC" -eq 0 ]]; then
+    "$PROVIDER_STATE" clear claude-code >/dev/null 2>&1 || true
+  fi
 fi
 if [[ -z "${FACTORY_USAGE_DISABLE:-}" ]]; then
   OC_AFTER=""

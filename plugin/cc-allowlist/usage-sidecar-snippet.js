@@ -14,7 +14,12 @@
 					duration_api_ms: message.duration_api_ms ?? null,
 					total_cost_usd: message.total_cost_usd ?? null,
 					usage: message.usage ?? null,
-					modelUsage: message.modelUsage ?? null
+					modelUsage: message.modelUsage ?? null,
+					is_error: message.is_error ?? null,
+					terminal_reason: message.terminal_reason ?? null,
+					api_error_status: message.api_error_status ?? null,
+					api_error: message.api_error ?? null,
+					result_head: typeof message.result === "string" ? message.result.slice(0, 300) : null
 				}) + "\n");
 			}
 		} catch {}

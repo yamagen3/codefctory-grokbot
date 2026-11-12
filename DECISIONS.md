@@ -107,3 +107,9 @@ Tool-body upgrades (DSH, OpenCode, Agent SDK) are **not** driven by “a newer v
 - **gate/claude の終了コード契約。** 0 pass、1 fail（FAIL 行が 1 つでもあれば fail）、75 判定なし（インフラ側）、124 timeout。run-local は 75 を 1 回だけ再試行し、なお 75/124/137 なら `gate-unavailable` 通知で exit 75（IMPL ラウンドを消費しない）。
 - **失敗理由の持ち越し。** `local/runs/<id>/feedback-r<N>.md`（末尾 60 行・4000 byte、秘密らしき行は伏字）を次ラウンドの IMPL プロンプト末尾に付ける。第 1 ラウンドのプロンプトは従来と同一。
 - **`factory-inbox` は仕組みのみ。** 締切・既定動作のポリシーは未決（TODO）。
+
+## 2026-11-13 — 改善ループ第 3 回（単一プロバイダー依存）
+- **CC の利用上限は失敗ではなく「待ち」。** CC の結果（`api_error_status` 429/529、`api_error` = `usage_limit_reached` など、または「hit your … limit」）を `bin/factory-provider-state` が判定し、`local/status/providers/claude-code.json` にリセット時刻を記録する。リセット時刻は結果文の「resets 6am (Asia/Tokyo)」から求め、読めなければ 1 時間後とする。上限中の CC step は dsh を呼ばずに exit 75 で止まり、`provider-limited` を通知する。`factory-stall-retry` は記録済みの上限に限りリセット + 60 秒まで待って再実行する（1 回の呼び出しで最大 2 回、待つのは 6 時間以内、`FACTORY_PROVIDER_WAIT=0` で無効）。上限の記録が無い exit 75（Grok の park、gate の判定なし）は今までどおりすぐ返す。今夜 CC が 2 回上限に達し、SPEC・gate・pong・レビューがすべて止まったための対策。
+- **セキュリティ更新の検証失敗を、プロバイダー障害と退行に分ける。** CC が上限中なら `factory-update` は何も適用せず `deferred-provider`（exit 40）で終わる。検証中に上限・過負荷の痕跡（または rc 75）で落ちた場合は、検証済みの状態に戻すためロールバックはするが、`rolled-back`（退行）ではなく `deferred-provider`（退行ではない）と記録し、`update-deferred` を通知して翌日の実行で再試行する。未検証の更新を残さないため、「ロールバックしない」ではなく「退行として扱わない」を選んだ。
+- **Fable 抜きで進めた回。** Fable（CC）が 11:20 JST まで上限のため、オーナーの指示（t79u）と第 2 回の保留項目「quota parking（429 の文言サンプルが必要）」を元に、今夜採れた実サンプルで OpenCode（flash, max）が実装した。CC が止まっていても工場の改善が回ることの実証も兼ねる。Fable の検証は次のレビューで行う。
+- **代替オーケストレーター / gate（OpenCode や Codex による SPEC・gate）は提案のみ。** モデル設定と認証情報に関わるため実装しない（TODO）。
