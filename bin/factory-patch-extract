@@ -67,8 +67,18 @@ root = Path(sys.argv[1])
 bad = []
 skip_dirs = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv"}
 for dirpath, dirnames, filenames in os.walk(root):
-    # skip VCS / bytecode / caches (OC may leave these after running tests)
-    dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+    # refuse symlinked directories and never descend into them
+    kept_dirs = []
+    for name in dirnames:
+        p = Path(dirpath) / name
+        rel = str(p.relative_to(root)).replace("\\", "/")
+        if p.is_symlink():
+            bad.append(f"symlink: {rel}")
+            continue
+        # skip VCS / bytecode / caches (OC may leave these after running tests)
+        if name not in skip_dirs:
+            kept_dirs.append(name)
+    dirnames[:] = kept_dirs
     for name in filenames:
         if name.endswith((".pyc", ".pyo", ".so")):
             continue
@@ -114,7 +124,7 @@ case "$CMD" in
     done
     set +e
     # Use paths relative to TMP so diff headers are a/... b/...
-    (cd "$TMP" && diff -ruN a b > "$OUT")
+    (cd "$TMP" && diff -ruN --no-dereference a b > "$OUT")
     EC=$?
     set -e
     if [[ "$EC" -gt 1 ]]; then die "diff failed ec=$EC"; fi

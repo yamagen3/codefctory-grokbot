@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Continue a Grok-gated branch after a verdict was recorded.
+# Usage: factory-continue <sha> [--force]
+# Exit codes:
+#   0 — merged, already continued, or not applicable (wait/stub without --force)
+#   1 — no pending record, factory/<id> no longer at <sha>, or merge failed
+#   2 — no Grok verdict yet
+#   4 — Grok rejected the change
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+
+HOOK_DIR="${FACTORY_GROK_HOOK_DIR:-$FACTORY_ROOT/local/grok-hooks}"
+SHA="${1:-}"
+FORCE=0
+if [[ "${2:-}" == "--force" ]]; then FORCE=1; fi
+[[ "$SHA" =~ ^[0-9a-f]{7,64}$ ]] || die "usage: factory-continue <sha> [--force]"
+
+PENDING="$HOOK_DIR/pending-${SHA}.json"
+RESULT="$HOOK_DIR/result-${SHA}.json"
+MARKER="$HOOK_DIR/continued-${SHA}.json"
+LOCK="$HOOK_DIR/.continue-${SHA}.lock"
+
+[[ -f "$PENDING" ]] || die "no pending record for $SHA"
+
+MODE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("mode",""))' "$PENDING")
+if [[ "$MODE" != "pending" && "$FORCE" != "1" ]]; then
+  echo "factory-continue: not applicable for $SHA (mode=${MODE:-unknown}; use --force to override)"
+  exit 0
+fi
+if [[ -f "$MARKER" ]]; then
+  echo "factory-continue: already continued for $SHA ($MARKER)"
+  exit 0
+fi
+if [[ ! -f "$RESULT" ]]; then
+  echo "factory-continue: no Grok verdict for $SHA" >&2
+  exit 2
+fi
+
+mkdir -p "$HOOK_DIR"
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  echo "factory-continue: another process holds $LOCK" >&2
+  exit 0
+fi
+# Recheck under the lock: another process may have finished between the checks above.
+if [[ -f "$MARKER" ]]; then
+  echo "factory-continue: already continued for $SHA ($MARKER)"
+  exit 0
+fi
+
+ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("id",""))' "$PENDING")
+REPO=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("repo",""))' "$PENDING")
+[[ -n "$ID" && -n "$REPO" ]] || die "pending record $PENDING is missing id/repo"
+REPO="$(resolve_repo "$REPO")"
+
+CURRENT=$(git -C "$REPO" rev-parse -q --verify "refs/heads/factory/${ID}" 2>/dev/null || true)
+if [[ "$CURRENT" != "$SHA" ]]; then
+  factory-notify continue-stale "id=${ID} sha=${SHA} ref=${CURRENT:-missing}"
+  echo "factory-continue: factory/${ID} is ${CURRENT:-missing}, not $SHA; refusing to merge" >&2
+  exit 1
+fi
+
+STATE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$RESULT")
+REASON=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("description",""))' "$RESULT")
+
+write_marker() {
+  local outcome="$1"
+  python3 - "$MARKER" "$SHA" "$ID" "$outcome" <<'PY'
+import datetime,json,sys
+path,sha,id_,outcome=sys.argv[1:5]
+rec={"sha":sha,"id":id_,"outcome":outcome,
+     "continued_at":datetime.datetime.now(datetime.timezone.utc).isoformat()}
+open(path,"w").write(json.dumps(rec,indent=2)+"\n")
+PY
+}
+
+if [[ "$STATE" == "success" ]]; then
+  if factory-merge "$REPO" "$ID"; then
+    factory-notify merged "id=${ID} sha=${SHA} via=continue"
+    write_marker merged
+    exit 0
+  fi
+  factory-notify merge-failed "id=${ID} sha=${SHA} via=continue"
+  echo "factory-continue: merge failed for factory/${ID} ($SHA)" >&2
+  exit 1
+fi
+
+factory-notify grok-rejected "id=${ID} sha=${SHA} reason=${REASON}"
+write_marker rejected
+echo "factory-continue: Grok rejected $SHA (${REASON:-no reason})" >&2
+exit 4

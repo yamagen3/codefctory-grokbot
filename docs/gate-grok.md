@@ -31,6 +31,10 @@
 | `FACTORY_GROK_MODE=pending` | 束だけ書いて exit 2（外側で poll） |
 | `FACTORY_GROK_WAIT_SEC` | 待ち上限秒（既定 3600） |
 
+## 自動続行
+
+`record` は既定で `factory-continue <sha>` を呼び、`pending` モードの判定が success なら `factory-merge` まで自動で進む。`FACTORY_GROK_AUTO_CONTINUE=0` を設定すると自動続行を止められる（あとから手動で `factory-continue <sha> [--force]` を実行できる）。`factory-continue` の終了コードは 0 = マージ済み／続行対象外／続行済み、1 = pending が無い・`factory/<id>` が `<sha>` から移動・マージ失敗、2 = 判定がまだ無い、4 = Grok が拒否（`grok-rejected` を通知）。`wait` / `stub` の pending は既定では続行せず、`--force` を付けたときだけ続行する。
+
 ## 見る観点（短く）
 
 - diff が `spec/`・`tests/acceptance/`・`.github/` を触っていないか（guard と二重）

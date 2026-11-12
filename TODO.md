@@ -89,3 +89,22 @@
 - [ ] `factory-cc` ユーザー + bwrap（CC の chmod allowlist 限界の本命）。
 - [ ] DSH plugin 内 multi-activation（Candidate B）は見送り。上流が one-shot を超えたら再検討。
 - [ ] 並列時の `FACTORY_IMPL_PARALLEL_TIMEOUT_SEC` を stall-retry とどう揃えるか。
+
+## Fable レビュー第 1 回（2026-11-13、claude-fable-5-2）由来
+- [x] T1: plugin の step timeout を stall 予算に連動（`plugin/step-timeout.js`、timeout は exit 124 で stall-retry に乗る）。
+- [x] T2: `LocalBackend.status_set` の shell 注入を除去（`subprocess` 配列、sha 検証、flock + atomic write）。`pr_merge` は push 失敗で例外。
+- [x] T3: `factory-gate-grok record` → `factory-continue` で pending 判定を自動続行（success は merge、failure は `grok-rejected` 通知）。`FACTORY_GROK_AUTO_CONTINUE=0` で停止。
+- [x] F14 一部: patch 抽出がディレクトリ symlink を拒否し `diff --no-dereference`。CC allowlist は未知 step を deny、決定ログは入力を書かない。
+- [x] 拡張性の設計提案 `docs/extensibility.md`（提案のみ。プロバイダー/モデル切替なし）。
+- [ ] F1 残り: run-state（`local/runs/<id>/state.json`）と `factory-run-local --resume`、failure 時の次ラウンド自動再開。
+- [ ] F2: 失敗理由を次ラウンドへ渡す（`feedback-r<N>.md` → `.factory-oc-feedback.md`）。
+- [ ] F3: 終了コード契約（75 = 一時失敗 / quota で park、ラウンドを消費しない）。429 文言のサンプル採取が必要。
+- [ ] 【要判断】F5: OpenCode が書いたコードの受入/CI 実行を sandbox 化（factory-oc + bwrap `--unshare-net`）。sudoers/launcher 変更のため承認が必要。自動 merge を信用する前提条件。
+- [ ] F6: ファイルキュー `local/queue/` と worker、`/tmp` 固定パスの run 別化と target ロック。
+- [ ] F7: `factory-inbox`（Grok/人間共通の受信箱、deadline 付き既定動作）。【要判断】締切で黙認＝続行とするポリシー。
+- [ ] 【要判断】F8: Grok の held-out 受入テストの置き場所・作成者、`factory-run-local` の既定 stub pass を fail-closed にするか。
+- [ ] F10: gate/claude の判定パース（最初の判定行が決める、step exit 0 必須、trap で allowlist 復元）。
+- [ ] F12: 並列 IMPL のプロセスグループ kill、早期打ち切り、敗者 workspace 削除。【要判断】launcher の `--die-with-parent`。
+- [ ] F13: `factory-update` の結果を通知、run と update の flock 共有、docs の acceptance ≥18 と既定 10 の不一致。
+- [ ] 【要判断】max rounds 後の自動 re-spec を新 run id で 1 回許すか。
+- [ ] 【要認証情報】GitHub backend の PAT 2 本とブランチ保護（既存項目）。

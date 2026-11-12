@@ -41,7 +41,8 @@ export function normalizeRel(cwd, filePath) {
 }
 
 export function isWriteAllowed(stepName, cwd, filePath) {
-  const step = STEPS[stepName] || STEPS.spec
+  if (!Object.prototype.hasOwnProperty.call(STEPS, stepName)) return false
+  const step = STEPS[stepName]
   if (step.writePrefixes === null) return true
   if (!step.writePrefixes.length) return false
   const rel = normalizeRel(cwd, filePath)
@@ -67,10 +68,12 @@ export function extractFilePaths(toolName, input) {
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit'])
 
 export function makeCanUseTool(stepName, cwd) {
-  const step = STEPS[stepName] || STEPS.spec
+  const step = Object.prototype.hasOwnProperty.call(STEPS, stepName) ? STEPS[stepName] : null
   return async (toolName, input) => {
     let result
-    if (step.denyTools.includes(toolName) || toolName === 'AskUserQuestion') {
+    if (!step) {
+      result = { behavior: 'deny', message: `factory allowlist: unknown step=${stepName}; denying ${toolName}` }
+    } else if (step.denyTools.includes(toolName) || toolName === 'AskUserQuestion') {
       result = { behavior: 'deny', message: `factory allowlist: tool ${toolName} denied for step=${stepName}` }
     } else if (!step.allowNetwork && /^(WebFetch|WebSearch|Bash)$/.test(toolName)) {
       if (toolName === 'Bash') {
@@ -105,7 +108,12 @@ export function makeCanUseTool(stepName, cwd) {
     try {
       fs.appendFileSync(
         '/tmp/cc-allowlist-decisions.log',
-        JSON.stringify({ step: stepName, cwd, toolName, input, result }) + '\n',
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          step: stepName,
+          toolName,
+          decision: result.behavior,
+        }) + '\n',
       )
     } catch { /* ignore */ }
     return result

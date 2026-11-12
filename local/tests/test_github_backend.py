@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -94,6 +95,88 @@ def test_local_status_and_required():
         assert pr["number"] == 1
 
 
+def test_status_set_no_shell_injection():
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["FACTORY_ROOT"] = td
+        os.environ["FACTORY_STATUS_DIR"] = str(Path(td) / "status")
+        os.environ["FACTORY_LABELS_DIR"] = str(Path(td) / "labels")
+        os.environ["FACTORY_PR_DIR"] = str(Path(td) / "prs")
+        repo = Path(td) / "repo"
+        subprocess.check_call(["git", "init", "-b", "main", str(repo)])
+        subprocess.check_call(["git", "-C", str(repo), "config", "user.email", "t@t"])
+        subprocess.check_call(["git", "-C", str(repo), "config", "user.name", "t"])
+        (repo / "f.txt").write_text("x\n")
+        subprocess.check_call(["git", "-C", str(repo), "add", "f.txt"])
+        subprocess.check_call(["git", "-C", str(repo), "commit", "-m", "base"])
+        sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        b = LocalBackend()
+        desc = f'$(touch {td}/MARK) `touch {td}/MARK2` "quote" back\\slash'
+        b.status_set(str(repo), sha, "guard", "success", desc)
+        assert not (Path(td) / "MARK").exists()
+        assert not (Path(td) / "MARK2").exists()
+        assert b.status_get(str(repo), sha, "guard")["description"] == desc
+        notes = subprocess.check_output(
+            ["git", "-C", str(repo), "notes", "--ref=refs/notes/factory-statuses", "show", sha],
+            text=True,
+        )
+        assert json.loads(notes)["guard"]["description"] == desc
+        try:
+            b.status_set(str(repo), "../evil", "guard", "success", "x")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("status_set accepted invalid sha")
+
+
+def test_local_merge_push_failure_is_error():
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["FACTORY_ROOT"] = td
+        os.environ["FACTORY_STATUS_DIR"] = str(Path(td) / "status")
+        os.environ["FACTORY_LABELS_DIR"] = str(Path(td) / "labels")
+        os.environ["FACTORY_PR_DIR"] = str(Path(td) / "prs")
+        origin = Path(td) / "origin.git"
+        repo = Path(td) / "repo"
+        subprocess.check_call(["git", "init", "--bare", "-b", "main", str(origin)])
+        subprocess.check_call(["git", "init", "-b", "main", str(repo)])
+        subprocess.check_call(["git", "-C", str(repo), "config", "user.email", "t@t"])
+        subprocess.check_call(["git", "-C", str(repo), "config", "user.name", "t"])
+        (repo / "f.txt").write_text("base\n")
+        subprocess.check_call(["git", "-C", str(repo), "add", "f.txt"])
+        subprocess.check_call(["git", "-C", str(repo), "commit", "-m", "base"])
+        subprocess.check_call(["git", "-C", str(repo), "remote", "add", "origin", str(origin)])
+        subprocess.check_call(["git", "-C", str(repo), "push", "-u", "origin", "main"])
+        subprocess.check_call(["git", "-C", str(repo), "checkout", "-b", "factory/m1"])
+        (repo / "g.txt").write_text("feature\n")
+        subprocess.check_call(["git", "-C", str(repo), "add", "g.txt"])
+        subprocess.check_call(["git", "-C", str(repo), "commit", "-m", "feature"])
+        sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        b = LocalBackend()
+        for ctx in ("guard", "ci", "gate/claude", "gate/grok"):
+            b.status_set(str(repo), sha, ctx, "success", "ok")
+        b.pr_create(str(repo), "m1", "t")
+        subprocess.check_call(
+            ["git", "-C", str(repo), "remote", "set-url", "origin", str(Path(td) / "missing.git")]
+        )
+        try:
+            b.pr_merge(str(repo), "m1")
+        except RuntimeError as e:
+            assert "push" in str(e)
+        else:
+            raise AssertionError("pr_merge ignored push failure")
+        assert b.pr_find("m1")["state"] == "open"
+        subprocess.check_call(["git", "-C", str(repo), "remote", "set-url", "origin", str(origin)])
+        out = b.pr_merge(str(repo), "m1")
+        assert out["merged"] is True
+        local_main = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "main"], text=True
+        ).strip()
+        origin_main = subprocess.check_output(
+            ["git", "--git-dir", str(origin), "rev-parse", "main"], text=True
+        ).strip()
+        assert local_main == origin_main
+        assert b.pr_find("m1")["state"] == "merged"
+
+
 def test_github_backend_mocked():
     MockGH.store = {"statuses": [], "labels": {}, "pulls": [], "merges": []}
     server = HTTPServer(("127.0.0.1", 0), MockGH)
@@ -151,6 +234,10 @@ def test_default_backend_is_local():
 if __name__ == "__main__":
     test_local_status_and_required()
     print("test_local: PASS")
+    test_status_set_no_shell_injection()
+    print("test_status_no_shell_injection: PASS")
+    test_local_merge_push_failure_is_error()
+    print("test_local_merge_push_failure: PASS")
     test_github_backend_mocked()
     print("test_github_mocked: PASS")
     test_default_backend_is_local()
