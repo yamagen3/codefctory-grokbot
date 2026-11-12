@@ -8,12 +8,14 @@ Usage:
 
 Exit codes (daily/apply):
   0 nothing-to-do   10 updated-ok   20 needs-approval (nothing auto-applied, or applied ok + pending approvals)
-  30 rolled-back    1 error         75 another run holds the lock
+  30 rolled-back    40 deferred-provider (provider outage, not a regression)
+  1 error           75 another run holds the lock
 `check` exits 0 on success, 1 on error.
 
 Never prints secret values; only checks that env vars exist. No model calls in `check`.
 Test hooks (env): FACTORY_UPDATE_DIR, FACTORY_UPDATE_NPM_PREFIX, FACTORY_UPDATE_VERIFY_CMD,
-FACTORY_UPDATE_SKIP_POST=1, FACTORY_UPDATE_SKIP_DOCTOR=1, FACTORY_UPDATE_DOCTOR_CMD.
+FACTORY_UPDATE_SKIP_POST=1, FACTORY_UPDATE_SKIP_DOCTOR=1, FACTORY_UPDATE_DOCTOR_CMD,
+FACTORY_UPDATE_PROVIDER_CHECK_CMD.
 """
 import datetime as dt
 import fcntl
@@ -44,7 +46,13 @@ OC_PKG = "@opencode/cli"
 PONG = "Reply with exactly the single word pong and nothing else."
 PONG_CHECK = ("python3 -c \"import sys,json; d=json.loads(sys.stdin.read().strip().splitlines()[-1]); "
               "sys.exit(0 if d.get('stopReason')=='completed' and d.get('text','').strip().strip('.').lower()=='pong' else 1)\"")
-EXIT = {"nothing-to-do": 0, "updated-ok": 10, "needs-approval": 20, "rolled-back": 30, "error": 1}
+EXIT = {"nothing-to-do": 0, "updated-ok": 10, "needs-approval": 20, "rolled-back": 30,
+        "deferred-provider": 40, "error": 1}
+PROVIDER_OUTAGE_MARKERS = (
+    "usage_limit_reached", "hit your 5-hour limit", "hit your weekly limit",
+    "rate_limit_error", "overloaded_error", '"api_error_status":429',
+    '"api_error_status":529', "factory-step: claude-code limited",
+)
 
 os.environ["PATH"] = f"{ROOT}/bin:{HOME}/.local/bin:" + os.environ.get("PATH", "")
 
@@ -723,6 +731,20 @@ def run_verify(d, stamp):
     return True, results
 
 
+def provider_check_cmd():
+    if "FACTORY_UPDATE_PROVIDER_CHECK_CMD" in os.environ:
+        return os.environ["FACTORY_UPDATE_PROVIDER_CHECK_CMD"]
+    p = ROOT / "bin/factory-provider-state"
+    if p.is_file() and os.access(p, os.X_OK):
+        return f"{p} check claude-code"
+    return None
+
+
+def provider_outage(rc, text):
+    low = (text or "").lower()
+    return rc == 75 or any(m in low for m in PROVIDER_OUTAGE_MARKERS)
+
+
 def post_apply(changed_kinds):
     """Re-apply CC allowlist patch + pstack (factory-setup is idempotent) and resync factory-oc OpenCode."""
     if os.environ.get("FACTORY_UPDATE_SKIP_POST"):
@@ -754,6 +776,13 @@ def append_log(entry):
         f.write(entry + "\n")
 
 
+def apply_log_entry(res, d, pending):
+    return (f"- {res['finished']}: **{res['status']}** — applied: {', '.join(res['applied']) or 'none'}"
+            + (f"; reason: {res.get('rollback_reason')}" if res.get("rollback_reason") else "")
+            + (f"; defer: {res.get('defer_reason')}" if res.get("defer_reason") else "")
+            + f"; pending approval: {len(pending)}; details `{d.relative_to(UPD) if str(d).startswith(str(UPD)) else d}/result.json`")
+
+
 def do_apply(rep):
     t = now()
     stamp = t.strftime("%Y%m%d-%H%M%S")
@@ -766,6 +795,17 @@ def do_apply(rep):
     if not auto:
         res["status"] = "needs-approval" if pending else "nothing-to-do"
         return res
+    check_cmd = provider_check_cmd()
+    if check_cmd:
+        p = run(["bash", "-c", check_cmd], timeout=120)
+        if p.returncode == 75:
+            res["status"] = "deferred-provider"
+            res["defer_reason"] = "claude-code limited: " + p.stdout.strip()[:200]
+            res["finished"] = now().isoformat(timespec="seconds")
+            (d / "result.json").write_text(json.dumps(res, indent=2, ensure_ascii=False))
+            append_log(apply_log_entry(res, d, pending))
+            log(f"deferred: {res['defer_reason']}")
+            return res
     snap = Snapshot(d / "snapshot")
     staging = Path(tempfile.mkdtemp(prefix="factory-update-stage-"))
     order = {"npm": 0, "cc-sdk": 0.5, "agmsg-skill": 1, "oc-copy": 2, "uv": 3, "python": 4, "apt": 5}
@@ -826,7 +866,14 @@ def do_apply(rep):
         res["verify"] = vres
         if not ok:
             failed = vres[-1]
-            raise VerifyFailed(f"verify step {failed['step']} failed rc={failed['rc']} (log {failed['log']})")
+            try:
+                vtext = Path(failed["log"]).read_text(errors="ignore")
+            except OSError:
+                vtext = ""
+            outage = provider_outage(failed["rc"], vtext)
+            raise VerifyFailed(
+                f"verify step {failed['step']} failed rc={failed['rc']} (log {failed['log']})",
+                defer_reason=(f"provider outage during verify step {failed['step']} (not a regression)" if outage else None))
         res["status"] = "updated-ok"
     except Exception as e:
         reason = str(e)
@@ -835,7 +882,11 @@ def do_apply(rep):
         try:
             rollback(snap)
             res["doctor_after_rollback_rc"] = doctor()
-            res["status"] = "rolled-back"
+            if getattr(e, "defer_reason", None):
+                res["status"] = "deferred-provider"
+                res["defer_reason"] = e.defer_reason
+            else:
+                res["status"] = "rolled-back"
         except Exception as e2:
             res["status"] = "error"
             res["rollback_error"] = str(e2)
@@ -843,15 +894,14 @@ def do_apply(rep):
         shutil.rmtree(staging, ignore_errors=True)
     res["finished"] = now().isoformat(timespec="seconds")
     (d / "result.json").write_text(json.dumps(res, indent=2, ensure_ascii=False))
-    entry = (f"- {res['finished']}: **{res['status']}** — applied: {', '.join(res['applied']) or 'none'}"
-             + (f"; reason: {res.get('rollback_reason')}" if res.get("rollback_reason") else "")
-             + f"; pending approval: {len(pending)}; details `{d.relative_to(UPD) if str(d).startswith(str(UPD)) else d}/result.json`")
-    append_log(entry)
+    append_log(apply_log_entry(res, d, pending))
     return res
 
 
 class VerifyFailed(RuntimeError):
-    pass
+    def __init__(self, msg, defer_reason=None):
+        super().__init__(msg)
+        self.defer_reason = defer_reason
 
 
 def rollback(snap):
@@ -894,6 +944,8 @@ def write_summary(status, rep=None, res=None, err=None):
     if res:
         L.append(f"- apply result: {res.get('status')}")
         L.append(f"- applied: {', '.join(res.get('applied', [])) or 'none'}")
+        if res.get("defer_reason"):
+            L.append(f"- deferred: {res['defer_reason']}")
         if res.get("rollback_reason"):
             L.append(f"- rolled back, reason: {res['rollback_reason']}")
             L.append(f"- factory-doctor after rollback rc={res.get('doctor_after_rollback_rc')}")
@@ -917,6 +969,8 @@ def final_status(rep, res):
         return "needs-approval" if pend else "nothing-to-do"
     if res["status"] in ("rolled-back", "error"):
         return res["status"]
+    if res["status"] == "deferred-provider":
+        return "deferred-provider"
     if res["status"] == "updated-ok":
         return "needs-approval" if pend else "updated-ok"
     return res["status"]
@@ -981,6 +1035,12 @@ def main(argv):
             res = do_apply(rep) if any(a["class"] == "auto" for a in rep["actions"]) else None
             st = final_status(rep, res)
             write_summary(st, rep, res, "; ".join(rep.get("errors", [])) or None)
+            if st == "deferred-provider":
+                reason = (res or {}).get("defer_reason", "")
+                try:
+                    run([str(ROOT / "bin/factory-notify"), "update-deferred", reason], timeout=120)
+                except Exception as e:
+                    log(f"notify failed (ignored): {e}")
             # updated-ok with pending approvals → report as needs-approval but keep the "updated" fact in summary
             if res and res["status"] == "updated-ok" and st == "needs-approval":
                 return EXIT["needs-approval"]

@@ -13,7 +13,7 @@ OpenCode isolation only bind-mounts the product workspace + `factory-oc` home �
 - Lock: `local/updates/.lock` (flock; a second run exits 75).
 - Verify reuses `factory-doctor`, `factory-step` pong (CC + OpenCode), `bin/factory-oc-leak-check` (P3 14 items), `local/tests/test-cc-allowlist.mjs` + `local/tests/test_cc_fs_allowlist.sh`, `factory-local-dry-run` (acceptance ≥ 10 by default; override with `FACTORY_UPDATE_MIN_ACCEPTANCE`).
 - Tests: `local/tests/test_factory_update.sh` (fake npm package in a temp prefix; simulated verify failure → rollback).
-- Scheduler: `flock -n "$FACTORY_ROOT/local/updates/.cron.lock" "$FACTORY_ROOT/bin/factory-update" daily` (exit 0 nothing-to-do, 10 updated-ok, 20 needs-approval, 30 rolled-back, 1 error, 75 locked).
+- Scheduler: `flock -n "$FACTORY_ROOT/local/updates/.cron.lock" "$FACTORY_ROOT/bin/factory-update" daily` (exit 0 nothing-to-do, 10 updated-ok, 20 needs-approval, 30 rolled-back, 40 deferred-provider — provider outage or rate limit, not a regression; 1 error, 75 locked).
 
 ## Usage tracking (`bin/factory-usage`)
 

@@ -123,3 +123,11 @@
 - [ ] R2-F12: キューと worker。
 - [ ] V11: CC allowlist の決定ログを `local/logs`（0600）へ（現在は内容は安全化済みだが /tmp の world-readable）。
 - [ ] 【要判断】inbox の締切ポリシー（沈黙＝続行にするか）。
+
+## 改善ループ第 3 回（2026-11-13、単一プロバイダー依存）由来
+- [x] R3-T1: CC の利用上限・過負荷を判定して park（`bin/factory-provider-state`、factory-step の事前チェックと事後判定、stall-retry はリセットまで待って再実行、`provider-limited` 通知）。usage sidecar が `is_error` / `api_error*` / `result_head` を記録する。
+- [x] R3-T2: `factory-update` は CC 上限中なら何も適用せず `deferred-provider`（exit 40）、検証中の上限・過負荷は退行扱いにせず `deferred-provider` と `update-deferred` 通知。
+- [ ] OpenCode 側（opencode-go）の 429・上限の文言サンプルを採り、同じ park を OC step にも入れる。
+- [ ] 実の DSH 経路で sidecar の新フィールドが記録されることを、次に CC が上限に達したときに確認する（今回はスタブでのテストのみ）。
+- [ ] 【要判断・要認証情報】CC 不通時の代替 SPEC/gate。案は、OpenCode（flash, max）を gate の 2 次判定に使う、または `docs/extensibility.md` のアダプター経由で別プロバイダーを使う。モデル設定の変更と新しい鍵が要る。
+- [ ] 【要判断】上限の枠を工場の実行とレビュー・保守で分ける（例: レビューは別アカウント・別トークン、または工場の実行中はレビューを止める）。
