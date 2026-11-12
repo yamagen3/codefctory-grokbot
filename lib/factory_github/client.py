@@ -103,16 +103,21 @@ class LocalBackend(Backend):
         self.labels_dir.mkdir(parents=True, exist_ok=True)
         self.pr_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _check_sha(sha: str) -> str:
+        if not re.fullmatch(r"[0-9A-Za-z]{4,64}", sha):
+            raise ValueError(f"bad sha {sha!r}")
+        return sha
+
     def _status_path(self, sha: str) -> Path:
-        return self.status_dir / f"{sha}.json"
+        return self.status_dir / f"{self._check_sha(sha)}.json"
 
     def _read_status(self, sha: str) -> dict:
         p = self._status_path(sha)
         return json.loads(p.read_text()) if p.exists() else {}
 
     def status_set(self, repo: str, sha: str, context: str, state: str, description: str = "") -> dict:
-        if not re.fullmatch(r"[0-9A-Za-z]{4,64}", sha):
-            raise ValueError(f"bad sha {sha!r}")
+        sha = self._check_sha(sha)
         if state not in ("success", "failure", "pending", "error"):
             raise ValueError(f"bad state {state}")
         with open(self.status_dir / ".lock", "a") as lock:

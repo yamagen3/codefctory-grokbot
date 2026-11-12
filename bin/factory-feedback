@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Per-round failure feedback for factory-run-local.
+# Usage:
+#   factory-feedback write <id> <round> <stage> <summary> [detail-file]
+#   factory-feedback prompt <id> <round>
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+
+valid_id() { [[ "${1:-}" =~ ^[A-Za-z0-9._-]+$ ]]; }
+valid_round() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+
+CMD="${1:-}"; shift || true
+
+case "$CMD" in
+  write)
+    ID="${1:-}"; ROUND="${2:-}"; STAGE="${3:-}"; SUMMARY="${4:-}"; DETAIL="${5:-}"
+    [[ -n "$ID" && -n "$ROUND" && -n "$STAGE" ]] \
+      || die "usage: factory-feedback write <id> <round> <stage> <summary> [detail-file]"
+    valid_id "$ID" || die "factory-feedback: invalid id"
+    valid_round "$ROUND" || die "factory-feedback: round must be an integer"
+    DIR="${FACTORY_RUNS_DIR:-$FACTORY_ROOT/local/runs}/${ID}"
+    mkdir -p "$DIR"
+    OUT="$DIR/feedback-r${ROUND}.md"
+    python3 - "$OUT" "$ROUND" "$STAGE" "$SUMMARY" "${DETAIL:-}" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+out, rnd, stage, summary, detail_path = sys.argv[1:6]
+
+text = ""
+if detail_path:
+    try:
+        raw = pathlib.Path(detail_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        raw = ""
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        obj = None
+    if isinstance(obj, dict) and isinstance(obj.get("text"), str):
+        text = obj["text"]
+    else:
+        text = raw
+
+# Keep newlines and tabs; drop the other control characters.
+text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", text)
+lines = text.split("\n")
+if lines and lines[-1] == "":
+    lines = lines[:-1]
+lines = lines[-60:]
+redact = re.compile(r"(api[_-]?key|token|secret|password|authorization)", re.IGNORECASE)
+lines = ["[redacted line]" if redact.search(line) else line for line in lines]
+text = "\n".join(lines)
+data = text.encode("utf-8")
+if len(data) > 4000:
+    text = data[-4000:].decode("utf-8", errors="ignore")
+
+body = (
+    f"# Round {rnd} failed at {stage}\n"
+    f"summary: {summary}\n"
+    "\n"
+    "```\n"
+    f"{text}\n"
+    "```\n"
+)
+pathlib.Path(out).write_text(body, encoding="utf-8")
+PY
+    ;;
+  prompt)
+    ID="${1:-}"; ROUND="${2:-}"
+    [[ -n "$ID" && -n "$ROUND" ]] || die "usage: factory-feedback prompt <id> <round>"
+    valid_id "$ID" || die "factory-feedback: invalid id"
+    valid_round "$ROUND" || die "factory-feedback: round must be an integer"
+    DIR="${FACTORY_RUNS_DIR:-$FACTORY_ROOT/local/runs}/${ID}"
+    PREV="$DIR/feedback-r$((ROUND - 1)).md"
+    if [[ -f "$PREV" ]]; then
+      printf '\n\nPrevious round was rejected. Fix exactly this and keep what already passes:\n'
+      cat "$PREV" || true
+    fi
+    exit 0
+    ;;
+  *)
+    die "usage: factory-feedback write|prompt ..."
+    ;;
+esac

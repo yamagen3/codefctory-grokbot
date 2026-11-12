@@ -11,7 +11,7 @@ OpenCode isolation only bind-mounts the product workspace + `factory-oc` home �
 - `factory-update check|apply|daily` — daily security-update batch (see `DECISIONS.md`, 2026-11-05).
 - Output: `local/updates/<date>/check-*.json|md`, `apply-*/` (snapshot, verify logs, `result.json`), `local/updates/latest-summary.md`, change log `local/updates/UPDATES-LOG.md`. `local/updates/` is runtime state (gitignored).
 - Lock: `local/updates/.lock` (flock; a second run exits 75).
-- Verify reuses `factory-doctor`, `factory-step` pong (CC + OpenCode), `bin/factory-oc-leak-check` (P3 14 items), `local/tests/test-cc-allowlist.mjs` + `local/tests/test_cc_fs_allowlist.sh`, `factory-local-dry-run` (acceptance ≥ 18).
+- Verify reuses `factory-doctor`, `factory-step` pong (CC + OpenCode), `bin/factory-oc-leak-check` (P3 14 items), `local/tests/test-cc-allowlist.mjs` + `local/tests/test_cc_fs_allowlist.sh`, `factory-local-dry-run` (acceptance ≥ 10 by default; override with `FACTORY_UPDATE_MIN_ACCEPTANCE`).
 - Tests: `local/tests/test_factory_update.sh` (fake npm package in a temp prefix; simulated verify failure → rollback).
 - Scheduler: `flock -n "$FACTORY_ROOT/local/updates/.cron.lock" "$FACTORY_ROOT/bin/factory-update" daily` (exit 0 nothing-to-do, 10 updated-ok, 20 needs-approval, 30 rolled-back, 1 error, 75 locked).
 

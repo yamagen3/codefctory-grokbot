@@ -115,8 +115,8 @@ case "$CMD" in
     TMP=$(mktemp -d /tmp/factory-patch-XXXXXX)
     trap 'rm -rf "$TMP"' EXIT
     mkdir -p "$TMP/a" "$TMP/b"
-    (cd "$CLEAN" && tar cf - --exclude .git --exclude __pycache__ --exclude .factory-round --exclude .factory-cc-fs-state --exclude tmp --exclude 'tmp.*' .) | (cd "$TMP/a" && tar xf -)
-    (cd "$OC" && tar cf - --exclude .git --exclude __pycache__ --exclude '.factory-oc-*' --exclude .factory-cc-fs-state --exclude tmp --exclude 'tmp.*' .) | (cd "$TMP/b" && tar xf -)
+    (cd "$CLEAN" && tar cf - --exclude .git --exclude __pycache__ --exclude .pytest_cache --exclude .mypy_cache --exclude .ruff_cache --exclude .venv --exclude venv --exclude .factory-round --exclude .factory-cc-fs-state --exclude tmp --exclude 'tmp.*' .) | (cd "$TMP/a" && tar xf -)
+    (cd "$OC" && tar cf - --exclude .git --exclude __pycache__ --exclude .pytest_cache --exclude .mypy_cache --exclude .ruff_cache --exclude .venv --exclude venv --exclude '.factory-oc-*' --exclude .factory-cc-fs-state --exclude tmp --exclude 'tmp.*' .) | (cd "$TMP/b" && tar xf -)
     # Drop protected paths + orchestrator bookkeeping from BOTH trees so they never appear in the diff
     for side in a b; do
       rm -rf "$TMP/$side/spec" "$TMP/$side/tests/acceptance" "$TMP/$side/.github"

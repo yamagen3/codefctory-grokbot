@@ -19,12 +19,31 @@ cmd_record() {
   local SHA="${1:-}" STATE_IN="${2:-}"; shift 2 || true
   local REASON="${*:-}"
   [[ -n "$SHA" && -n "$STATE_IN" ]] || die "usage: factory-gate-grok record <sha> success|failure <reason>"
+  [[ "$SHA" =~ ^[0-9A-Za-z]{4,64}$ ]] || die "record: bad sha"
   local STATE
   case "$STATE_IN" in
     pass|success) STATE=success ;;
     fail|failure) STATE=failure ;;
     *) die "state must be success|failure" ;;
   esac
+  # Resolve a unique pending sha prefix to the full sha before naming the result.
+  local PENDING="$HOOK_DIR/pending-${SHA}.json"
+  if [[ ! -f "$PENDING" && "${#SHA}" -ge 7 ]]; then
+    local -a MATCHES=()
+    local MATCH
+    while IFS= read -r MATCH; do
+      [[ -f "$MATCH" ]] && MATCHES+=("$MATCH")
+    done < <(compgen -G "$HOOK_DIR/pending-${SHA}*.json" || true)
+    if (( ${#MATCHES[@]} > 1 )); then
+      die "record: ambiguous sha prefix"
+    elif (( ${#MATCHES[@]} == 1 )); then
+      MATCH="${MATCHES[0]##*/pending-}"
+      SHA="${MATCH%.json}"
+      PENDING="$HOOK_DIR/pending-${SHA}.json"
+    else
+      echo "factory-gate-grok: WARN no pending record for $SHA; nothing will continue" >&2
+    fi
+  fi
   local RESULT="$HOOK_DIR/result-${SHA}.json"
   python3 - "$RESULT" "$SHA" "$STATE" "$REASON" <<'PY'
 import json,sys,datetime
@@ -34,7 +53,6 @@ open(path,"w").write(json.dumps(rec,indent=2)+"\n")
 print(path)
 PY
   # If a repo path was stored in pending, set status
-  local PENDING="$HOOK_DIR/pending-${SHA}.json"
   local REPO=""
   if [[ -f "$PENDING" ]]; then
     REPO=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("repo",""))' "$PENDING")
@@ -201,12 +219,14 @@ case "$MODE" in
     ;;
   pending)
     factory-status set "$REPO" "$SHA" gate/grok pending "awaiting Grok"
+    factory-notify grok-pending "id=${ID} sha=${SHA} bundle=${BUNDLE}" >/dev/null || true
     echo "factory-gate-grok: pending Grok verdict (bundle=$BUNDLE)" >&2
     exit 2
     ;;
   wait)
     WAIT="${FACTORY_GROK_WAIT_SEC:-3600}"
     POLL="${FACTORY_GROK_POLL_SEC:-2}"
+    ON_TIMEOUT="${FACTORY_GROK_ON_WAIT_TIMEOUT:-park}"
     echo "factory-gate-grok: waiting up to ${WAIT}s for $RESULT"
     factory-status set "$REPO" "$SHA" gate/grok pending "awaiting Grok"
     elapsed=0
@@ -218,8 +238,30 @@ case "$MODE" in
       elapsed=$((elapsed + POLL))
     done
     if [[ ! -f "$RESULT" ]]; then
-      factory-status set "$REPO" "$SHA" gate/grok error "timeout waiting for Grok"
-      die "timeout waiting for Grok verdict ($WAIT s)"
+      case "$ON_TIMEOUT" in
+        fail)
+          factory-status set "$REPO" "$SHA" gate/grok error "timeout waiting for Grok"
+          die "timeout waiting for Grok verdict ($WAIT s)"
+          ;;
+        park)
+          python3 - "$PENDING" <<'PY'
+import json,sys,datetime
+path=sys.argv[1]
+rec=json.load(open(path))
+rec["mode"]="pending"
+rec["status"]="pending"
+rec["parked_at"]=datetime.datetime.now(datetime.timezone.utc).isoformat()
+open(path,"w").write(json.dumps(rec,indent=2)+"\n")
+PY
+          factory-status set "$REPO" "$SHA" gate/grok pending "awaiting Grok (wait timed out)"
+          factory-notify grok-pending "id=${ID} sha=${SHA} bundle=${BUNDLE} reason=wait-timeout" >/dev/null || true
+          if [[ -f "$RESULT" ]]; then
+            "$FACTORY_ROOT/bin/factory-continue" "$SHA" || true
+          fi
+          exit 2
+          ;;
+        *) die "unknown FACTORY_GROK_ON_WAIT_TIMEOUT=$ON_TIMEOUT" ;;
+      esac
     fi
     STATE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$RESULT")
     DESC=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("description",""))' "$RESULT")

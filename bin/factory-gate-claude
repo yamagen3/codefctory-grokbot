@@ -9,12 +9,13 @@ REPO="${1:-}"; ID="${2:-}"; SHA="${3:-}"
 REPO="$(resolve_repo "$REPO")"
 cd "$REPO"
 SHA="${SHA:-$(git rev-parse HEAD)}"
+OUT="${FACTORY_GATE_CLAUDE_OUT:-/tmp/factory-gate-claude.json}"
 
 # Optional stub for spend-free tests
 if [[ -n "${FACTORY_CLAUDE_GATE_STUB:-}" ]]; then
   case "$FACTORY_CLAUDE_GATE_STUB" in
-    pass|success) STATE=success; echo '{"text":"GATE: PASS\nstub"}' > /tmp/factory-gate-claude.json ;;
-    fail|failure) STATE=failure; echo '{"text":"GATE: FAIL\nstub"}' > /tmp/factory-gate-claude.json ;;
+    pass|success) STATE=success; echo '{"text":"GATE: PASS\nstub"}' > "$OUT" ;;
+    fail|failure) STATE=failure; echo '{"text":"GATE: FAIL\nstub"}' > "$OUT" ;;
     *) die "bad FACTORY_CLAUDE_GATE_STUB" ;;
   esac
 else
@@ -27,19 +28,53 @@ Then a short rationale. Do not modify files. Do not use AskUserQuestion."
   # Read-only allowlist for gate
   export FACTORY_CC_STEP=gate
   factory-cc-fs-allowlist apply "$REPO" gate
+  trap 'factory-cc-fs-allowlist restore "$REPO" >/dev/null 2>&1 || true' EXIT
   set +e
-  FACTORY_USAGE_STEP=gate-claude FACTORY_USAGE_RUN_ID="${FACTORY_USAGE_RUN_ID:-$ID}" FACTORY_PROVIDER=claude-code factory-step --json "$TASK" | tee /tmp/factory-gate-claude.json
+  FACTORY_USAGE_STEP=gate-claude FACTORY_USAGE_RUN_ID="${FACTORY_USAGE_RUN_ID:-$ID}" FACTORY_PROVIDER=claude-code factory-step --json "$TASK" | tee "$OUT"
+  STEP_EC=${PIPESTATUS[0]}
   set -e
   factory-cc-fs-allowlist restore "$REPO"
+  trap - EXIT
   # Scrub ephemeral artifacts CC may drop while running tests (not product writes)
   find "$REPO" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
   rm -f "$REPO/uv.lock" "$REPO/.coverage" 2>/dev/null || true
   factory-cc-fs-allowlist verify "$REPO" gate || { factory-status set "$REPO" "$SHA" gate/claude failure "wrote files"; exit 1; }
-  STATE=failure
-  if python3 -c 'import json;from pathlib import Path;t=json.loads(Path("/tmp/factory-gate-claude.json").read_text()).get("text") or "";
-import sys; sys.exit(0 if any(l.strip()=="GATE: PASS" for l in t.splitlines()) else 1)'; then
-    STATE=success
+  if [[ "$STEP_EC" -eq 124 ]]; then
+    factory-status set "$REPO" "$SHA" gate/claude error "step timeout"
+    exit 124
   fi
+  VERDICT=$(python3 - "$OUT" "$STEP_EC" <<'PY'
+import json, sys
+
+out, step_ec = sys.argv[1], sys.argv[2]
+try:
+    with open(out, encoding="utf-8") as fh:
+        text = json.load(fh).get("text")
+except (OSError, ValueError, AttributeError):
+    text = None
+if not isinstance(text, str):
+    text = ""
+lines = [line.strip() for line in text.splitlines()]
+passes = sum(line == "GATE: PASS" for line in lines)
+fails = sum(line == "GATE: FAIL" for line in lines)
+if fails >= 1:
+    print("fail")
+elif passes >= 1 and step_ec == "0":
+    print("pass")
+else:
+    print("none")
+PY
+)
+  case "$VERDICT" in
+    pass) STATE=success ;;
+    fail) STATE=failure ;;
+    none)
+      factory-status set "$REPO" "$SHA" gate/claude error "no verdict (step exit=$STEP_EC)"
+      echo "factory-gate-claude: no verdict (step exit=$STEP_EC)" >&2
+      exit 75
+      ;;
+    *) die "factory-gate-claude: bad verdict: $VERDICT" ;;
+  esac
 fi
 
 factory-status set "$REPO" "$SHA" gate/claude "$STATE" "factory gate/claude"
