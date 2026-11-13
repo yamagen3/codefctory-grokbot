@@ -207,61 +207,71 @@ def check(doc):
     prompts = doc["prompts"]
     root = factory_root()
 
+    model = re.escape(brain["model"])
+    effort = re.escape(brain["effort"])
+    timeout_ms = re.escape(str(brain["step_timeout_ms"]))
+    maker_model = re.escape(maker["model"])
+    maker_effort = re.escape(maker["reasoning_effort"])
+    goal_turns = re.escape(str(brain["spec_goal_turns"]))
+    max_rounds = re.escape(str(loop["max_rounds"]))
+    stall_sec = re.escape(str(loop["stall_timeout_sec"]))
+    parallel_max = re.escape(str(maker["parallel_max"]))
+
     rules = [
         (
             "brain.model",
             "config/factory.patch.yml",
-            "model: {}".format(brain["model"]),
+            r"(?m)^\s*model: " + model + r"\s*$",
         ),
         (
             "brain.effort",
             "config/factory.patch.yml",
-            "CLAUDE_CODE_EFFORT_LEVEL: '{}'".format(brain["effort"]),
+            r"(?m)^\s*CLAUDE_CODE_EFFORT_LEVEL:\s*'" + effort + r"'\s*,?\s*$",
         ),
         (
             "brain.step_timeout_ms",
             "config/factory.patch.yml",
-            "timeoutMs: {}".format(brain["step_timeout_ms"]),
+            r"(?m)^\s*timeoutMs: " + timeout_ms + r"\s*$",
         ),
         (
             "maker.model",
             "bin/factory-common.sh",
-            '"model": "{}"'.format(maker["model"]),
+            r'(?m)^\s*"model":\s*"' + maker_model + r'",?\s*$',
         ),
         (
             "maker.reasoning_effort",
             "bin/factory-common.sh",
-            '"reasoningEffort": "{}"'.format(maker["reasoning_effort"]),
+            r'(?m)^\s*"reasoningEffort":\s*"' + maker_effort + r'",?\s*$',
         ),
         (
             "brain.spec_goal_turns",
             "bin/factory-common.sh",
-            "FACTORY_CC_GOAL_TURNS:-{}".format(brain["spec_goal_turns"]),
+            r"FACTORY_CC_GOAL_TURNS:-" + goal_turns + r"\}",
         ),
         (
             "loop.max_rounds",
             "bin/factory-run-local",
-            "FACTORY_MAX_ROUNDS:-{}".format(loop["max_rounds"]),
+            r"FACTORY_MAX_ROUNDS:-" + max_rounds + r"\}",
         ),
         (
             "loop.stall_timeout_sec",
             "bin/factory-stall-retry",
-            "FACTORY_STALL_TIMEOUT_SEC:-{}".format(loop["stall_timeout_sec"]),
-        ),
-        (
-            "maker.parallel_default",
-            "bin/factory-impl-step",
-            "PARALLEL={}".format(maker["parallel_default"]),
+            r"FACTORY_STALL_TIMEOUT_SEC:-" + stall_sec + r"\}",
         ),
         (
             "maker.parallel_max",
             "bin/factory-impl-step",
-            "-gt {}".format(maker["parallel_max"]),
+            r"(?<![\w])-gt\s+" + parallel_max + r"\b",
+        ),
+        (
+            "brain.effort",
+            "lib/factory_usage.py",
+            r'"FACTORY_CC_EXPECT_EFFORT", "' + effort + r'"',
         ),
     ]
 
     mismatches = []
-    for key, relative, needle in rules:
+    for key, relative, pattern in rules:
         path = root / relative
         try:
             text = path.read_text(encoding="utf-8")
@@ -270,10 +280,34 @@ def check(doc):
                 "{}: {}: file not found".format(key, relative)
             )
             continue
-        if needle not in text:
+        if not re.search(pattern, text):
             mismatches.append(
-                "{}: {}: missing {!r}".format(key, relative, needle)
+                "{}: {}: missing {!r}".format(key, relative, pattern)
             )
+
+    # Every standalone PARALLEL=<digits> default line must agree with the profile.
+    parallel_path = root / "bin/factory-impl-step"
+    try:
+        parallel_text = parallel_path.read_text(encoding="utf-8")
+    except OSError:
+        mismatches.append(
+            "maker.parallel_default: bin/factory-impl-step: file not found"
+        )
+    else:
+        assignments = re.findall(r"(?m)^\s*PARALLEL=([0-9]+)\s*$", parallel_text)
+        if not assignments:
+            mismatches.append(
+                "maker.parallel_default: bin/factory-impl-step: missing PARALLEL={}".format(
+                    maker["parallel_default"]
+                )
+            )
+        for assigned in assignments:
+            if int(assigned) != maker["parallel_default"]:
+                mismatches.append(
+                    "maker.parallel_default: bin/factory-impl-step: PARALLEL={} does not match profile value {}".format(
+                        assigned, maker["parallel_default"]
+                    )
+                )
 
     for name in ("spec", "gate_claude", "impl"):
         prompt = prompts[name]

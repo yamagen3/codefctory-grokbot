@@ -1,9 +1,9 @@
 # Benchmark skeleton
 
-`bin/factory-bench` is an offline validator and scorer for a small set of factory
-tasks. It reads JSON files only: it never starts a factory run, invokes a model,
-or uses the network. Results are recorded separately, so a score can be repeated
-without spending tokens.
+`bin/factory-bench` is an offline validator, collector, and scorer for a small
+set of factory tasks. It reads files only: it never starts a factory run, invokes
+a model, or uses the network. Results are recorded separately, so a score can be
+repeated without spending tokens.
 
 ## Layout
 
@@ -78,12 +78,45 @@ problem and exits 1 when any task is invalid.
 - `source` is `recorded` or `stub`.
 - `status` is `merged`, `max-rounds`, `aborted`, or `parked`.
 - `rounds` is the number of implementation rounds.
-- `gate_claude` has one `pass` or `fail` entry per round.
+- `gate_claude` has one `pass` or `fail` entry per round that reached the gate.
 - `grok` is `pass`, `fail`, or `null`.
 - `checks` maps hidden-check names to `true` or `false`.
 - `wall_ms` is a non-negative number.
 - `cost.cc_usd` and `cost.oc_tokens` are non-negative values or `null` when the
   cost is unknown.
+
+## Collecting a finished run
+
+```
+bin/factory-bench collect <run-id> --task <task-id> --out <results-dir> \
+  [--profile ID] [--runs DIR] [--usage DIR] [--checks FILE] [--tasks DIR] [--force]
+```
+
+`collect` reads `<runs>/<run-id>/state.json`, the run's `feedback-r<N>.md`
+files, and its usage records, then writes
+`<results-dir>/<profile>/<task-id>.json` with `source: "recorded"`. It never
+starts a model. `--runs` defaults to `$FACTORY_RUNS_DIR` or `local/runs`, and
+`--usage` to `$FACTORY_USAGE_DIR` or `local/usage`. `--tasks` is accepted for
+parity with `score`.
+
+- Status comes from `state.exit`: `0` is `merged`, `3` is `max-rounds`, `75` is
+  `parked`, and any other value is `aborted`. A run whose `exit` is `2` or
+  `null` has not finished, so `collect` exits 1.
+- The profile is `--profile`, falling back to `state.profile`. If neither is
+  present, or both are present and differ, `collect` exits 2.
+- `rounds` is `state.round`. The first line of each `feedback-r<N>.md` feeds
+  `gate_claude`: `gate-claude` gives `fail`, `gate-grok` gives `pass`, and
+  `guard` or `ci` gives no entry because the gate was never reached. A merged
+  run's last round with no feedback file gives `pass`.
+- `grok` is `pass` for a merged run, `fail` when a non-merged run has any
+  `gate-grok` feedback stage, and `null` otherwise.
+- `--checks` is a JSON object of check name to boolean and is copied into the
+  result. Without it, `checks` is `{}`, so required checks score as failed.
+- `wall_ms` is the sum of `wall_ms` over the run's `runs.jsonl` summary records,
+  or 0 when there are none. `cost.cc_usd` sums `cost_usd_estimate` over
+  claude-code steps, and `cost.oc_tokens` sums `total_tokens` over opencode
+  steps. A cost is `null` when no matching step has that field.
+- An existing result is refused unless `--force` is passed.
 
 Score one profile with:
 
@@ -122,11 +155,14 @@ The report aggregates:
 
 Exit codes:
 
-- `0`: validation succeeded, or `pass_rate >= --min-pass`.
-- `1`: validation found problems, or the score is below the minimum.
-- `2`: malformed arguments or result files, or an invalid task set passed to
-  `score` (validation itself reports task problems with exit 1).
+- `0`: validation or collection succeeded, or `pass_rate >= --min-pass`.
+- `1`: validation found problems, the score is below the minimum, `collect`
+  found an unfinished run, or a result already exists without `--force`.
+- `2`: malformed arguments, run state, or result files, a missing or conflicting
+  profile during `collect`, or an invalid task set passed to `score` (validation
+  itself reports task problems with exit 1).
 
 Running the task set against paid models and choosing a profile from these
 scores are out of scope for this skeleton. Both are owner decisions; this tool
-only validates tasks and scores results that already exist.
+only collects finished runs, validates tasks, and scores results that already
+exist.

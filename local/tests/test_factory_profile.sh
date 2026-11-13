@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline tests for the descriptive model profile and bin/factory-profile.
+# Offline tests for the model profile and bin/factory-profile.
 # A fake factory root is built by copying the real checked files; no model,
 # network, or provider call is made.
 set -euo pipefail
@@ -19,6 +19,7 @@ FILES=(
   bin/factory-spec-step
   bin/factory-gate-claude
   bin/factory-profile
+  lib/factory_usage.py
 )
 
 make_root() {
@@ -130,9 +131,48 @@ grep -qi 'missing' <<<"$out" || fail "(f) message does not name the profile: $ou
 grep -qi 'not found\|cannot read' <<<"$out" \
   || fail "(f) message does not say the profile is missing: $out"
 
-echo "=== (g) the real checkout matches its profile ==="
+echo "=== (h) model drift is named ==="
+make_root "$BASE"
+python3 - "$BASE/config/factory.patch.yml" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+want = "model: claude-opus-5-5"
+assert want in text, text
+path.write_text(text.replace(want, "model: claude-opus-5-5-x", 1))
+PY
+set +e
+out=$(run_profile "$BASE" check 2>&1)
+CHECK_RC=$?
+set -e
+[[ "$CHECK_RC" -eq 1 ]] || fail "(h) check exited $CHECK_RC, want 1: $out"
+grep -q 'brain\.model' <<<"$out" || fail "(h) mismatch did not name brain.model: $out"
+
+echo "=== (i) parallel default drift is named ==="
+make_root "$BASE"
+python3 - "$BASE/bin/factory-impl-step" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+want = "PARALLEL=2"
+assert text.count(want) >= 1, text
+path.write_text(text.replace(want, "PARALLEL=3", 1))
+PY
+set +e
+out=$(run_profile "$BASE" check 2>&1)
+CHECK_RC=$?
+set -e
+[[ "$CHECK_RC" -eq 1 ]] || fail "(i) check exited $CHECK_RC, want 1: $out"
+grep -q 'maker\.parallel_default' <<<"$out" \
+  || fail "(i) mismatch did not name maker.parallel_default: $out"
+
+echo "=== (j) the real checkout matches its profile ==="
 out=$(FACTORY_ROOT="$ROOT" "$ROOT/bin/factory-profile" check) \
-  || fail "(g) real checkout check failed: $out"
-[[ "$out" == "ok" ]] || fail "(g) real checkout check printed: $out"
+  || fail "(j) real checkout check failed: $out"
+[[ "$out" == "ok" ]] || fail "(j) real checkout check printed: $out"
 
 echo "test_factory_profile: PASS"
