@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+"""factory-bench — validate benchmark tasks and score recorded results offline.
+
+Usage:
+  factory-bench validate [--tasks DIR]
+  factory-bench score <results-dir> --profile <id> [--tasks DIR] [--json] [--min-pass X]
+
+This tool only reads JSON files. It never starts a factory run, calls a model,
+or uses the network.
+"""
+import argparse
+import json
+import math
+import re
+import sys
+from pathlib import Path
+
+DEFAULT_TASKS = Path(__file__).resolve().parent.parent / "bench" / "tasks"
+RESULT_STATUSES = {"merged", "max-rounds", "aborted", "parked"}
+SOURCES = {"recorded", "stub"}
+GATE_VALUES = {"pass", "fail"}
+RESULT_FIELDS = (
+    "task",
+    "profile",
+    "source",
+    "status",
+    "rounds",
+    "gate_claude",
+    "grok",
+    "checks",
+    "wall_ms",
+    "cost",
+)
+SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+class InputError(Exception):
+    pass
+
+
+def is_number(value):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def read_json(path):
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise InputError(f"{path}: {exc}") from exc
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise InputError(f"{path}: invalid JSON: {exc}") from exc
+
+
+def validate_task(doc, path, directory_name):
+    if not isinstance(doc, dict):
+        return [f"{path}: top level must be a JSON object"]
+    problems = []
+
+    def add(message):
+        problems.append(f"{path}: {message}")
+
+    if "schema" not in doc:
+        add("schema: missing")
+    elif (
+        not isinstance(doc["schema"], int)
+        or isinstance(doc["schema"], bool)
+        or doc["schema"] != 1
+    ):
+        add("schema: must be 1")
+
+    for field in ("id", "title", "kind", "brief"):
+        if field not in doc:
+            add(f"{field}: missing")
+        elif not isinstance(doc[field], str) or not doc[field].strip():
+            add(f"{field}: must be a non-empty string")
+
+    task_id = doc.get("id")
+    if isinstance(task_id, str) and task_id.strip():
+        if task_id != directory_name:
+            add(f"id: {task_id!r} does not match directory name {directory_name!r}")
+
+    checks = doc.get("checks")
+    if "checks" not in doc:
+        add("checks: missing")
+    elif not isinstance(checks, list):
+        add("checks: must be a list")
+    else:
+        names = set()
+        for index, check in enumerate(checks):
+            prefix = f"checks[{index}]"
+            if not isinstance(check, dict):
+                add(f"{prefix}: must be an object")
+                continue
+            name = check.get("name")
+            if not isinstance(name, str) or not name.strip():
+                add(f"{prefix}.name: must be a non-empty string")
+            elif name in names:
+                add(f"{prefix}.name: duplicate check name {name!r}")
+            else:
+                names.add(name)
+            if not isinstance(check.get("required"), bool):
+                add(f"{prefix}.required: must be true or false")
+
+    expect = doc.get("expect")
+    if "expect" not in doc:
+        add("expect: missing")
+    elif not isinstance(expect, dict):
+        add("expect: must be an object")
+    else:
+        status = expect.get("status")
+        if not isinstance(status, str) or status not in RESULT_STATUSES:
+            add(
+                "expect.status: must be one of "
+                + ", ".join(sorted(RESULT_STATUSES))
+            )
+        max_rounds = expect.get("max_rounds")
+        if (
+            not isinstance(max_rounds, int)
+            or isinstance(max_rounds, bool)
+            or max_rounds < 0
+        ):
+            add("expect.max_rounds: must be a non-negative integer")
+
+    return problems
+
+
+def load_tasks(tasks_dir):
+    if not tasks_dir.is_dir():
+        return [], [f"{tasks_dir}: tasks directory not found"]
+    entries = sorted(
+        (
+            path
+            for path in tasks_dir.iterdir()
+            if path.is_dir() and not path.name.startswith(".")
+        ),
+        key=lambda path: path.name,
+    )
+    if not entries:
+        return [], [f"{tasks_dir}: no task directories found"]
+
+    tasks = []
+    problems = []
+    seen = {}
+    for directory in entries:
+        path = directory / "task.json"
+        if not path.is_file():
+            problems.append(f"{path}: missing file")
+            continue
+        try:
+            doc = read_json(path)
+        except InputError as exc:
+            problems.append(str(exc))
+            continue
+        task_problems = validate_task(doc, path, directory.name)
+        if task_problems:
+            problems.extend(task_problems)
+            continue
+        task_id = doc["id"]
+        if task_id in seen:
+            problems.append(
+                f"{path}: duplicate task id {task_id!r} (also {seen[task_id]})"
+            )
+            continue
+        seen[task_id] = path
+        tasks.append(doc)
+    return tasks, problems
+
+
+def validate_result(doc, path, profile, task_id):
+    if not isinstance(doc, dict):
+        return [f"{path}: top level must be a JSON object"]
+    problems = []
+
+    def add(message):
+        problems.append(f"{path}: {message}")
+
+    for field in RESULT_FIELDS:
+        if field not in doc:
+            add(f"{field}: missing")
+
+    if "task" in doc and doc["task"] != task_id:
+        add(f"task: must equal {task_id!r}")
+    if "profile" in doc and doc["profile"] != profile:
+        add(f"profile: must equal {profile!r}")
+    if "source" in doc and (
+        not isinstance(doc["source"], str) or doc["source"] not in SOURCES
+    ):
+        add("source: must be \"recorded\" or \"stub\"")
+    if "status" in doc and (
+        not isinstance(doc["status"], str) or doc["status"] not in RESULT_STATUSES
+    ):
+        add("status: must be one of " + ", ".join(sorted(RESULT_STATUSES)))
+
+    if "rounds" in doc:
+        rounds = doc["rounds"]
+        if (
+            not isinstance(rounds, int)
+            or isinstance(rounds, bool)
+            or rounds < 0
+        ):
+            add("rounds: must be a non-negative integer")
+
+    if "gate_claude" in doc:
+        gate = doc["gate_claude"]
+        if not isinstance(gate, list):
+            add("gate_claude: must be a list")
+        else:
+            for index, value in enumerate(gate):
+                if not isinstance(value, str) or value not in GATE_VALUES:
+                    add(f"gate_claude[{index}]: must be \"pass\" or \"fail\"")
+
+    if "grok" in doc:
+        grok = doc["grok"]
+        if grok is not None and (
+            not isinstance(grok, str) or grok not in GATE_VALUES
+        ):
+            add("grok: must be \"pass\", \"fail\", or null")
+
+    if "checks" in doc:
+        checks = doc["checks"]
+        if not isinstance(checks, dict):
+            add("checks: must be an object of name -> true/false")
+        else:
+            for name, value in checks.items():
+                if not isinstance(value, bool):
+                    add(f"checks[{name!r}]: must be true or false")
+
+    if "wall_ms" in doc:
+        wall_ms = doc["wall_ms"]
+        if not is_number(wall_ms) or wall_ms < 0:
+            add("wall_ms: must be a non-negative number")
+
+    if "cost" in doc:
+        cost = doc["cost"]
+        if not isinstance(cost, dict):
+            add("cost: must be an object")
+        else:
+            if "cc_usd" not in cost:
+                add("cost.cc_usd: missing")
+            else:
+                cc_usd = cost["cc_usd"]
+                if cc_usd is not None and (
+                    not is_number(cc_usd) or cc_usd < 0
+                ):
+                    add("cost.cc_usd: must be a non-negative number or null")
+            if "oc_tokens" not in cost:
+                add("cost.oc_tokens: missing")
+            else:
+                oc_tokens = cost["oc_tokens"]
+                if oc_tokens is not None and (
+                    not isinstance(oc_tokens, int)
+                    or isinstance(oc_tokens, bool)
+                    or oc_tokens < 0
+                ):
+                    add("cost.oc_tokens: must be a non-negative integer or null")
+
+    return problems
+
+
+def evaluate(task, result):
+    required = [check["name"] for check in task["checks"] if check["required"]]
+    task_id = task["id"]
+    if result is None:
+        return {
+            "task": task_id,
+            "source": None,
+            "status": None,
+            "outcome": "fail",
+            "reason": "missing result file",
+            "rounds": None,
+            "gate_claude": [],
+            "grok": None,
+            "checks": {},
+            "required_checks": required,
+            "failed_checks": list(required),
+            "gate_false_pass": False,
+            "wall_ms": 0,
+            "cost": {"cc_usd": None, "oc_tokens": None},
+        }
+
+    checks = result["checks"]
+    failed = [name for name in required if checks.get(name) is not True]
+    gate = result["gate_claude"]
+    last_gate = gate[-1] if gate else None
+    gate_false_pass = last_gate == "pass" and bool(failed)
+
+    if result["status"] == "parked":
+        outcome = "skipped"
+        reason = "parked"
+        gate_false_pass = False
+    else:
+        expect = task["expect"]
+        status_ok = result["status"] == expect["status"]
+        rounds_ok = result["rounds"] <= expect["max_rounds"]
+        reasons = []
+        if not status_ok:
+            reasons.append(
+                f"status {result['status']!r} != {expect['status']!r}"
+            )
+        if failed:
+            reasons.append("required checks failed: " + ", ".join(failed))
+        if not rounds_ok:
+            reasons.append(
+                f"rounds {result['rounds']} > max_rounds {expect['max_rounds']}"
+            )
+        outcome = "pass" if not reasons else "fail"
+        reason = "; ".join(reasons)
+
+    return {
+        "task": task_id,
+        "source": result["source"],
+        "status": result["status"],
+        "outcome": outcome,
+        "reason": reason,
+        "rounds": result["rounds"],
+        "gate_claude": list(gate),
+        "grok": result["grok"],
+        "checks": checks,
+        "required_checks": required,
+        "failed_checks": failed,
+        "gate_false_pass": gate_false_pass,
+        "wall_ms": result["wall_ms"],
+        "cost": result["cost"],
+    }
+
+
+def score_results(tasks, results_dir, profile):
+    profile_dir = results_dir / profile
+    rows = []
+    problems = []
+    for task in tasks:
+        path = profile_dir / f"{task['id']}.json"
+        if not path.exists():
+            rows.append(evaluate(task, None))
+            continue
+        if not path.is_file():
+            problems.append(f"{path}: not a regular file")
+            continue
+        try:
+            result = read_json(path)
+        except InputError as exc:
+            problems.append(str(exc))
+            continue
+        result_problems = validate_result(result, path, profile, task["id"])
+        if result_problems:
+            problems.extend(result_problems)
+            continue
+        rows.append(evaluate(task, result))
+    if problems:
+        return None, problems
+
+    evaluated = [row for row in rows if row["outcome"] != "skipped"]
+    skipped = [row for row in rows if row["outcome"] == "skipped"]
+    passed = [row for row in evaluated if row["outcome"] == "pass"]
+    first_round = [row for row in passed if row["rounds"] <= 1]
+    with_result = [row for row in evaluated if row["rounds"] is not None]
+
+    cc_values = [
+        row["cost"]["cc_usd"]
+        for row in rows
+        if row["cost"]["cc_usd"] is not None
+    ]
+    token_values = [
+        row["cost"]["oc_tokens"]
+        for row in rows
+        if row["cost"]["oc_tokens"] is not None
+    ]
+
+    return {
+        "profile": profile,
+        "tasks": rows,
+        "total": len(rows),
+        "evaluated": len(evaluated),
+        "passed": len(passed),
+        "failed": len(evaluated) - len(passed),
+        "skipped": len(skipped),
+        "pass_rate": len(passed) / len(evaluated) if evaluated else 0.0,
+        "first_round_pass_rate": (
+            len(first_round) / len(evaluated) if evaluated else 0.0
+        ),
+        "mean_rounds": (
+            sum(row["rounds"] for row in with_result) / len(with_result)
+            if with_result
+            else 0.0
+        ),
+        "gate_false_pass": sum(
+            1 for row in evaluated if row["gate_false_pass"]
+        ),
+        "wall_ms": sum(row["wall_ms"] for row in rows),
+        "cost": {
+            "cc_usd": sum(cc_values) if cc_values else None,
+            "oc_tokens": sum(token_values) if token_values else None,
+        },
+    }, []
+
+
+def format_cost(cost):
+    cc = "null" if cost["cc_usd"] is None else f"{cost['cc_usd']:g}"
+    tokens = "null" if cost["oc_tokens"] is None else str(cost["oc_tokens"])
+    return f"cc_usd={cc} oc_tokens={tokens}"
+
+
+def print_score(report):
+    print(f"profile: {report['profile']}")
+    for row in report["tasks"]:
+        label = {"pass": "PASS", "fail": "FAIL", "skipped": "SKIP"}[row["outcome"]]
+        detail = ""
+        if row["outcome"] == "skipped":
+            detail = "parked"
+        elif row["outcome"] == "fail":
+            detail = row["reason"]
+        elif row["rounds"] is not None:
+            detail = f"{row['rounds']} round(s)"
+        suffix = f"  {detail}" if detail else ""
+        print(f"{label}  {row['task']}{suffix}")
+    print(
+        f"pass_rate: {report['pass_rate']:.3f} "
+        f"({report['passed']}/{report['evaluated']})"
+    )
+    print(f"first_round_pass_rate: {report['first_round_pass_rate']:.3f}")
+    print(f"mean_rounds: {report['mean_rounds']:.2f}")
+    print(f"gate_false_pass: {report['gate_false_pass']}")
+    print(f"skipped: {report['skipped']}")
+    print(f"wall_ms: {report['wall_ms']:g}")
+    print(f"cost: {format_cost(report['cost'])}")
+
+
+def cmd_validate(args):
+    tasks_dir = Path(args.tasks).expanduser() if args.tasks else DEFAULT_TASKS
+    tasks, problems = load_tasks(tasks_dir)
+    if problems:
+        for problem in problems:
+            print(problem, file=sys.stderr)
+        return 1
+    print(f"ok: {len(tasks)} task(s) in {tasks_dir}")
+    return 0
+
+
+def cmd_score(args):
+    tasks_dir = Path(args.tasks).expanduser() if args.tasks else DEFAULT_TASKS
+    tasks, problems = load_tasks(tasks_dir)
+    if problems:
+        for problem in problems:
+            print(f"factory-bench: {problem}", file=sys.stderr)
+        return 2
+
+    profile = args.profile
+    if not SAFE_ID.match(profile):
+        print(
+            "factory-bench: --profile must use only letters, digits, dot, "
+            "dash, or underscore",
+            file=sys.stderr,
+        )
+        return 2
+    if not math.isfinite(args.min_pass) or not 0.0 <= args.min_pass <= 1.0:
+        print("factory-bench: --min-pass must be between 0 and 1", file=sys.stderr)
+        return 2
+
+    results_dir = Path(args.results_dir).expanduser()
+    if results_dir.exists() and not results_dir.is_dir():
+        print(
+            f"factory-bench: not a results directory: {results_dir}",
+            file=sys.stderr,
+        )
+        return 2
+
+    report, problems = score_results(tasks, results_dir, profile)
+    if problems:
+        for problem in problems:
+            print(f"factory-bench: {problem}", file=sys.stderr)
+        return 2
+
+    report["min_pass"] = args.min_pass
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print_score(report)
+    return 0 if report["pass_rate"] + 1e-12 >= args.min_pass else 1
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="factory-bench",
+        description="Validate benchmark tasks and score recorded results offline.",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    validate = subparsers.add_parser("validate", help="schema-check every task")
+    validate.add_argument(
+        "--tasks",
+        metavar="DIR",
+        help="task set directory (default: bench/tasks)",
+    )
+    validate.set_defaults(func=cmd_validate)
+
+    score = subparsers.add_parser(
+        "score", help="score one profile's recorded results"
+    )
+    score.add_argument("results_dir", metavar="RESULTS-DIR")
+    score.add_argument("--profile", required=True, metavar="ID")
+    score.add_argument(
+        "--tasks",
+        metavar="DIR",
+        help="task set directory (default: bench/tasks)",
+    )
+    score.add_argument("--json", action="store_true", help="print JSON")
+    score.add_argument(
+        "--min-pass",
+        type=float,
+        default=1.0,
+        metavar="X",
+        help="minimum pass rate for exit 0 (default: 1.0)",
+    )
+    score.set_defaults(func=cmd_score)
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "command", None):
+        parser.print_help(sys.stderr)
+        return 2
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

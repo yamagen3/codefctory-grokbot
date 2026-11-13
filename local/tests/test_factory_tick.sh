@@ -16,7 +16,7 @@ trap cleanup EXIT
 fail() { echo "test_factory_tick: FAIL $*" >&2; exit 1; }
 
 unset FACTORY_TICK_PROVIDER_WAIT FACTORY_PROVIDER_WAIT FACTORY_TICK_RESUME_CMD \
-  FACTORY_TICK_INBOX_CMD FACTORY_STATUS_DIR || true
+  FACTORY_TICK_INBOX_CMD FACTORY_STATUS_DIR FACTORY_LOG_DIR || true
 export FACTORY_ROOT="$ROOT"
 export FACTORY_STATUS_DIR="$T/status"
 mkdir -p "$FACTORY_STATUS_DIR"
@@ -56,6 +56,7 @@ run_tick() {
   env \
     FACTORY_ROOT="$ROOT" \
     FACTORY_STATUS_DIR="$FACTORY_STATUS_DIR" \
+    FACTORY_LOG_DIR="$T/logs" \
     FACTORY_TICK_RESUME_CMD="$RESUME_STUB" \
     FACTORY_TICK_INBOX_CMD="$INBOX_STUB" \
     STUB_RESUME_OUT="$resume_out" \
@@ -167,5 +168,27 @@ run_tick 'resume exploded' 1 0 0
 grep -qi 'resume.*failed' "$TICK_ERR" \
   || fail "(f) resume failure was not logged: $(cat "$TICK_ERR")"
 assert_record f 1 0 0
+
+echo "=== (g) tick keeps the full resume log and counts only structured lines ==="
+clear_calls
+rm -rf "$T/logs"
+run_tick $'noise\nresumed x exit=0\nresumed by hand' 0 0 0
+[[ "$TICK_RC" -eq 0 ]] || fail "(g) exit $TICK_RC, want 0: $(cat "$TICK_ERR")"
+[[ "$(cat "$TICK_OUT")" == "factory-tick: resumed=1 attention=0 provider=ok" ]] \
+  || fail "(g) status line: $(cat "$TICK_OUT")"
+python3 - "$FACTORY_STATUS_DIR/tick.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    doc = json.load(fh)
+assert doc["resumed"] == ["resumed x exit=0"], doc
+PY
+LOG="$T/logs/tick-resume.log"
+[[ -f "$LOG" ]] || fail "(g) missing tick-resume.log"
+[[ "$(grep -c '^=== tick ' "$LOG")" -eq 1 ]] || fail "(g) missing tick heading"
+grep -Fqx 'noise' "$LOG" || fail "(g) tick-resume.log lost noise"
+grep -Fqx 'resumed x exit=0' "$LOG" || fail "(g) tick-resume.log lost resumed x"
+grep -Fqx 'resumed by hand' "$LOG" || fail "(g) tick-resume.log lost resumed by hand"
 
 echo "test_factory_tick: PASS"

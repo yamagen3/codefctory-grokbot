@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "ini-lint",
+  "title": "INI linter",
+  "kind": "code-cli",
+  "brief": "Build a Python 3 stdlib command-line INI linter at src/inilint.py (no third-party packages).\n\nUsage: python3 src/inilint.py <file.ini>\n\nAccept a small INI dialect:\n- A [section] line starts a section. Section names are non-empty and case-sensitive.\n- A key = value line belongs to the current section. Keys are non-empty; values may be empty. Ignore surrounding spaces around the key and value.\n- Blank lines and lines whose first non-space character is # or ; are ignored. There are no inline comments, so # or ; inside a value is part of the value.\n\nPrint ok and exit 0 when the file is valid. Otherwise print one line per problem to stderr as line <n>: <message> and exit 1. Problems are: a key/value line before any section, a malformed line, a duplicate key in the same section, or an empty section name. A missing file exits 2.\n",
+  "checks": [
+    {"name": "valid-file-ok", "required": true},
+    {"name": "key-before-section", "required": true},
+    {"name": "duplicate-key", "required": true},
+    {"name": "comments-and-empty-values", "required": true},
+    {"name": "missing-file-exit-2", "required": true}
+  ],
+  "expect": {"status": "merged", "max_rounds": 3}
+}

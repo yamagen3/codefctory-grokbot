@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "id": "csv-column-sum",
+  "title": "CSV column summer",
+  "kind": "code-cli",
+  "brief": "Build a Python 3 stdlib command-line tool at src/csvsum.py (no third-party packages).\n\nUsage: python3 src/csvsum.py <file.csv> <column>\n\n- The first row of the CSV is a header. Match <column> exactly and case-sensitively.\n- Print the sum of that column as one plain decimal number, for example 6.0.\n- Treat an empty cell as 0. Values are ordinary decimal numbers without thousands separators.\n- A missing file, a missing column, or a non-numeric value prints one line to stderr and exits 2.\n- If the file has no data rows, the sum is 0.\n",
+  "checks": [
+    {"name": "sums-column", "required": true},
+    {"name": "empty-cell-is-zero", "required": true},
+    {"name": "missing-column-exit-2", "required": true},
+    {"name": "non-numeric-exit-2", "required": true}
+  ],
+  "expect": {"status": "merged", "max_rounds": 3}
+}

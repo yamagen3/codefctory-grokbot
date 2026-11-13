@@ -20,6 +20,10 @@ shopt -u nullglob
 ORPHAN_SEC="${FACTORY_RESUME_ORPHAN_SEC:-900}"
 [[ "$ORPHAN_SEC" =~ ^[0-9]+$ ]] || ORPHAN_SEC=900
 
+MAX_ATTEMPTS="${FACTORY_RESUME_MAX_ATTEMPTS:-5}"
+[[ "$MAX_ATTEMPTS" =~ ^[0-9]+$ ]] || MAX_ATTEMPTS=5
+MAX_ATTEMPTS=$((10#$MAX_ATTEMPTS))
+
 ORIG_WORK_SET="${FACTORY_WORK_DIR+x}"
 ORIG_WORK="${FACTORY_WORK_DIR:-}"
 ORIG_MAX_SET="${FACTORY_MAX_ROUNDS+x}"
@@ -69,7 +73,7 @@ for path in paths:
     saved_exit = doc.get("exit")
     stage = doc.get("stage")
     kind = None
-    if saved_exit == 75 and stage in ("spec", "gate-claude"):
+    if saved_exit == 75 and stage in ("spec", "impl", "gate-claude"):
         kind = "resume"
     elif saved_exit is None:
         updated = parse_time(doc.get("updated_at"))
@@ -180,7 +184,7 @@ PY
     exec 8>&-
     echo "orphaned $id stage=$stage"
     if [[ "$DRY_RUN" != "1" ]]; then
-      factory-notify run-aborted "id=${id} orphaned stage=${stage} round=${saved_round}"
+      factory-notify run-aborted "id=${id} orphaned stage=${stage} round=${saved_round}" || true
     fi
   else
     exec 8>&-
@@ -227,18 +231,64 @@ for ((i = 0; i < ${#records[@]}; i += RECORD_FIELDS)); do
   fi
 
   # Re-check under the lock: another process may have resumed this run.
-  if ! python3 - "$state_path" <<'PY'
+  locked_stage=""
+  if ! locked_stage=$(python3 - "$state_path" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as fh:
     doc = json.load(fh)
-raise SystemExit(0 if doc.get("exit") == 75 and doc.get("stage") in ("spec", "gate-claude") else 1)
+if not (doc.get("exit") == 75 and doc.get("stage") in ("spec", "impl", "gate-claude")):
+    raise SystemExit(1)
+print(doc.get("stage") or "")
 PY
-  then
+  ); then
     exec 9>&-
     continue
   fi
+
+  attempt_path="$run_dir/resume-attempts"
+  attempts=0
+  if [[ -f "$attempt_path" ]]; then
+    attempts_raw="$(cat "$attempt_path" 2>/dev/null || true)"
+    attempts_raw="${attempts_raw//[[:space:]]/}"
+    if [[ "$attempts_raw" =~ ^[0-9]+$ ]]; then
+      attempts=$((10#$attempts_raw))
+    fi
+  fi
+  if [[ "$attempts" -ge "$MAX_ATTEMPTS" ]]; then
+    python3 - "$state_path" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    doc = json.load(fh)
+doc["exit"] = 1
+fd, tmp = tempfile.mkstemp(prefix=".state.json.", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, sort_keys=True)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+PY
+    exec 9>&-
+    echo "gave-up $id attempts=$attempts"
+    factory-notify run-aborted "id=${id} resume limit stage=${locked_stage} attempts=${attempts}" || true
+    continue
+  fi
+  attempts=$((attempts + 1))
+  printf '%s\n' "$attempts" > "$attempt_path"
 
   unset FACTORY_GROK_MODE FACTORY_GROK_STUB FACTORY_TARGET_NAME || true
   [[ -z "$target" ]] || export FACTORY_TARGET_NAME="$target"
@@ -263,6 +313,30 @@ PY
   FACTORY_RESUME=1 factory-run-local "$id" "$(cat "$run_dir/brief.txt" 2>/dev/null)"
   ec=$?
   set -e
+  if [[ "$ec" -ne 75 ]]; then
+    rm -f "$attempt_path"
+  else
+    set +e
+    "$PS" check claude-code >/dev/null 2>&1
+    provider_ec=$?
+    set -e
+    if [[ "$provider_ec" -eq 75 ]]; then
+      current_raw="$(cat "$attempt_path" 2>/dev/null || true)"
+      current_raw="${current_raw//[[:space:]]/}"
+      current="$attempts"
+      if [[ "$current_raw" =~ ^[0-9]+$ ]]; then
+        current=$((10#$current_raw))
+      fi
+      if [[ "$current" -gt 0 ]]; then
+        current=$((current - 1))
+        if [[ "$current" -eq 0 ]]; then
+          rm -f "$attempt_path"
+        else
+          printf '%s\n' "$current" > "$attempt_path"
+        fi
+      fi
+    fi
+  fi
   echo "resumed $id exit=$ec"
   exec 9>&-
 done

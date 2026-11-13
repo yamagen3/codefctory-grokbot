@@ -9,6 +9,7 @@ set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
 
 STATUS_DIR="${FACTORY_STATUS_DIR:-$FACTORY_ROOT/local/status}"
+LOG_DIR="${FACTORY_LOG_DIR:-$FACTORY_ROOT/local/logs}"
 LOCK="$STATUS_DIR/tick.lock"
 mkdir -p "$STATUS_DIR"
 
@@ -34,6 +35,15 @@ elif TICK_RESUME_OUT=$(FACTORY_PROVIDER_WAIT="$PROVIDER_WAIT" "${TICK_RESUME_ARG
   TICK_RESUME_RC=0
 else
   TICK_RESUME_RC=$?
+fi
+if [[ "${#TICK_RESUME_ARGV[@]}" -gt 0 ]]; then
+  mkdir -p "$LOG_DIR"
+  {
+    printf '=== tick %s ===\n' "$(date -Iseconds)"
+    if [[ -n "$TICK_RESUME_OUT" ]]; then
+      printf '%s\n' "$TICK_RESUME_OUT"
+    fi
+  } >> "$LOG_DIR/tick-resume.log"
 fi
 case "$TICK_RESUME_RC" in
   0 | 75) ;;
@@ -67,19 +77,20 @@ if [[ "$TICK_RESUME_RC" -eq 75 ]]; then
   PROVIDER_LIMITED=1
 fi
 
-# Pass the resume output on stdin; the helper keeps the resumed/orphaned lines
-# and replaces tick.json atomically.
+# Pass the resume output on stdin; the helper keeps structured
+# resumed/orphaned/gave-up lines and replaces tick.json atomically.
 RESUMED_COUNT=$(python3 -c '
-import datetime, json, os, sys, tempfile
+import datetime, json, os, re, sys, tempfile
 
 status_dir = sys.argv[1]
 resume_rc = int(sys.argv[2])
 attention = int(sys.argv[3])
 provider_limited = sys.argv[4] == "1"
+pattern = re.compile(r"^(resumed|orphaned|gave-up) [A-Za-z0-9._-]+ [A-Za-z0-9._-]+=")
 lines = [
     line
     for line in sys.stdin.read().splitlines()
-    if line.startswith("resumed ") or line.startswith("orphaned ")
+    if pattern.match(line)
 ]
 doc = {
     "time": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),

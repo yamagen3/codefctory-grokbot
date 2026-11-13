@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""factory-profile — load and drift-check the factory model profile.
+
+Read-only: this tool never starts a model and never writes a file.
+
+Selection: FACTORY_MODEL_PROFILE (default "default") names
+$FACTORY_ROOT/profiles/<id>.json. The id must match ^[a-z0-9][a-z0-9._-]*$.
+
+  id                print the profile id
+  show [--json]     print the profile (flattened keys or JSON)
+  get <dotted.key>  print one value; exit 1 when the key is missing
+  check             print one line per mismatch with the live files; exit 1
+                    when any mismatch exists, else print "ok"
+"""
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+BIN_DIR = Path(__file__).resolve().parent
+DEFAULT_ROOT = BIN_DIR.parent
+PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+CREDENTIAL_RE = re.compile(r"key|token|secret|password", re.IGNORECASE)
+SCHEMA = 1
+TOP_LEVEL_KEYS = {
+    "schema",
+    "id",
+    "description",
+    "brain",
+    "maker",
+    "loop",
+    "gates",
+    "prompts",
+}
+
+
+class ProfileError(Exception):
+    pass
+
+
+def factory_root():
+    raw = os.environ.get("FACTORY_ROOT")
+    return Path(raw) if raw else DEFAULT_ROOT
+
+
+def profile_selection():
+    raw = os.environ.get("FACTORY_MODEL_PROFILE") or "default"
+    if not PROFILE_ID_RE.fullmatch(raw):
+        raise ProfileError(
+            "invalid FACTORY_MODEL_PROFILE {!r}; want ^[a-z0-9][a-z0-9._-]*$".format(raw)
+        )
+    return raw
+
+
+def require(container, key, kind, where):
+    if key not in container:
+        raise ProfileError("{}: missing required key {!r}".format(where, key))
+    value = container[key]
+    if kind is int:
+        valid = isinstance(value, int) and not isinstance(value, bool)
+        label = "an integer"
+    elif kind is bool:
+        valid = isinstance(value, bool)
+        label = "a boolean"
+    elif kind is str:
+        valid = isinstance(value, str)
+        label = "a string"
+    elif kind is dict:
+        valid = isinstance(value, dict)
+        label = "an object"
+    else:  # pragma: no cover - only the helper's own callers reach this
+        raise AssertionError("unsupported type check: {!r}".format(kind))
+    if not valid:
+        raise ProfileError(
+            "{}.{}: expected {}, got {!r}".format(where, key, label, value)
+        )
+    return value
+
+
+def reject_credential_keys(value, where):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if CREDENTIAL_RE.search(str(key)):
+                raise ProfileError(
+                    "{}: forbidden key {!r}; a profile never holds credentials".format(
+                        where, key
+                    )
+                )
+            reject_credential_keys(child, where)
+    elif isinstance(value, list):
+        for child in value:
+            reject_credential_keys(child, where)
+
+
+def validate_prompt(prompts, name, where):
+    prompt = require(prompts, name, dict, where)
+    prompt_where = "{}.{}".format(where, name)
+    require(prompt, "file", str, prompt_where)
+    require(prompt, "anchor", str, prompt_where)
+
+
+def validate(doc, path):
+    where = str(path)
+    if not isinstance(doc, dict):
+        raise ProfileError("{}: top level must be a JSON object".format(where))
+    reject_credential_keys(doc, where)
+    unknown = sorted(set(doc) - TOP_LEVEL_KEYS)
+    if unknown:
+        raise ProfileError(
+            "{}: unknown top-level key(s): {}".format(where, ", ".join(unknown))
+        )
+    schema = require(doc, "schema", int, where)
+    if schema != SCHEMA:
+        raise ProfileError(
+            "{}: schema is {}, want {}".format(where, schema, SCHEMA)
+        )
+    profile_id = require(doc, "id", str, where)
+    if not PROFILE_ID_RE.fullmatch(profile_id):
+        raise ProfileError(
+            "{}: invalid id {!r}; want ^[a-z0-9][a-z0-9._-]*$".format(
+                where, profile_id
+            )
+        )
+    require(doc, "description", str, where)
+
+    brain = require(doc, "brain", dict, where)
+    require(brain, "provider", str, where + ".brain")
+    require(brain, "model", str, where + ".brain")
+    require(brain, "effort", str, where + ".brain")
+    require(brain, "spec_goal_turns", int, where + ".brain")
+    require(brain, "step_timeout_ms", int, where + ".brain")
+
+    maker = require(doc, "maker", dict, where)
+    require(maker, "provider", str, where + ".maker")
+    require(maker, "model", str, where + ".maker")
+    require(maker, "reasoning_effort", str, where + ".maker")
+    require(maker, "parallel_default", int, where + ".maker")
+    require(maker, "parallel_max", int, where + ".maker")
+
+    loop = require(doc, "loop", dict, where)
+    require(loop, "max_rounds", int, where + ".loop")
+    require(loop, "stall_timeout_sec", int, where + ".loop")
+
+    gates = require(doc, "gates", dict, where)
+    claude = require(gates, "claude", dict, where + ".gates")
+    require(claude, "required", bool, where + ".gates.claude")
+    require(claude, "reask_on_no_verdict", int, where + ".gates.claude")
+    grok = require(gates, "grok", dict, where + ".gates")
+    require(grok, "required", bool, where + ".gates.grok")
+
+    prompts = require(doc, "prompts", dict, where)
+    validate_prompt(prompts, "spec", where + ".prompts")
+    validate_prompt(prompts, "gate_claude", where + ".prompts")
+    validate_prompt(prompts, "impl", where + ".prompts")
+
+
+def load_profile():
+    selected = profile_selection()
+    path = factory_root() / "profiles" / (selected + ".json")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise ProfileError(
+            "profile {!r} not found: {} (FACTORY_MODEL_PROFILE={})".format(
+                selected, path, selected
+            )
+        )
+    except OSError as exc:
+        raise ProfileError("cannot read profile {}: {}".format(path, exc))
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ProfileError("profile {} is not valid JSON: {}".format(path, exc))
+    validate(doc, path)
+    return doc
+
+
+def flatten(value, prefix=""):
+    for key, child in value.items():
+        dotted = prefix + "." + key if prefix else key
+        if isinstance(child, dict):
+            yield from flatten(child, dotted)
+        else:
+            yield dotted, child
+
+
+def format_scalar(value):
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, sort_keys=True)
+
+
+def nested_get(doc, dotted):
+    current = doc
+    for part in dotted.split("."):
+        if not isinstance(current, dict) or part not in current:
+            raise KeyError(dotted)
+        current = current[part]
+    return current
+
+
+def check(doc):
+    brain = doc["brain"]
+    maker = doc["maker"]
+    loop = doc["loop"]
+    prompts = doc["prompts"]
+    root = factory_root()
+
+    rules = [
+        (
+            "brain.model",
+            "config/factory.patch.yml",
+            "model: {}".format(brain["model"]),
+        ),
+        (
+            "brain.effort",
+            "config/factory.patch.yml",
+            "CLAUDE_CODE_EFFORT_LEVEL: '{}'".format(brain["effort"]),
+        ),
+        (
+            "brain.step_timeout_ms",
+            "config/factory.patch.yml",
+            "timeoutMs: {}".format(brain["step_timeout_ms"]),
+        ),
+        (
+            "maker.model",
+            "bin/factory-common.sh",
+            '"model": "{}"'.format(maker["model"]),
+        ),
+        (
+            "maker.reasoning_effort",
+            "bin/factory-common.sh",
+            '"reasoningEffort": "{}"'.format(maker["reasoning_effort"]),
+        ),
+        (
+            "brain.spec_goal_turns",
+            "bin/factory-common.sh",
+            "FACTORY_CC_GOAL_TURNS:-{}".format(brain["spec_goal_turns"]),
+        ),
+        (
+            "loop.max_rounds",
+            "bin/factory-run-local",
+            "FACTORY_MAX_ROUNDS:-{}".format(loop["max_rounds"]),
+        ),
+        (
+            "loop.stall_timeout_sec",
+            "bin/factory-stall-retry",
+            "FACTORY_STALL_TIMEOUT_SEC:-{}".format(loop["stall_timeout_sec"]),
+        ),
+        (
+            "maker.parallel_default",
+            "bin/factory-impl-step",
+            "PARALLEL={}".format(maker["parallel_default"]),
+        ),
+        (
+            "maker.parallel_max",
+            "bin/factory-impl-step",
+            "-gt {}".format(maker["parallel_max"]),
+        ),
+    ]
+
+    mismatches = []
+    for key, relative, needle in rules:
+        path = root / relative
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            mismatches.append(
+                "{}: {}: file not found".format(key, relative)
+            )
+            continue
+        if needle not in text:
+            mismatches.append(
+                "{}: {}: missing {!r}".format(key, relative, needle)
+            )
+
+    for name in ("spec", "gate_claude", "impl"):
+        prompt = prompts[name]
+        relative = prompt["file"]
+        anchor = prompt["anchor"]
+        path = root / relative
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            mismatches.append(
+                "prompts.{}: {}: file not found".format(name, relative)
+            )
+            continue
+        if anchor not in text:
+            mismatches.append(
+                "prompts.{}: {}: missing anchor {!r}".format(name, relative, anchor)
+            )
+    return mismatches
+
+
+def usage_error(text):
+    print("usage: factory-profile " + text, file=sys.stderr)
+    return 2
+
+
+def main(argv):
+    if len(argv) < 2:
+        return usage_error("{id|show [--json]|get <dotted.key>|check}")
+    command = argv[1]
+    args = argv[2:]
+    if command not in ("id", "show", "get", "check"):
+        return usage_error("{id|show [--json]|get <dotted.key>|check}")
+    try:
+        doc = load_profile()
+    except ProfileError as exc:
+        print("factory-profile: {}".format(exc), file=sys.stderr)
+        return 2
+
+    if command == "id":
+        if args:
+            return usage_error("id")
+        print(doc["id"])
+        return 0
+
+    if command == "show":
+        if args not in ([], ["--json"]):
+            return usage_error("show [--json]")
+        if args == ["--json"]:
+            print(json.dumps(doc, indent=2, sort_keys=True))
+        else:
+            for key, value in flatten(doc):
+                print("{}: {}".format(key, format_scalar(value)))
+        return 0
+
+    if command == "get":
+        if len(args) != 1 or not args[0]:
+            return usage_error("get <dotted.key>")
+        try:
+            value = nested_get(doc, args[0])
+        except KeyError:
+            print("factory-profile: missing key: {}".format(args[0]), file=sys.stderr)
+            return 1
+        print(format_scalar(value))
+        return 0
+
+    # check
+    if args:
+        return usage_error("check")
+    mismatches = check(doc)
+    if mismatches:
+        for line in mismatches:
+            print(line)
+        return 1
+    print("ok")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
