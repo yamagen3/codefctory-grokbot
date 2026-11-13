@@ -136,3 +136,9 @@ Tool-body upgrades (DSH, OpenCode, Agent SDK) are **not** driven by “a newer v
 - **profile は run の開始時に照合し、run ごとに記録する。** `factory-run-local` は開始時に `factory-profile check` を走らせ、ずれていれば exit 1 で止める（profile の切り替えはまだ配線していないので、違う profile の名前で走ることを防ぐ）。state と usage に `profile` を残し、別の profile での resume は拒否する。`factory-doctor` も profile check を行う。値はまだ profile から読まない（2 つ目の profile を承認するまで読まない、Fable の推奨）。check はアンカー付きの正規表現にし、`PARALLEL=` の全箇所と usage の effort 既定値も照合する。
 - **終わった run をベンチ結果に変換できる。** `factory-bench collect <run-id> --task <id>` が state・feedback・usage からステータス、ラウンド、gate の合否、時間、費用を読み、`source: recorded` で書き出す。隠しチェックの結果は `--checks` で渡す（置き場所は要判断）。
 - **途中で死んだ resume も試行として数える。** resume 後に state を読み直し、exit がまだ 75 なら試行回数を残す。
+## 2026-11-14 — 改善ループ第 8 回（キューの安全化と inbox、追加 3 回の最終回、Fable medium）
+- **キューは取り出す前に事前チェックする。** `run-next` は CC の上限確認と `factory-profile check` を通ってからエントリを動かす。profile がずれていれば全件 pending のまま `blocked profile-check` で止まり、キューを 1 件ずつ使い潰さない。
+- **同じ target で開いている run は 1 つだけ（既定）。** 同じ target の run が exit null / 2（Grok 待ち）/ 75（park）なら、そのエントリは後回しにして別 target のエントリを先に始める。`FACTORY_QUEUE_SERIAL_TARGET=0` で無効。動いた main へのマージの扱い（要判断）を、キュー経由の仕事では避けるため。`kind` が `code-cli` 以外のエントリは実行しない（将来の動画・台本パイプライン用の継ぎ目）。キューから始めた run の出力は `local/logs/queue-<id>.log` に残す。
+- **inbox はキューと tick の停止を知らせる。** 積まれた仕事は数えないが、キューが止まっている（`queue-blocked`）ときと、1 時間 tick が走っていないのに積まれた仕事か park 中の run があるとき（`tick-stale`）は人を呼ぶ。tick が動いている間は、次の tick が拾う park 中の run で人を呼ばない。
+- **ベンチ collect のラウンド数を直す。** max-rounds で終わった run は `min(round, max_rounds)`。
+- **追加の 3 ラウンド（6〜8）はここで終了。** 第 8 回も CONVERGED: no だったが、Fable は「第 8 回の 3 件の後に残るのは、見える範囲ではオーナーの判断か認証情報が要るものだけ」としている。

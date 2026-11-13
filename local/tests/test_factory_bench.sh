@@ -180,7 +180,7 @@ runs = Path(sys.argv[1])
 usage = Path(sys.argv[2])
 
 
-def state(run_id, **overrides):
+def state(run_id, drop=(), **overrides):
     directory = runs / run_id
     directory.mkdir(parents=True, exist_ok=True)
     doc = {
@@ -197,6 +197,8 @@ def state(run_id, **overrides):
         "updated_at": "2026-01-01T00:00:00+00:00",
     }
     doc.update(overrides)
+    for key in drop:
+        doc.pop(key, None)
     (directory / "state.json").write_text(
         json.dumps(doc, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -244,6 +246,14 @@ append("runs", "2026-01-02", [{"run_id": "run-merged", "wall_ms": 2500}])
 
 state("run-max", profile="bench-max", exit=3, stage="ci")
 feedback("run-max", 1, "ci")
+
+state("run-max-capped", profile="bench-max-capped", exit=3, stage="ci", round=4)
+state("run-max-nomax", profile="bench-max-nomax", exit=3, stage="ci",
+      round=4, drop=("max_rounds",))
+state("run-merged-lowmax", profile="bench-merged-lowmax", exit=0, round=2,
+      max_rounds=1)
+state("run-max-zero", profile="bench-max-zero", exit=3, stage="ci", round=1,
+      max_rounds=0)
 
 state("run-parked", profile="bench-parked", exit=75, stage="gate-claude")
 
@@ -404,5 +414,63 @@ run "$BENCH" collect run-merged --task "$TASK_ID" --out "$RESULTS" \
   --runs "$RUNS" --usage "$USAGE" --profile other-profile
 [[ "$RC" -eq 2 ]] || fail "collect (i) exit $RC, want 2"
 grep -q "does not match" "$T/err" || fail "collect (i): $(cat "$T/err")"
+
+echo "=== collect (j) max-rounds run caps rounds at max_rounds ==="
+run "$BENCH" collect run-max-capped --task "$TASK_ID" --out "$RESULTS" \
+  --runs "$RUNS" --usage "$USAGE"
+[[ "$RC" -eq 0 ]] || fail "collect (j) exit $RC: $(cat "$T/err")"
+python3 - "$RESULTS/bench-max-capped/$TASK_ID.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    doc = json.load(handle)
+assert doc["status"] == "max-rounds", doc
+assert doc["rounds"] == 3, doc
+print("collect (j) capped rounds ok")
+PY
+
+echo "=== collect (k) max-rounds without a positive max_rounds keeps state.round ==="
+run "$BENCH" collect run-max-nomax --task "$TASK_ID" --out "$RESULTS" \
+  --runs "$RUNS" --usage "$USAGE"
+[[ "$RC" -eq 0 ]] || fail "collect (k) exit $RC: $(cat "$T/err")"
+python3 - "$RESULTS/bench-max-nomax/$TASK_ID.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    doc = json.load(handle)
+assert doc["status"] == "max-rounds", doc
+assert doc["rounds"] == 4, doc
+print("collect (k) missing max_rounds keeps state.round")
+PY
+run "$BENCH" collect run-max-zero --task "$TASK_ID" --out "$RESULTS" \
+  --runs "$RUNS" --usage "$USAGE"
+[[ "$RC" -eq 0 ]] || fail "collect (k) zero exit $RC: $(cat "$T/err")"
+python3 - "$RESULTS/bench-max-zero/$TASK_ID.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    doc = json.load(handle)
+assert doc["status"] == "max-rounds", doc
+assert doc["rounds"] == 1, doc
+print("collect (k) zero max_rounds keeps state.round")
+PY
+
+echo "=== collect (l) a merged run keeps its round count ==="
+run "$BENCH" collect run-merged-lowmax --task "$TASK_ID" --out "$RESULTS" \
+  --runs "$RUNS" --usage "$USAGE"
+[[ "$RC" -eq 0 ]] || fail "collect (l) exit $RC: $(cat "$T/err")"
+python3 - "$RESULTS/bench-merged-lowmax/$TASK_ID.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    doc = json.load(handle)
+assert doc["status"] == "merged", doc
+assert doc["rounds"] == 2, doc
+print("collect (l) merged rounds ok")
+PY
 
 echo "test_factory_bench: PASS"

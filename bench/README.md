@@ -104,10 +104,13 @@ parity with `score`.
   `null` has not finished, so `collect` exits 1.
 - The profile is `--profile`, falling back to `state.profile`. If neither is
   present, or both are present and differ, `collect` exits 2.
-- `rounds` is `state.round`. The first line of each `feedback-r<N>.md` feeds
-  `gate_claude`: `gate-claude` gives `fail`, `gate-grok` gives `pass`, and
-  `guard` or `ci` gives no entry because the gate was never reached. A merged
-  run's last round with no feedback file gives `pass`.
+- `rounds` is `state.round`, except that a `max-rounds` run (`state.exit` 3)
+  with a positive integer `state.max_rounds` uses
+  `min(state.round, state.max_rounds)`. The first line of each
+  `feedback-r<N>.md` feeds `gate_claude`: `gate-claude` gives `fail`,
+  `gate-grok` gives `pass`, and `guard` or `ci` gives no entry because the gate
+  was never reached. A merged run's last round with no feedback file gives
+  `pass`.
 - `grok` is `pass` for a merged run, `fail` when a non-merged run has any
   `gate-grok` feedback stage, and `null` otherwise.
 - `--checks` is a JSON object of check name to boolean and is copied into the

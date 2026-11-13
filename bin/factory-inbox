@@ -14,6 +14,7 @@ export FACTORY_ROOT
 
 exec python3 - "$HOOK" "$NOTIFY" "$@" <<'PY'
 import json
+import math
 import os
 import sys
 import time
@@ -30,6 +31,11 @@ ATTENTION_KINDS = {
     "gate-unavailable",
     "update-deferred-repeated",
 }
+
+# A parked run in one of these stages can be resumed by the next tick. While
+# the tick is fresh, waiting for that tick is not a reason to call a human.
+RESUMABLE_STAGES = {"spec", "impl", "gate-claude"}
+DEFAULT_TICK_FRESH_SEC = 3600.0
 
 USAGE = (
     "usage: factory-inbox list [--json] [--all] | count | check | "
@@ -104,6 +110,122 @@ def read_json_object(path, label):
         warn(f"skipping {label}: not a JSON object")
         return None
     return record
+
+
+def read_optional_json(path, label):
+    if not os.path.isfile(path):
+        return None, False
+    return read_json_object(path, label), True
+
+
+def tick_fresh_seconds():
+    raw = os.environ.get("FACTORY_INBOX_TICK_FRESH_SEC")
+    if raw is None or not raw.strip():
+        return DEFAULT_TICK_FRESH_SEC
+    try:
+        value = float(raw)
+    except ValueError:
+        warn(f"invalid FACTORY_INBOX_TICK_FRESH_SEC: {raw}")
+        return DEFAULT_TICK_FRESH_SEC
+    if not math.isfinite(value) or value < 0:
+        warn(f"invalid FACTORY_INBOX_TICK_FRESH_SEC: {raw}")
+        return DEFAULT_TICK_FRESH_SEC
+    return value
+
+
+def read_tick(status_dir, now):
+    path = os.path.join(status_dir, "tick.json")
+    if not os.path.isfile(path):
+        return False, None, False
+    record = read_json_object(path, "tick.json")
+    if record is None:
+        return False, None, True
+    raw = record.get("time")
+    epoch = parse_time(raw)
+    last = as_text(raw) or (iso_time(epoch) if epoch is not None else None)
+    fresh = epoch is not None and (now - epoch) <= tick_fresh_seconds()
+    return fresh, last, True
+
+
+def queue_entry_id(name, record):
+    value = as_text(record.get("id"))
+    if value:
+        return value
+    stem = name[:-5] if name.endswith(".json") else name
+    parts = stem.split("-", 1)
+    return parts[1] if len(parts) == 2 else stem
+
+
+def queue_items(queue):
+    items = []
+    pending = os.path.join(queue, "pending")
+    if not os.path.isdir(pending):
+        return items
+    try:
+        names = sorted(os.listdir(pending))
+    except OSError as exc:
+        warn(f"cannot read {pending}: {exc}")
+        return items
+
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(pending, name)
+        if not os.path.isfile(path):
+            continue
+        record = read_json_object(path, os.path.join("queue", "pending", name))
+        if record is None:
+            continue
+        queued_at = as_text(record.get("queued_at"))
+        item = {
+            "kind": "queued",
+            "id": queue_entry_id(name, record),
+            "target": as_text(record.get("target")),
+            "queued_at": queued_at,
+            "attention": False,
+        }
+        sort_time = parse_time(queued_at)
+        if sort_time is None:
+            sort_time = file_mtime(path)
+        items.append((sort_time, item))
+    return items
+
+
+def blocked_reason(blocked):
+    if isinstance(blocked, str):
+        return blocked
+    if isinstance(blocked, dict):
+        for key in ("reason", "message", "blocked"):
+            value = blocked.get(key)
+            if value is not None:
+                return as_text(value)
+        try:
+            return json.dumps(blocked, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            return as_text(blocked)
+    return as_text(blocked)
+
+
+def queue_status_items(queue):
+    path = os.path.join(queue, "status.json")
+    record, present = read_optional_json(path, "queue/status.json")
+    if not present or record is None:
+        return []
+    blocked = record.get("blocked")
+    if blocked is None:
+        return []
+    reason = blocked_reason(blocked)
+    message = f"queue blocked: {reason}" if reason else "queue blocked"
+    return [
+        (
+            file_mtime(path),
+            {
+                "kind": "queue-blocked",
+                "message": message,
+                "attention": True,
+            },
+        )
+    ]
 
 
 def read_acked(notify):
@@ -272,7 +394,7 @@ def provider_items(state_dir, now):
     return items
 
 
-def parked_items(runs_dir, provider_limited):
+def parked_items(runs_dir, provider_limited, tick_fresh):
     items = []
     if not os.path.isdir(runs_dir):
         return items
@@ -294,28 +416,61 @@ def parked_items(runs_dir, provider_limited):
             continue
         if as_int(record.get("exit")) != 75:
             continue
+        stage = as_text(record.get("stage"))
+        waiting_for_tick = stage in RESUMABLE_STAGES and tick_fresh
         item = {
             "kind": "run-parked",
             "id": as_text(record.get("id")) or name,
-            "stage": as_text(record.get("stage")),
+            "stage": stage,
             "round": record.get("round", 0),
             "sha": as_text(record.get("sha")),
             "action": "factory-resume",
-            "attention": not provider_limited,
+            "attention": not (provider_limited or waiting_for_tick),
         }
         items.append((file_mtime(path), item))
     return items
 
 
-def collect(hook, notify, provider_state, runs, include_all=False):
+def collect(hook, notify, provider_state, runs, queue, status, include_all=False):
     now = time.time()
     providers = provider_items(provider_state, now)
+    queued = queue_items(queue)
+    tick_fresh, tick_last, tick_present = read_tick(status, now)
+    parked = parked_items(runs, bool(providers), tick_fresh)
     items = (
         pending_items(hook)
         + notification_items(notify, include_all)
         + providers
-        + parked_items(runs, bool(providers))
+        + queued
+        + queue_status_items(queue)
+        + parked
     )
+
+    needs_tick = bool(queued) or any(
+        item.get("stage") in RESUMABLE_STAGES for _, item in parked
+    )
+    # Before the queue or an explicit tick location exists, a missing tick is
+    # not news: keep the pre-queue inbox (and its existing parked-run output)
+    # unchanged. Once queue entries or tick state exist, a missing tick counts.
+    queue_configured = (
+        bool(os.environ.get("FACTORY_QUEUE_DIR"))
+        or bool(os.environ.get("FACTORY_STATUS_DIR"))
+        or os.path.isdir(queue)
+        or tick_present
+    )
+    if not tick_fresh and needs_tick and queue_configured:
+        last = tick_last or "never"
+        items.append(
+            (
+                now,
+                {
+                    "kind": "tick-stale",
+                    "message": f"factory tick is stale (last tick: {last})",
+                    "attention": True,
+                },
+            )
+        )
+
     items.sort(key=lambda pair: pair[0])
     return [item for _, item in items]
 
@@ -345,6 +500,15 @@ def print_list(items, as_json):
                 item["sha"],
                 item["action"],
             ]
+        elif kind == "queued":
+            values = [
+                item["kind"],
+                item["id"],
+                item["target"],
+                item["queued_at"],
+            ]
+        elif kind in ("queue-blocked", "tick-stale"):
+            values = [item["kind"], item["message"]]
         else:
             values = [
                 item["id"],
@@ -420,6 +584,14 @@ def main(argv):
     runs = os.environ.get("FACTORY_RUNS_DIR") or os.path.join(
         root, "local", "runs"
     )
+    queue = os.path.expanduser(
+        os.environ.get("FACTORY_QUEUE_DIR")
+        or os.path.join(root, "local", "queue")
+    )
+    status = os.path.expanduser(
+        os.environ.get("FACTORY_STATUS_DIR")
+        or os.path.join(root, "local", "status")
+    )
     args = argv[3:]
     command = args[0] if args else ""
 
@@ -435,7 +607,16 @@ def main(argv):
                 print(USAGE, file=sys.stderr)
                 return 1
         print_list(
-            collect(hook, notify, provider_state, runs, include_all), as_json
+            collect(
+                hook,
+                notify,
+                provider_state,
+                runs,
+                queue,
+                status,
+                include_all,
+            ),
+            as_json,
         )
         return 0
 
@@ -443,14 +624,20 @@ def main(argv):
         if len(args) != 1:
             print(USAGE, file=sys.stderr)
             return 1
-        print(attention_count(collect(hook, notify, provider_state, runs)))
+        print(
+            attention_count(
+                collect(hook, notify, provider_state, runs, queue, status)
+            )
+        )
         return 0
 
     if command == "check":
         if len(args) != 1:
             print(USAGE, file=sys.stderr)
             return 1
-        count = attention_count(collect(hook, notify, provider_state, runs))
+        count = attention_count(
+            collect(hook, notify, provider_state, runs, queue, status)
+        )
         print(count)
         return 10 if count else 0
 
