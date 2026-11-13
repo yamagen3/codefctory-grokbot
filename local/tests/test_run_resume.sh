@@ -10,7 +10,8 @@ fail() { echo "test_run_resume: FAIL $*" >&2; exit 1; }
 unset FACTORY_AGMSG_TEAM FACTORY_RUNS_DIR FACTORY_NOTIFY_DIR FACTORY_WORK_DIR \
   FACTORY_GROK_HOOK_DIR FACTORY_ORIGIN_REINIT FACTORY_MAX_ROUNDS \
   FACTORY_GROK_MODE FACTORY_GROK_STUB FACTORY_CLAUDE_GATE_STUB FACTORY_RESUME \
-  FACTORY_PROVIDER_STATE_DIR FACTORY_RESUME_ORPHAN_SEC || true
+  FACTORY_PROVIDER_STATE_DIR FACTORY_RESUME_ORPHAN_SEC \
+  FACTORY_RESUME_MAX_ATTEMPTS FACTORY_LOG_DIR || true
 export GIT_AUTHOR_NAME=factory GIT_AUTHOR_EMAIL=factory@localhost
 export GIT_COMMITTER_NAME=factory GIT_COMMITTER_EMAIL=factory@localhost
 
@@ -22,6 +23,18 @@ for f in factory-run-local factory-common.sh factory-feedback factory-notify \
   cp "$ROOT/bin/$f" "$FAKE/bin/$f"
   chmod +x "$FAKE/bin/$f"
 done
+
+mv "$FAKE/bin/factory-notify" "$FAKE/bin/factory-notify.real"
+cat > "$FAKE/bin/factory-notify" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${FACTORY_NOTIFY_FAIL:-}" == "1" ]]; then
+  echo "factory-notify stub: failing" >&2
+  exit 1
+fi
+exec "$(dirname "$0")/factory-notify.real" "$@"
+SH
+chmod +x "$FAKE/bin/factory-notify"
 
 PREPARED="$FAKE/local/origin/t.git"
 git init --bare -q -b main "$PREPARED"
@@ -105,6 +118,7 @@ repo="${1:?}"
 n=$(( $(cat "$IMPL_COUNTER" 2>/dev/null || echo 0) + 1 ))
 printf '%s\n' "$n" > "$IMPL_COUNTER"
 printf 'impl %s\n' "$n" >> "${STEP_LOG:?}"
+printf 'impl round=%s\n' "${FACTORY_USAGE_ROUND:-}" >> "${STEP_LOG:?}"
 printf 'impl %s\n' "$n" >> "$repo/IMPL.txt"
 git -C "$repo" add IMPL.txt
 git -C "$repo" -c user.email=factory@localhost -c user.name=factory commit -q -m "impl $n"
@@ -130,6 +144,9 @@ set -euo pipefail
 n=$(( $(cat "$GATE_CLAUDE_COUNTER" 2>/dev/null || echo 0) + 1 ))
 printf '%s\n' "$n" > "$GATE_CLAUDE_COUNTER"
 printf 'gate-claude\n' >> "${STEP_LOG:?}"
+if [[ "${GATE_CLAUDE_MARK_LIMITED:-}" == "1" ]]; then
+  printf 'limited\n' > "${PROVIDER_STATE_FILE:?}"
+fi
 if [[ -n "${GATE_CLAUDE_BLOCK_FIFO:-}" ]]; then
   : > "${GATE_CLAUDE_BLOCK_READY:?}"
   read -r _ < "$GATE_CLAUDE_BLOCK_FIFO" || true
@@ -471,6 +488,121 @@ assert_state "$RUN_RUNS/spec" exit "0"
 [[ "$(cat "$T/spec-count-spec")" -eq 2 ]] || fail "case spec: SPEC did not rerun"
 [[ "$(cat "$T/impl-count-spec")" -eq 1 ]] || fail "case spec: IMPL did not run once"
 [[ "$(cat "$T/merge-count-spec")" -eq 1 ]] || fail "case spec: merge did not run once"
+
+echo "=== (r6-a) resume stops after the attempt cap ==="
+write_provider ok
+run_factory r6a FACTORY_SKIP_CC_SPEC=1 GATE_CLAUDE_CODES="75 75"
+[[ "$RUN_RC" -eq 75 ]] || fail "r6-a: initial exit $RUN_RC, want 75: $(cat "$T/log-r6a")"
+assert_state "$RUN_RUNS/r6a" stage "gate-claude"
+assert_state "$RUN_RUNS/r6a" exit "75"
+for attempt in 1 2; do
+  GATE_CODES_RESUME=75 run_resume r6a FACTORY_RESUME_MAX_ATTEMPTS=2
+  [[ "$RESUME_RC" -eq 0 ]] || fail "r6-a: attempt $attempt exit $RESUME_RC, want 0: $(cat "$T/resume-r6a.log")"
+  grep -q '^resumed r6a exit=75$' "$T/resume-r6a.log" \
+    || fail "r6-a: attempt $attempt did not resume"
+  [[ "$(cat "$RUN_RUNS/r6a/resume-attempts")" -eq "$attempt" ]] \
+    || fail "r6-a: attempt file is $(cat "$RUN_RUNS/r6a/resume-attempts"), want $attempt"
+done
+GATE_CODES_RESUME=75 run_resume r6a FACTORY_RESUME_MAX_ATTEMPTS=2
+[[ "$RESUME_RC" -eq 0 ]] || fail "r6-a: gave-up exit $RESUME_RC, want 0: $(cat "$T/resume-r6a.log")"
+grep -q '^gave-up r6a attempts=2$' "$T/resume-r6a.log" || fail "r6-a: missing gave-up line"
+if grep -q '^resumed r6a ' "$T/resume-r6a.log"; then
+  fail "r6-a: resumed past the attempt cap"
+fi
+assert_state "$RUN_RUNS/r6a" exit "1"
+assert_state "$RUN_RUNS/r6a" stage "gate-claude"
+aborted="$(notify_glob "$T/notify-r6a" run-aborted)"
+[[ -n "$aborted" ]] || fail "r6-a: missing run-aborted notification"
+grep -Fq 'id=r6a resume limit stage=gate-claude attempts=2' $aborted \
+  || fail "r6-a: run-aborted message lost its fields"
+[[ "$(notify_count "$T/notify-r6a" run-aborted)" -eq 1 ]] \
+  || fail "r6-a: run-aborted count is $(notify_count "$T/notify-r6a" run-aborted), want 1"
+attempts_after="$(cat "$RUN_RUNS/r6a/resume-attempts")"
+GATE_CODES_RESUME=75 run_resume r6a FACTORY_RESUME_MAX_ATTEMPTS=2
+[[ "$RESUME_RC" -eq 0 ]] || fail "r6-a: fourth exit $RESUME_RC, want 0: $(cat "$T/resume-r6a.log")"
+[[ ! -s "$T/resume-r6a.log" ]] || fail "r6-a: fourth call did work: $(cat "$T/resume-r6a.log")"
+assert_state "$RUN_RUNS/r6a" exit "1"
+[[ "$(cat "$RUN_RUNS/r6a/resume-attempts")" == "$attempts_after" ]] \
+  || fail "r6-a: fourth call changed resume-attempts"
+[[ "$(notify_count "$T/notify-r6a" run-aborted)" -eq 1 ]] \
+  || fail "r6-a: fourth call sent another run-aborted"
+
+echo "=== (r6-b) a fresh provider limit does not consume an attempt ==="
+write_provider ok
+run_factory r6b FACTORY_SKIP_CC_SPEC=1 GATE_CLAUDE_CODES="75 75"
+[[ "$RUN_RC" -eq 75 ]] || fail "r6-b: initial exit $RUN_RC, want 75: $(cat "$T/log-r6b")"
+assert_state "$RUN_RUNS/r6b" exit "75"
+printf '1\n' > "$RUN_RUNS/r6b/resume-attempts"
+GATE_CODES_RESUME=75 run_resume r6b FACTORY_RESUME_MAX_ATTEMPTS=5 GATE_CLAUDE_MARK_LIMITED=1
+[[ "$RESUME_RC" -eq 0 ]] || fail "r6-b: resume exit $RESUME_RC, want 0: $(cat "$T/resume-r6b.log")"
+[[ "$(cat "$RUN_RUNS/r6b/resume-attempts")" == "1" ]] \
+  || fail "r6-b: resume-attempts is $(cat "$RUN_RUNS/r6b/resume-attempts"), want 1"
+assert_state "$RUN_RUNS/r6b" exit "75"
+write_provider ok
+rm -f "$RUN_RUNS/r6b/resume-attempts"
+GATE_CODES_RESUME=75 run_resume r6b FACTORY_RESUME_MAX_ATTEMPTS=5 GATE_CLAUDE_MARK_LIMITED=1
+[[ "$RESUME_RC" -eq 0 ]] || fail "r6-b: second resume exit $RESUME_RC, want 0: $(cat "$T/resume-r6b.log")"
+[[ ! -e "$RUN_RUNS/r6b/resume-attempts" ]] \
+  || fail "r6-b: a fresh provider limit created resume-attempts"
+assert_state "$RUN_RUNS/r6b" exit "75"
+write_provider ok
+
+echo "=== (r6-c) a successful resume removes resume-attempts ==="
+write_provider ok
+run_factory r6c FACTORY_SKIP_CC_SPEC=1 GATE_CLAUDE_CODES="75 75"
+[[ "$RUN_RC" -eq 75 ]] || fail "r6-c: initial exit $RUN_RC, want 75: $(cat "$T/log-r6c")"
+printf '2\n' > "$RUN_RUNS/r6c/resume-attempts"
+GATE_CODES_RESUME=0 run_resume r6c FACTORY_RESUME_MAX_ATTEMPTS=5
+[[ "$RESUME_RC" -eq 0 ]] || fail "r6-c: resume exit $RESUME_RC, want 0: $(cat "$T/resume-r6c.log")"
+grep -q '^resumed r6c exit=0$' "$T/resume-r6c.log" || fail "r6-c: missing resumed line"
+[[ ! -e "$RUN_RUNS/r6c/resume-attempts" ]] || fail "r6-c: resume-attempts survived a completed resume"
+assert_state "$RUN_RUNS/r6c" exit "0"
+
+echo "=== (r6-d) an impl park reruns the saved round ==="
+write_provider ok
+run_factory r6d FACTORY_SKIP_CC_SPEC=1 GATE_CLAUDE_CODES="75 75"
+[[ "$RUN_RC" -eq 75 ]] || fail "r6-d: initial exit $RUN_RC, want 75: $(cat "$T/log-r6d")"
+git -C "$T/work-r6d" rev-parse -q --verify "refs/tags/spec/r6d" >/dev/null \
+  || fail "r6-d: spec tag is missing"
+impl_before="$(cat "$T/impl-count-r6d")"
+python3 - "$RUN_RUNS/r6d/state.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    doc = json.load(fh)
+doc["stage"] = "impl"
+doc["exit"] = 75
+doc["round"] = 2
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(doc, fh, sort_keys=True)
+    fh.write("\n")
+PY
+GATE_CODES_RESUME=0 run_resume r6d
+[[ "$RESUME_RC" -eq 0 ]] || fail "r6-d: resume exit $RESUME_RC, want 0: $(cat "$T/resume-r6d.log")"
+[[ "$(cat "$T/impl-count-r6d")" -eq $((impl_before + 1)) ]] \
+  || fail "r6-d: IMPL did not run exactly once during the resume"
+[[ "$(grep -c '^impl round=2$' "$T/steps-r6d.log")" -eq 1 ]] \
+  || fail "r6-d: IMPL did not run at round 2"
+assert_state "$RUN_RUNS/r6d" exit "0"
+assert_state "$RUN_RUNS/r6d" round "2"
+[[ "$(cat "$T/merge-count-r6d")" -eq 1 ]] || fail "r6-d: resume did not merge"
+
+echo "=== (r6-e) a failing run-aborted notification does not stop orphan marking ==="
+write_provider ok
+for orphan in o1 o2; do
+  mkdir -p "$T/runs-r6e/$orphan"
+  cat > "$T/runs-r6e/$orphan/state.json" <<JSON
+{"exit": null, "grok_mode": null, "grok_stub": "pass", "id": "$orphan", "max_rounds": 3, "round": 2, "sha": "deadbeef", "stage": "impl", "target": "t", "updated_at": "2000-01-01T00:00:00+00:00", "work": "$T/work-r6e"}
+JSON
+done
+run_resume r6e FACTORY_NOTIFY_FAIL=1
+[[ "$RESUME_RC" -eq 0 ]] || fail "r6-e: exit $RESUME_RC, want 0: $(cat "$T/resume-r6e.log")"
+[[ "$(grep -c '^orphaned ' "$T/resume-r6e.log")" -eq 2 ]] \
+  || fail "r6-e: did not orphan both runs"
+assert_state "$T/runs-r6e/o1" exit "137"
+assert_state "$T/runs-r6e/o2" exit "137"
 
 echo "=== (h) existing run-local tests still pass ==="
 env -u FACTORY_ROOT -u FACTORY_RUNS_DIR -u FACTORY_NOTIFY_DIR -u FACTORY_WORK_DIR \

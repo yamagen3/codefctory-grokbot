@@ -126,3 +126,8 @@ Tool-body upgrades (DSH, OpenCode, Agent SDK) are **not** driven by “a newer v
 - **強制終了された run は「孤立」として知らせ、自動再開はしない。** exit が null のまま 15 分以上更新が無く、lock も空いている run は `factory-resume` が exit 137 に書き換え、`run-aborted` を 1 回だけ通知する。途中状態が不明なので、再開は人か Grok が判断する。
 - **定期実行の入口は `bin/factory-tick` 1 本。** resume（待たずに即 park）→ inbox check の順に走り、`local/status/tick.json` に結果を残す。タイマー（cron / systemd / Grok のループ）の設置はオーナー判断で、`factory-setup` は入れない。
 - **改善ループは上限の 5 回で終了。** 第 5 回レビューも CONVERGED: no だったが、残りは要判断・要認証情報・P2 の項目が中心で、TODO に記録した。
+## 2026-11-14 — 改善ループ第 6 回（モデルプロファイルとベンチの骨組み、Fable medium）
+- **自動再開には回数の上限を設ける。** `factory-resume` は run ごとに `resume-attempts` を数え、`FACTORY_RESUME_MAX_ATTEMPTS`（既定 5）に達したら exit 1 にして `run-aborted` を 1 回送る。再開した run がまた CC の上限に当たった場合は失敗に数えない。上限以外の park（gate の判定なし、stall）が tick のたびに CC を無限に消費するのを防ぐ。impl 段階の park も再開対象にする。tick は再開した run の出力を `local/logs/tick-resume.log` に残す。
+- **Grok の差し戻しは次のラウンドとして自動で積み直す。** pending モードで Grok が差し戻したとき、state が gate-grok・sha 一致・lock が空いていれば、理由を feedback に書き、state を impl / round+1 / exit 75 に戻して `grok-rejected-requeued`（人を呼ばない）を送る。次の tick で `factory-resume` が拾う。`FACTORY_GROK_REJECT_REQUEUE=0` で従来どおり。
+- **工場は前段の「頭脳」モデルを中心に全体として構成する（オーナーの考え、Fable も同意）。** プロンプト・effort・gate の厳しさ・ラウンド数・並列数は頭脳モデルに合わせて一緒に調整されているので、モデルだけを 1 行で差し替えられるように見せない。第 1 段階として `profiles/default.json`（schema 1、JSON）に現行設定を記録し、`bin/factory-profile check` が 8 か所の実ファイルとのずれを検出する。どのスクリプトもまだ profile を読まないので動作は変わらない。選択は `FACTORY_MODEL_PROFILE`（`FACTORY_PROFILE` は DSH の profile 名なので使わない）。profile に鍵・トークン類は書けない。
+- **品質は固定のベンチ課題で測る。** `bench/tasks/<id>/task.json` に課題（今は小さな CLI 2 件）、記録済みの結果を `bin/factory-bench score` がオフラインで採点する（合格率、1 ラウンド目での合格率、平均ラウンド、gate の見逃し数）。上限による park は品質の信号ではないので分母から外す。有料モデルでの実行、profile の切り替え、スコアによる自動選択はしない（要判断）。

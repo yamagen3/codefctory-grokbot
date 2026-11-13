@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "id": "default",
+  "description": "Current factory configuration: Claude Code Opus 5.5 at xhigh for brain steps, OpenCode DeepSeek Flash at max for implementation, three rounds, and parallel implementation 2..4.",
+  "brain": {
+    "provider": "claude-code",
+    "model": "claude-opus-5-5",
+    "effort": "xhigh",
+    "spec_goal_turns": 12,
+    "step_timeout_ms": 1800000
+  },
+  "maker": {
+    "provider": "opencode",
+    "model": "opencode-go/deepseek-v4.1-flash",
+    "reasoning_effort": "max",
+    "parallel_default": 2,
+    "parallel_max": 4
+  },
+  "loop": {
+    "max_rounds": 3,
+    "stall_timeout_sec": 3600
+  },
+  "gates": {
+    "claude": {
+      "required": true,
+      "reask_on_no_verdict": 1
+    },
+    "grok": {
+      "required": true
+    }
+  },
+  "prompts": {
+    "spec": {
+      "file": "bin/factory-common.sh",
+      "anchor": "You are the factory SPEC step. Working directory is the product repo."
+    },
+    "gate_claude": {
+      "file": "bin/factory-gate-claude",
+      "anchor": "You are the factory GATE/claude step."
+    },
+    "impl": {
+      "file": "bin/factory-run-local",
+      "anchor": "Implement per spec/PRODUCT.md; make acceptance tests pass; stdlib only."
+    }
+  }
+}

@@ -148,3 +148,12 @@
 - [ ] 【要判断】text fallback の厳格化（R5-F6）: stdout を走査対象から外すか、「resets」句を必須にするか。まずスタブで再現する。text で見つけた 529 が 1 時間 park になる件も合わせて。
 - [ ] Fable のレビュー実行スクリプト（追跡外）で `factory-provider-state ingest claude-code` を呼ぶ（R5-F7）。
 - [ ] 第 5 回で上限に達したため Fable の再レビューはしていない。次にループを回すときは第 5 回の変更（PR #10）の検証から始める。
+## 改善ループ第 6 回（2026-11-14、Fable medium）由来
+- [x] R6-T1: 自動再開の回数上限（既定 5）、impl 段階の再開、tick の再開ログ、孤立通知の失敗で止まらない。
+- [x] R6-T2: Grok の差し戻しを次ラウンドとして自動で積み直す（`grok-rejected-requeued`）。
+- [x] R6-T3: `profiles/default.json` と `bin/factory-profile`（記録とずれ検出のみ）。
+- [x] R6-T4: `bench/` の骨組みと `bin/factory-bench`（validate / オフライン採点）。
+- [ ] profile 第 2 段階: スクリプトが既定値を profile から読む。`factory-doctor` に `factory-profile check` を入れる（第 7 回候補）。
+- [ ] 【要判断】2 つ目の profile と切り替え。新しい頭脳・製造モデル、CC 不通時の代替頭脳は、モデル設定の変更と新しい認証情報が要る。
+- [ ] 【要判断】ベンチを有料モデルで回すか、誰が・どの頻度で・予算はいくらか。隠しチェックを製造側から見えない場所に置く方法。
+- [ ] run の state と usage に profile id を記録する（第 7 回候補）。

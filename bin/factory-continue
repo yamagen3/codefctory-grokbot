@@ -94,6 +94,91 @@ open(path,"w").write(json.dumps(rec,indent=2)+"\n")
 PY
 }
 
+requeue_rejected() {
+  [[ "${FACTORY_GROK_REJECT_REQUEUE:-1}" != "0" ]] || return 1
+  local RUN_DIR="${FACTORY_RUNS_DIR:-$FACTORY_ROOT/local/runs}/${ID}"
+  local STATE_PATH="$RUN_DIR/state.json"
+  [[ -f "$STATE_PATH" ]] || return 1
+
+  exec 8>"$RUN_DIR/.run.lock"
+  if ! flock -n 8; then
+    exec 8>&-
+    return 1
+  fi
+
+  local SAVED_ROUND
+  if ! SAVED_ROUND=$(python3 - "$STATE_PATH" "$SHA" <<'PY'
+import json
+import sys
+
+path, sha = sys.argv[1:3]
+try:
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+except Exception:
+    raise SystemExit(1)
+if not isinstance(doc, dict):
+    raise SystemExit(1)
+if doc.get("exit") != 2 or doc.get("stage") != "gate-grok" or doc.get("sha") != sha:
+    raise SystemExit(1)
+round_value = doc.get("round")
+if isinstance(round_value, bool) or not isinstance(round_value, int):
+    raise SystemExit(1)
+print(round_value)
+PY
+  ); then
+    exec 8>&-
+    return 1
+  fi
+
+  if ! factory-feedback write "$ID" "$SAVED_ROUND" gate-grok "${REASON:-gate/grok failed}"; then
+    exec 8>&-
+    return 1
+  fi
+
+  if ! python3 - "$STATE_PATH" "$SHA" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+path, sha = sys.argv[1:3]
+with open(path, encoding="utf-8") as fh:
+    doc = json.load(fh)
+if not isinstance(doc, dict):
+    raise SystemExit(1)
+if doc.get("exit") != 2 or doc.get("stage") != "gate-grok" or doc.get("sha") != sha:
+    raise SystemExit(1)
+round_value = doc.get("round")
+if isinstance(round_value, bool) or not isinstance(round_value, int):
+    raise SystemExit(1)
+doc["stage"] = "impl"
+doc["round"] = round_value + 1
+doc["exit"] = 75
+fd, tmp = tempfile.mkstemp(prefix=".state.json.", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, sort_keys=True)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+PY
+  then
+    exec 8>&-
+    return 1
+  fi
+
+  exec 8>&-
+  return 0
+}
+
 if [[ "$STATE" == "success" ]]; then
   if factory-merge "$REPO" "$ID"; then
     factory-notify merged "id=${ID} sha=${SHA} via=continue"
@@ -105,7 +190,11 @@ if [[ "$STATE" == "success" ]]; then
   exit 1
 fi
 
-factory-notify grok-rejected "id=${ID} sha=${SHA} reason=${REASON}"
+if requeue_rejected; then
+  factory-notify grok-rejected-requeued "id=${ID} sha=${SHA} reason=${REASON}"
+else
+  factory-notify grok-rejected "id=${ID} sha=${SHA} reason=${REASON}"
+fi
 write_marker rejected
 echo "factory-continue: Grok rejected $SHA (${REASON:-no reason})" >&2
 exit 4
