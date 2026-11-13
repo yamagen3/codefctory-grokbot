@@ -141,3 +141,10 @@
 - [ ] 【要判断】`pr_merge` が `main` の更新を取り込まずにマージする件、および同じ id の再実行で保留中の作業クローンを消す件（R4-F10、第 2 回からの持ち越し）。
 - [ ] 並列 IMPL のタイムアウト処理・`/tmp` ログ固定・負けた workspace の残留（R4-F11、持ち越し。launcher フラグは要判断）。
 - [ ] パイプライン記述子とプロバイダー名の継ぎ目はまだ docs のみ（R4-F12、読み取り専用の記述子なら実装可）。
+## 改善ループ第 5 回（2026-11-13、Fable medium、上限の最終回）由来
+- [x] R5-T1: run lock、再開時の round/sha 保持、`work`/`max_rounds` の保存、上限中の gate park は通知しない、孤立 run の検出（exit 137 + `run-aborted` 1 回）。
+- [x] R5-T2: `bin/factory-tick`（resume → inbox check、`tick.json`、exit 10/75/0）。
+- [ ] 【要判断】`factory-tick` のタイマーを入れるか、何で（cron / systemd timer / Grok のループ）、間隔は（例: 10 分）。
+- [ ] 【要判断】text fallback の厳格化（R5-F6）: stdout を走査対象から外すか、「resets」句を必須にするか。まずスタブで再現する。text で見つけた 529 が 1 時間 park になる件も合わせて。
+- [ ] Fable のレビュー実行スクリプト（追跡外）で `factory-provider-state ingest claude-code` を呼ぶ（R5-F7）。
+- [ ] 第 5 回で上限に達したため Fable の再レビューはしていない。次にループを回すときは第 5 回の変更（PR #10）の検証から始める。

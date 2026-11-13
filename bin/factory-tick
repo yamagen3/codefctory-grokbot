@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# One cron-safe factory tick: resume parked runs, check the inbox, record status.
+# Usage: factory-tick
+# Exit codes:
+#   0  — nothing needs attention and no provider limit
+#   10 — the inbox has attention items
+#   75 — the resume pass is still provider-limited
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+
+STATUS_DIR="${FACTORY_STATUS_DIR:-$FACTORY_ROOT/local/status}"
+LOCK="$STATUS_DIR/tick.lock"
+mkdir -p "$STATUS_DIR"
+
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  echo "factory-tick: already running"
+  exit 0
+fi
+
+PROVIDER_WAIT="${FACTORY_TICK_PROVIDER_WAIT:-0}"
+RESUME_CMD="${FACTORY_TICK_RESUME_CMD:-factory-resume}"
+INBOX_CMD="${FACTORY_TICK_INBOX_CMD:-factory-inbox check}"
+read -r -a TICK_RESUME_ARGV <<<"$RESUME_CMD"
+read -r -a TICK_INBOX_ARGV <<<"$INBOX_CMD"
+
+# A still-limited resume must park again immediately: never sleep for the
+# provider reset inside the tick.
+TICK_RESUME_OUT=""
+TICK_RESUME_RC=1
+if [[ "${#TICK_RESUME_ARGV[@]}" -eq 0 ]]; then
+  echo "factory-tick: resume command is empty" >&2
+elif TICK_RESUME_OUT=$(FACTORY_PROVIDER_WAIT="$PROVIDER_WAIT" "${TICK_RESUME_ARGV[@]}"); then
+  TICK_RESUME_RC=0
+else
+  TICK_RESUME_RC=$?
+fi
+case "$TICK_RESUME_RC" in
+  0 | 75) ;;
+  *) echo "factory-tick: resume command failed (exit $TICK_RESUME_RC)" >&2 ;;
+esac
+
+TICK_INBOX_OUT=""
+TICK_INBOX_RC=1
+if [[ "${#TICK_INBOX_ARGV[@]}" -eq 0 ]]; then
+  echo "factory-tick: inbox command is empty" >&2
+elif TICK_INBOX_OUT=$("${TICK_INBOX_ARGV[@]}"); then
+  TICK_INBOX_RC=0
+else
+  TICK_INBOX_RC=$?
+fi
+case "$TICK_INBOX_RC" in
+  0 | 10) ;;
+  *) echo "factory-tick: inbox command failed (exit $TICK_INBOX_RC)" >&2 ;;
+esac
+
+ATTENTION_RAW=$(printf '%s\n' "$TICK_INBOX_OUT" | tail -n 1 | tr -d '[:space:]')
+ATTENTION=0
+if [[ "$ATTENTION_RAW" =~ ^[0-9]{1,9}$ ]]; then
+  ATTENTION=$((10#$ATTENTION_RAW))
+else
+  echo "factory-tick: inbox command printed no count; using 0" >&2
+fi
+
+PROVIDER_LIMITED=0
+if [[ "$TICK_RESUME_RC" -eq 75 ]]; then
+  PROVIDER_LIMITED=1
+fi
+
+# Pass the resume output on stdin; the helper keeps the resumed/orphaned lines
+# and replaces tick.json atomically.
+RESUMED_COUNT=$(python3 -c '
+import datetime, json, os, sys, tempfile
+
+status_dir = sys.argv[1]
+resume_rc = int(sys.argv[2])
+attention = int(sys.argv[3])
+provider_limited = sys.argv[4] == "1"
+lines = [
+    line
+    for line in sys.stdin.read().splitlines()
+    if line.startswith("resumed ") or line.startswith("orphaned ")
+]
+doc = {
+    "time": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+    "resume_rc": resume_rc,
+    "resumed": lines,
+    "attention": attention,
+    "provider_limited": provider_limited,
+}
+fd, tmp = tempfile.mkstemp(prefix="tick.json.", dir=status_dir)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, sort_keys=True)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, os.path.join(status_dir, "tick.json"))
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+print(len(lines))
+' "$STATUS_DIR" "$TICK_RESUME_RC" "$ATTENTION" "$PROVIDER_LIMITED" <<<"$TICK_RESUME_OUT")
+
+if [[ "$PROVIDER_LIMITED" -eq 1 ]]; then
+  PROVIDER_STATE=limited
+else
+  PROVIDER_STATE=ok
+fi
+printf 'factory-tick: resumed=%s attention=%s provider=%s\n' \
+  "$RESUMED_COUNT" "$ATTENTION" "$PROVIDER_STATE"
+
+if [[ "$ATTENTION" -gt 0 ]]; then
+  exit 10
+fi
+if [[ "$TICK_RESUME_RC" -eq 75 ]]; then
+  exit 75
+fi
+exit 0

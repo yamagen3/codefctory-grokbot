@@ -25,3 +25,7 @@ OpenCode isolation only bind-mounts the product workspace + `factory-oc` home â€
 - OpenCode max: `factory-doctor` fails when the provisioned JSON or the live `/home/factory-oc/.config/opencode/opencode.json` lacks `reasoningEffort=max`. Restore with `factory-oc-provision`.
 - SPEC's Claude Code prompt starts with `/goal ` plus a measurable condition, how to prove it, a turn bound, and the brief (`docs/goal.md`). DSH `/goal` is not used. OpenCode IMPL is an ordinary prompt.
 - OpenCode reprovision: `factory-oc-provision` writes `reasoningEffort=max` through `factory_oc_write_config`. A max-less file is replaced. `--apply-config <file>` is the same write without sudo.
+
+## One cron tick (`bin/factory-tick`)
+
+`bin/factory-tick` is the cron-safe entry point: it takes `local/status/tick.lock` with `flock -n` (a second tick prints `factory-tick: already running` and exits 0), runs `factory-resume` with `FACTORY_PROVIDER_WAIT=0` so a still-limited run parks again without sleeping in the tick, then runs `factory-inbox check`, and atomically writes `local/status/tick.json` (`time`, `resume_rc`, `resumed`, `attention`, `provider_limited`). It exits 10 when attention is above 0, 75 when the resume pass is still provider-limited, else 0; `FACTORY_TICK_RESUME_CMD` and `FACTORY_TICK_INBOX_CMD` override the hooks. It installs no timer and makes no model call. The cron entry is owner-installed, not written by `factory-setup`: `*/10 * * * * /workspace/factory/bin/factory-tick >/dev/null 2>&1`.

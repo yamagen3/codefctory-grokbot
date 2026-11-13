@@ -24,17 +24,22 @@ WORK="${FACTORY_WORK_DIR:-$FACTORY_ROOT/local/work/${ID}}"
 MAX="${FACTORY_MAX_ROUNDS:-3}"
 RUN_DIR="${FACTORY_RUNS_DIR:-$FACTORY_ROOT/local/runs}/${ID}"
 mkdir -p "$RUN_DIR"
+exec 8>"$RUN_DIR/.run.lock"
+if ! flock -n 8; then
+  echo "factory-run-local: id=$ID is already running" >&2
+  exit 75
+fi
 
 save_state() {
   local exit_code="${1:-null}"
-  python3 - "$RUN_DIR/state.json" "$ID" "$NAME" "${STAGE:-setup}" "${ROUND:-0}" "${SHA:-}" "$exit_code" "${FACTORY_GROK_MODE:-}" "${FACTORY_GROK_STUB:-}" <<'PY'
+  python3 - "$RUN_DIR/state.json" "$ID" "$NAME" "${STAGE:-setup}" "${ROUND:-0}" "${SHA:-}" "$exit_code" "${FACTORY_GROK_MODE:-}" "${FACTORY_GROK_STUB:-}" "$WORK" "$MAX" <<'PY'
 import json
 import os
 import sys
 import tempfile
 from datetime import datetime, timezone
 
-path, run_id, target, stage, round_raw, sha, exit_raw, grok_mode, grok_stub = sys.argv[1:10]
+path, run_id, target, stage, round_raw, sha, exit_raw, grok_mode, grok_stub, work, max_raw = sys.argv[1:12]
 
 
 def optional(value):
@@ -50,6 +55,8 @@ doc = {
     "exit": None if exit_raw == "null" else int(exit_raw),
     "grok_mode": optional(grok_mode),
     "grok_stub": optional(grok_stub),
+    "work": optional(work),
+    "max_rounds": int(max_raw or 0),
     "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
 }
 fd, tmp = tempfile.mkstemp(prefix=".state.json.", dir=os.path.dirname(path))
@@ -99,6 +106,8 @@ if [[ -z "${FACTORY_GROK_MODE:-}" && -z "${FACTORY_GROK_STUB:-}" ]]; then
 fi
 
 if [[ "$RESUME" == "1" ]]; then
+  ROUND="$RESUME_ROUND"
+  SHA="$RESUME_SHA"
   STAGE="${RESUME_STAGE:-setup}"
   save_state
 else
@@ -241,7 +250,16 @@ while true; do
       ;;
     75|124|137)
       factory-status set "$WORK" "$SHA" gate/claude error "gate unavailable"
-      factory-notify gate-unavailable "id=${ID} sha=${SHA} exit=${GATE_EC}"
+      gate_provider_ec=1
+      if [[ "$GATE_EC" -eq 75 && -x "$FACTORY_ROOT/bin/factory-provider-state" ]]; then
+        set +e
+        "$FACTORY_ROOT/bin/factory-provider-state" check claude-code >/dev/null 2>&1
+        gate_provider_ec=$?
+        set -e
+      fi
+      if [[ "$GATE_EC" -ne 75 || "$gate_provider_ec" -ne 75 ]]; then
+        factory-notify gate-unavailable "id=${ID} sha=${SHA} exit=${GATE_EC}"
+      fi
       exit 75
       ;;
     *)

@@ -12,6 +12,181 @@ case "${1:-}" in
 esac
 [[ "$#" -le 1 ]] || die "usage: factory-resume [--dry-run]"
 
+RUNS_DIR="${FACTORY_RUNS_DIR:-$FACTORY_ROOT/local/runs}"
+shopt -s nullglob
+states=("$RUNS_DIR"/*/state.json)
+shopt -u nullglob
+
+ORPHAN_SEC="${FACTORY_RESUME_ORPHAN_SEC:-900}"
+[[ "$ORPHAN_SEC" =~ ^[0-9]+$ ]] || ORPHAN_SEC=900
+
+ORIG_WORK_SET="${FACTORY_WORK_DIR+x}"
+ORIG_WORK="${FACTORY_WORK_DIR:-}"
+ORIG_MAX_SET="${FACTORY_MAX_ROUNDS+x}"
+ORIG_MAX="${FACTORY_MAX_ROUNDS:-}"
+
+records=()
+if [[ "${#states[@]}" -gt 0 ]]; then
+  mapfile -d '' -t records < <(python3 - "${states[@]}" "$ORPHAN_SEC" <<'PY'
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+
+orphan_sec = int(sys.argv[-1])
+paths = sys.argv[1:-1]
+
+
+def parse_time(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def text(value):
+    return "" if value is None else str(value)
+
+
+now = time.time()
+candidates = []
+for path in paths:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except Exception:
+        continue
+    if not isinstance(doc, dict):
+        continue
+    saved_exit = doc.get("exit")
+    stage = doc.get("stage")
+    kind = None
+    if saved_exit == 75 and stage in ("spec", "gate-claude"):
+        kind = "resume"
+    elif saved_exit is None:
+        updated = parse_time(doc.get("updated_at"))
+        if updated is not None and now - updated > orphan_sec:
+            kind = "orphan"
+    if kind is None:
+        continue
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        continue
+    candidates.append((mtime, path, kind, doc))
+
+for _mtime, path, kind, doc in sorted(candidates, key=lambda item: (item[0], item[1])):
+    run_dir = os.path.dirname(path)
+    fields = [
+        kind,
+        path,
+        run_dir,
+        text(doc.get("id")),
+        text(doc.get("target")),
+        text(doc.get("grok_mode")),
+        text(doc.get("grok_stub")),
+        text(doc.get("exit")),
+        text(doc.get("work")),
+        text(doc.get("max_rounds")),
+        text(doc.get("stage")),
+        text(doc.get("round")),
+    ]
+    sys.stdout.write("\0".join(fields) + "\0")
+PY
+  )
+fi
+
+# Fields per record emitted above.
+RECORD_FIELDS=12
+
+# Mark orphans first, even while the provider is limited: they are not parked
+# runs and must not be resumed later. The run lock is the ownership test.
+for ((i = 0; i < ${#records[@]}; i += RECORD_FIELDS)); do
+  [[ "${records[i]}" == "orphan" ]] || continue
+  state_path="${records[i + 1]}"
+  run_dir="${records[i + 2]}"
+  id="${records[i + 3]}"
+  stage="${records[i + 10]}"
+  saved_round="${records[i + 11]}"
+  [[ -n "$id" ]] || id="$(basename "$run_dir")"
+
+  exec 8>"$run_dir/.run.lock"
+  if ! flock -n 8; then
+    exec 8>&-
+    continue
+  fi
+
+  # Re-check and rewrite under the lock. Dry-run takes the lock too but only
+  # prints.
+  if python3 - "$state_path" "$ORPHAN_SEC" "$DRY_RUN" <<'PY'
+import json
+import os
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+
+path, orphan_raw, dry_run = sys.argv[1:4]
+orphan_sec = int(orphan_raw)
+
+
+def parse_time(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+with open(path, encoding="utf-8") as fh:
+    doc = json.load(fh)
+if not isinstance(doc, dict) or doc.get("exit") is not None:
+    raise SystemExit(1)
+updated = parse_time(doc.get("updated_at"))
+if updated is None or time.time() - updated <= orphan_sec:
+    raise SystemExit(1)
+if dry_run != "1":
+    doc["exit"] = 137
+    fd, tmp = tempfile.mkstemp(prefix=".state.json.", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+PY
+  then
+    exec 8>&-
+    echo "orphaned $id stage=$stage"
+    if [[ "$DRY_RUN" != "1" ]]; then
+      factory-notify run-aborted "id=${id} orphaned stage=${stage} round=${saved_round}"
+    fi
+  else
+    exec 8>&-
+  fi
+done
+
 PS="$FACTORY_ROOT/bin/factory-provider-state"
 if [[ ! -x "$PS" ]]; then
   PS=$(command -v factory-provider-state || true)
@@ -27,57 +202,17 @@ if [[ "$CHECK_EC" -eq 75 ]]; then
 fi
 [[ "$CHECK_EC" -eq 0 ]] || die "factory-provider-state check claude-code failed (exit $CHECK_EC)"
 
-RUNS_DIR="${FACTORY_RUNS_DIR:-$FACTORY_ROOT/local/runs}"
-shopt -s nullglob
-states=("$RUNS_DIR"/*/state.json)
-shopt -u nullglob
-[[ "${#states[@]}" -gt 0 ]] || exit 0
-
-mapfile -d '' -t records < <(python3 - "${states[@]}" <<'PY'
-import json
-import os
-import sys
-
-candidates = []
-for path in sys.argv[1:]:
-    try:
-        with open(path, encoding="utf-8") as fh:
-            doc = json.load(fh)
-    except Exception:
-        continue
-    if not isinstance(doc, dict):
-        continue
-    if doc.get("exit") != 75 or doc.get("stage") not in ("spec", "gate-claude"):
-        continue
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        continue
-    candidates.append((mtime, path, doc))
-
-for _mtime, path, doc in sorted(candidates, key=lambda item: (item[0], item[1])):
-    run_dir = os.path.dirname(path)
-    fields = [
-        path,
-        run_dir,
-        str(doc.get("id") or ""),
-        str(doc.get("target") or ""),
-        str(doc.get("grok_mode") or ""),
-        str(doc.get("grok_stub") or ""),
-        str(doc.get("exit")),
-    ]
-    sys.stdout.write("\0".join(fields) + "\0")
-PY
-)
-
-for ((i = 0; i < ${#records[@]}; i += 7)); do
-  state_path="${records[i]}"
-  run_dir="${records[i + 1]}"
-  id="${records[i + 2]}"
-  target="${records[i + 3]}"
-  grok_mode="${records[i + 4]}"
-  grok_stub="${records[i + 5]}"
-  saved_exit="${records[i + 6]}"
+for ((i = 0; i < ${#records[@]}; i += RECORD_FIELDS)); do
+  [[ "${records[i]}" == "resume" ]] || continue
+  state_path="${records[i + 1]}"
+  run_dir="${records[i + 2]}"
+  id="${records[i + 3]}"
+  target="${records[i + 4]}"
+  grok_mode="${records[i + 5]}"
+  grok_stub="${records[i + 6]}"
+  saved_exit="${records[i + 7]}"
+  work="${records[i + 8]}"
+  max_rounds="${records[i + 9]}"
   [[ -n "$id" ]] || id="$(basename "$run_dir")"
 
   if [[ "$DRY_RUN" == "1" ]]; then
@@ -109,6 +244,20 @@ PY
   [[ -z "$target" ]] || export FACTORY_TARGET_NAME="$target"
   [[ -z "$grok_mode" ]] || export FACTORY_GROK_MODE="$grok_mode"
   [[ -z "$grok_stub" ]] || export FACTORY_GROK_STUB="$grok_stub"
+  if [[ -n "$work" ]]; then
+    export FACTORY_WORK_DIR="$work"
+  elif [[ -n "$ORIG_WORK_SET" ]]; then
+    export FACTORY_WORK_DIR="$ORIG_WORK"
+  else
+    unset FACTORY_WORK_DIR || true
+  fi
+  if [[ -n "$max_rounds" ]]; then
+    export FACTORY_MAX_ROUNDS="$max_rounds"
+  elif [[ -n "$ORIG_MAX_SET" ]]; then
+    export FACTORY_MAX_ROUNDS="$ORIG_MAX"
+  else
+    unset FACTORY_MAX_ROUNDS || true
+  fi
 
   set +e
   FACTORY_RESUME=1 factory-run-local "$id" "$(cat "$run_dir/brief.txt" 2>/dev/null)"
