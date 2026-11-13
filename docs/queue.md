@@ -10,9 +10,10 @@ The queue root is `$FACTORY_QUEUE_DIR` (default `local/queue`).
 
 ```text
 local/queue/
-  pending/   waiting entries
-  started/   entries handed to factory-run-local
-  .lock      held by run-next while it selects and starts an entry
+  pending/    waiting entries
+  started/    entries handed to factory-run-local
+  status.json latest run-next summary
+  .lock       held by run-next while it selects and starts an entry
 ```
 
 Each entry is one JSON file named `<UTC yyyymmddThhmmssZ>-<id>.json` and is
@@ -45,12 +46,14 @@ factory-queue add <id> --target <name> \
 factory-queue list [--json]  # pending entries, oldest first
 factory-queue count          # number of pending entries
 factory-queue remove <id>    # pending entries only
-factory-queue run-next       # start the oldest pending entry, if any
+factory-queue run-next       # start the first eligible pending entry
 ```
 
-`add` refuses an id that is already in `pending/` or `started/`, or that already
-has `<runs dir>/<id>/state.json`. This keeps a later requeue from wiping an
-existing work clone.
+`add` validates `<id>` and `--target` against
+`^[A-Za-z0-9][A-Za-z0-9._-]*$`; an invalid value exits 1. It refuses an id that
+is already in `pending/` or `started/`, or that already has
+`<runs dir>/<id>/state.json`. This keeps a later requeue from wiping an existing
+work clone.
 
 `remove` deletes a pending entry. It refuses an id that has already moved to
 `started/`; started entries are owned by the run and its `state.json`.
@@ -71,15 +74,57 @@ Before starting anything it runs `factory-provider-state check claude-code`.
 If that exits 75, `run-next` prints its line and exits 75, leaving the entry
 pending.
 
-Otherwise it moves the oldest entry to `started/`, then runs:
+Next it runs a profile preflight:
+
+```bash
+${FACTORY_QUEUE_PREFLIGHT_CMD:-$FACTORY_ROOT/bin/factory-profile check}
+```
+
+The default preflight is skipped when `$FACTORY_ROOT/bin/factory-profile` is
+not executable or `$FACTORY_ROOT/profiles` is missing. An explicit
+`FACTORY_QUEUE_PREFLIGHT_CMD` always runs. If the preflight exits non-zero,
+`run-next` prints `blocked profile-check` on stdout, copies the tool's output
+to stderr, leaves every entry pending, and exits 1.
+
+Otherwise it walks the pending entries oldest first and takes the first
+eligible one:
+
+- An entry whose `kind` is not `code-cli` is skipped with a warning on stderr.
+- Unless `FACTORY_QUEUE_SERIAL_TARGET=0`, an entry is deferred while any
+  `<runs dir>/*/state.json` with the same `target` has `exit` null, 2, or 75.
+  A deferred entry prints `deferred <id> target-busy=<run-id>` on stdout.
+- With no eligible entry, `run-next` exits 0.
+
+The selected entry moves to `started/`, then runs:
 
 ```bash
 ${FACTORY_QUEUE_RUN_CMD:-factory-run-local} <id> <brief>
 ```
 
-with `FACTORY_TARGET_NAME` and the entry's Grok variable exported. It prints
-`started <id> exit=<ec>` and exits 0 even when the run itself exits non-zero.
-One call starts one entry.
+with `FACTORY_TARGET_NAME` and the entry's Grok variable exported. The run's
+stdout and stderr are appended to
+`${FACTORY_LOG_DIR:-$FACTORY_ROOT/local/logs}/queue-<id>.log`; they are not
+written to the caller's stderr. `run-next` prints only
+`started <id> exit=<ec>` on stdout and exits 0 even when the run itself exits
+non-zero. One call starts one entry.
+
+## status.json
+
+After every `run-next` that takes the queue lock, `<queue>/status.json` is
+replaced atomically:
+
+```json
+{
+  "time": "2026-11-13T12:34:56+00:00",
+  "pending": 2,
+  "blocked": null,
+  "last": {"id": "example", "exit": 0}
+}
+```
+
+`pending` is the number left in `pending/`. `blocked` is null or
+`"profile-check"`. `last` records the most recent start; it is carried over
+unchanged when this call started nothing, and is null before the first start.
 
 ## Tick integration
 

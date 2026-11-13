@@ -9,8 +9,9 @@
 #   factory-queue run-next
 #
 # Entries live in $FACTORY_QUEUE_DIR (default local/queue):
-#   pending/  waiting entries
-#   started/  entries handed to factory-run-local (one per run-next call)
+#   pending/     waiting entries
+#   started/     entries handed to factory-run-local (one per run-next call)
+#   status.json  latest run-next summary
 set -euo pipefail
 CALLER_PATH="${PATH:-}"
 source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
@@ -221,8 +222,10 @@ def cmd_add(args):
         else:
             return usage_error("unexpected argument: {}".format(arg))
 
-    if target is None or target == "":
+    if target is None:
         return usage_error("--target is required")
+    if not ID_RE.fullmatch(target):
+        return fail("invalid target: {!r}".format(target))
     if grok_mode is not None and grok_stub is not None:
         return usage_error("--grok-mode and --grok-stub are mutually exclusive")
     if grok_mode is not None and grok_mode == "":
@@ -362,6 +365,110 @@ def check_provider():
     return 75
 
 
+def preflight_argv():
+    raw = os.environ.get("FACTORY_QUEUE_PREFLIGHT_CMD")
+    if raw is not None and raw.strip():
+        return shlex.split(raw)
+    root = root_dir()
+    tool = root / "bin" / "factory-profile"
+    if not tool.is_file() or not os.access(str(tool), os.X_OK):
+        return None
+    if not (root / "profiles").is_dir():
+        return None
+    return [str(tool), "check"]
+
+
+def check_preflight():
+    argv = preflight_argv()
+    if argv is None:
+        return 0
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as exc:
+        warn("preflight command failed to start: {}".format(exc))
+        print("blocked profile-check")
+        return 1
+    if proc.returncode == 0:
+        return 0
+    print("blocked profile-check")
+    if proc.stdout:
+        sys.stderr.write(proc.stdout)
+        if not proc.stdout.endswith("\n"):
+            sys.stderr.write("\n")
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+        if not proc.stderr.endswith("\n"):
+            sys.stderr.write("\n")
+    return 1
+
+
+def busy_target_run(target):
+    try:
+        paths = sorted(runs_dir().glob("*/state.json"))
+    except OSError:
+        return None
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        state_target = "" if doc.get("target") is None else str(doc.get("target"))
+        if state_target == target and doc.get("exit") in (None, 2, 75):
+            return path.parent.name
+    return None
+
+
+def previous_last(queue):
+    try:
+        with open(queue / "status.json", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    last = doc.get("last")
+    if isinstance(last, dict) and "id" in last and "exit" in last:
+        return {"id": last.get("id"), "exit": last.get("exit")}
+    return None
+
+
+def write_status(queue, blocked, last):
+    doc = {
+        "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "pending": len(entries(queue / "pending")),
+        "blocked": blocked,
+        "last": last,
+    }
+    fd = None
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".queue-status.", dir=str(queue))
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = None
+            json.dump(doc, fh, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, queue / "status.json")
+        tmp = None
+    except OSError as exc:
+        warn("cannot write {}: {}".format(queue / "status.json", exc))
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 def cmd_run_next(args):
     # Equivalent to flock -n on <queue>/.lock: a held lock means another
     # run-next call owns the queue, so this call is a quiet no-op.
@@ -376,43 +483,97 @@ def cmd_run_next(args):
         except BlockingIOError:
             return 0
 
-        pending = sorted_entries(queue / "pending")
-        if not pending:
-            return 0
-        if check_provider() == 75:
-            return 75
-
-        path, entry = pending[0]
-        run_id = entry_id(path, entry)
-        target = "" if entry.get("target") is None else str(entry.get("target"))
-        brief = "" if entry.get("brief") is None else str(entry.get("brief"))
-
-        started = queue / "started"
-        started.mkdir(parents=True, exist_ok=True)
-        os.replace(path, started / path.name)
-
-        env = os.environ.copy()
-        env.pop("FACTORY_GROK_MODE", None)
-        env.pop("FACTORY_GROK_STUB", None)
-        env["FACTORY_TARGET_NAME"] = target
-        mode = entry.get("grok_mode")
-        stub = entry.get("grok_stub")
-        if isinstance(mode, str) and mode:
-            env["FACTORY_GROK_MODE"] = mode
-        elif isinstance(stub, str) and stub:
-            env["FACTORY_GROK_STUB"] = stub
-        else:
-            # Never let factory-run-local fall back to its stub=pass default.
-            env["FACTORY_GROK_MODE"] = "pending"
-
-        argv = run_argv() + [run_id, brief]
+        last = previous_last(queue)
+        blocked = None
         try:
-            ec = subprocess.run(argv, env=env, stdout=sys.stderr, stderr=sys.stderr).returncode
-        except OSError as exc:
-            warn("run command failed to start: {}".format(exc))
-            ec = 127
-        print("started {} exit={}".format(run_id, ec))
-        return 0
+            pending = sorted_entries(queue / "pending")
+            if not pending:
+                return 0
+            if check_provider() == 75:
+                return 75
+            if check_preflight() != 0:
+                blocked = "profile-check"
+                return 1
+
+            selected = None
+            serial = os.environ.get("FACTORY_QUEUE_SERIAL_TARGET") != "0"
+            for path, entry in pending:
+                run_id = entry_id(path, entry)
+                kind = entry.get("kind")
+                if kind != "code-cli":
+                    warn("{} has kind {!r}; not code-cli".format(run_id, kind))
+                    continue
+                target = "" if entry.get("target") is None else str(entry.get("target"))
+                if serial:
+                    busy = busy_target_run(target)
+                    if busy is not None:
+                        print("deferred {} target-busy={}".format(run_id, busy))
+                        continue
+                selected = (path, entry)
+                break
+            if selected is None:
+                return 0
+
+            path, entry = selected
+            run_id = entry_id(path, entry)
+            target = "" if entry.get("target") is None else str(entry.get("target"))
+            brief = "" if entry.get("brief") is None else str(entry.get("brief"))
+
+            started = queue / "started"
+            started.mkdir(parents=True, exist_ok=True)
+            os.replace(path, started / path.name)
+
+            env = os.environ.copy()
+            env.pop("FACTORY_GROK_MODE", None)
+            env.pop("FACTORY_GROK_STUB", None)
+            env["FACTORY_TARGET_NAME"] = target
+            mode = entry.get("grok_mode")
+            stub = entry.get("grok_stub")
+            if isinstance(mode, str) and mode:
+                env["FACTORY_GROK_MODE"] = mode
+            elif isinstance(stub, str) and stub:
+                env["FACTORY_GROK_STUB"] = stub
+            else:
+                # Never let factory-run-local fall back to its stub=pass default.
+                env["FACTORY_GROK_MODE"] = "pending"
+
+            raw_log_dir = os.environ.get("FACTORY_LOG_DIR")
+            log_dir = (
+                Path(raw_log_dir).expanduser()
+                if raw_log_dir
+                else root_dir() / "local" / "logs"
+            )
+            log_path = log_dir / "queue-{}.log".format(run_id)
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+                log_fh = open(log_path, "a", encoding="utf-8")
+            except OSError as exc:
+                warn("cannot write {}: {}".format(log_path, exc))
+                log_fh = None
+
+            argv = run_argv() + [run_id, brief]
+            try:
+                try:
+                    if log_fh is None:
+                        ec = subprocess.run(
+                            argv, env=env, stdout=sys.stderr, stderr=sys.stderr
+                        ).returncode
+                    else:
+                        ec = subprocess.run(
+                            argv, env=env, stdout=log_fh, stderr=log_fh
+                        ).returncode
+                except OSError as exc:
+                    warn("run command failed to start: {}".format(exc))
+                    ec = 127
+            finally:
+                if log_fh is not None:
+                    log_fh.close()
+
+            last = {"id": run_id, "exit": ec}
+            print("started {} exit={}".format(run_id, ec))
+            return 0
+        finally:
+            write_status(queue, blocked, last)
     finally:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)

@@ -654,6 +654,15 @@ def cmd_collect(args):
         ):
             raise InputError("state.round must be a non-negative integer")
 
+        if status == "max-rounds":
+            max_rounds = state.get("max_rounds")
+            if (
+                isinstance(max_rounds, int)
+                and not isinstance(max_rounds, bool)
+                and max_rounds > 0
+            ):
+                rounds = min(rounds, max_rounds)
+
         checks = load_checks(Path(args.checks).expanduser()) if args.checks else {}
         gate_claude, grok = collect_gates(run_dir, rounds, status)
         wall_ms, cc_usd, oc_tokens = collect_usage(usage_dir, run_id)

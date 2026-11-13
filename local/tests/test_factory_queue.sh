@@ -8,13 +8,15 @@ trap 'rm -rf "$T"' EXIT
 fail() { echo "test_factory_queue: FAIL $*" >&2; exit 1; }
 
 unset FACTORY_QUEUE_DIR FACTORY_RUNS_DIR FACTORY_PROVIDER_STATE_DIR \
-  FACTORY_GROK_MODE FACTORY_GROK_STUB FACTORY_TARGET_NAME \
+  FACTORY_GROK_MODE FACTORY_GROK_STUB FACTORY_TARGET_NAME FACTORY_LOG_DIR \
   FACTORY_QUEUE_RUN_CMD FACTORY_QUEUE_PROVIDER_CMD \
-  FACTORY_QUEUE_PROVIDER_CHECK_CMD || true
+  FACTORY_QUEUE_PROVIDER_CHECK_CMD FACTORY_QUEUE_PREFLIGHT_CMD \
+  FACTORY_QUEUE_SERIAL_TARGET || true
 export FACTORY_ROOT="$ROOT"
 export FACTORY_QUEUE_DIR="$T/queue"
 export FACTORY_RUNS_DIR="$T/runs"
 export FACTORY_PROVIDER_STATE_DIR="$T/providers"
+export FACTORY_LOG_DIR="$T/logs"
 
 Q="$ROOT/bin/factory-queue"
 PS="$ROOT/bin/factory-provider-state"
@@ -25,6 +27,10 @@ RUN_LOG="$T/run.calls"
 cat > "$T/run-stub" <<'SH'
 #!/usr/bin/env bash
 set -u
+if [[ -n "${STUB_RUN_NOISE:-}" ]]; then
+  printf 'run-stdout-%s\n' "${1-}"
+  printf 'run-stderr-%s\n' "${1-}" >&2
+fi
 {
   printf 'id=%s\n' "${1-}"
   printf 'brief=%s\n' "${2-}"
@@ -37,6 +43,21 @@ SH
 chmod +x "$T/run-stub"
 export FACTORY_QUEUE_RUN_CMD="$T/run-stub"
 export STUB_RUN_LOG="$RUN_LOG"
+
+PASS_PREFLIGHT="$T/preflight-pass"
+FAIL_PREFLIGHT="$T/preflight-fail"
+cat > "$PASS_PREFLIGHT" <<'SH'
+#!/usr/bin/env bash
+echo ok
+SH
+cat > "$FAIL_PREFLIGHT" <<'SH'
+#!/usr/bin/env bash
+echo 'brain.model: stale profile'
+echo 'profile detail on stderr' >&2
+exit 1
+SH
+chmod +x "$PASS_PREFLIGHT" "$FAIL_PREFLIGHT"
+export FACTORY_QUEUE_PREFLIGHT_CMD="$PASS_PREFLIGHT"
 
 echo "=== (a) add writes one pending entry and list --json shows grok_mode=pending ==="
 printf 'brief from file' > "$T/brief-a"
@@ -184,5 +205,232 @@ set +e
 G_MISSING_RC=$?
 set -e
 [[ "$G_MISSING_RC" -eq 1 ]] || fail "(g) missing remove exit $G_MISSING_RC, want 1"
+
+# ---- R8: preflight, serial targets, kept output, status.json ----
+
+assert_queue_status() {
+  python3 - "$1" "$2" "$3" "$4" "$5" "$6" <<'PY'
+import json
+import sys
+
+path, label, pending, blocked, last_id, last_exit = sys.argv[1:]
+with open(path, encoding="utf-8") as fh:
+    doc = json.load(fh)
+assert set(doc) == {"time", "pending", "blocked", "last"}, (label, doc)
+assert isinstance(doc["time"], str) and doc["time"], (label, doc)
+assert isinstance(doc["pending"], int) and not isinstance(doc["pending"], bool), (label, doc)
+assert doc["pending"] == int(pending), (label, doc)
+want_blocked = None if blocked == "<null>" else blocked
+assert doc["blocked"] == want_blocked, (label, doc)
+if last_id == "<null>":
+    assert doc["last"] is None, (label, doc)
+else:
+    assert doc["last"] == {"id": last_id, "exit": int(last_exit)}, (label, doc)
+PY
+}
+
+write_busy_state() {
+  local run_id="$1" target="$2" exit_value="$3"
+  mkdir -p "$FACTORY_RUNS_DIR/$run_id"
+  printf '{"id":"%s","target":"%s","exit":%s}\n' \
+    "$run_id" "$target" "$exit_value" > "$FACTORY_RUNS_DIR/$run_id/state.json"
+}
+
+use_r8_queue() {
+  local name="$1"
+  export FACTORY_QUEUE_DIR="$T/r8-$name-queue"
+  export FACTORY_RUNS_DIR="$T/r8-$name-runs"
+  export FACTORY_LOG_DIR="$T/r8-$name-logs"
+  export FACTORY_QUEUE_PREFLIGHT_CMD="$PASS_PREFLIGHT"
+  unset FACTORY_QUEUE_SERIAL_TARGET || true
+  rm -rf "$FACTORY_QUEUE_DIR" "$FACTORY_RUNS_DIR" "$FACTORY_LOG_DIR"
+  mkdir -p "$FACTORY_QUEUE_DIR" "$FACTORY_RUNS_DIR" "$FACTORY_LOG_DIR"
+  PENDING="$FACTORY_QUEUE_DIR/pending"
+  STARTED="$FACTORY_QUEUE_DIR/started"
+}
+
+set_entry_kind() {
+  local run_id="$1" kind="$2"
+  python3 - "$PENDING" "$run_id" "$kind" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+directory, run_id, kind = sys.argv[1:]
+for path in sorted(Path(directory).glob("*.json")):
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    if str(doc.get("id")) == run_id or path.stem.endswith("-" + run_id):
+        stat = path.stat()
+        doc["kind"] = kind
+        path.write_text(json.dumps(doc, sort_keys=True) + "\n", encoding="utf-8")
+        # Editing the kind must not make the entry look newer to run-next.
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        raise SystemExit(0)
+raise SystemExit("entry not found: " + run_id)
+PY
+}
+
+"$PS" clear claude-code >/dev/null 2>&1 || true
+
+echo "=== (R8-a) add rejects an invalid target ==="
+use_r8_queue target-invalid
+rm -f "$RUN_LOG"
+set +e
+"$Q" add bad-target --target ../x -- 'bad target brief' >"$T/r8a.out" 2>"$T/r8a.err"
+R8A_RC=$?
+set -e
+[[ "$R8A_RC" -eq 1 ]] || fail "(R8-a) invalid target exit $R8A_RC, want 1"
+[[ "$("$Q" count)" == "0" ]] || fail "(R8-a) invalid target was queued"
+
+echo "=== (R8-b) failing preflight blocks, leaves entries pending, and records it ==="
+use_r8_queue preflight-fail
+"$Q" add b-old --target t -- 'old brief'
+"$Q" add b-new --target u -- 'new brief'
+rm -f "$RUN_LOG"
+set +e
+R8B_OUT=$(FACTORY_QUEUE_PREFLIGHT_CMD="$FAIL_PREFLIGHT" "$Q" run-next 2>"$T/r8b.err")
+R8B_RC=$?
+set -e
+[[ "$R8B_RC" -eq 1 ]] || fail "(R8-b) exit $R8B_RC, want 1"
+[[ "$R8B_OUT" == "blocked profile-check" ]] || fail "(R8-b) stdout: $R8B_OUT"
+grep -Fq 'brain.model: stale profile' "$T/r8b.err" \
+  || fail "(R8-b) missing tool stdout on stderr: $(cat "$T/r8b.err")"
+grep -Fq 'profile detail on stderr' "$T/r8b.err" \
+  || fail "(R8-b) missing tool stderr: $(cat "$T/r8b.err")"
+[[ ! -e "$RUN_LOG" ]] || fail "(R8-b) run stub was called"
+[[ "$("$Q" count)" == "2" ]] || fail "(R8-b) pending count is not 2"
+assert_queue_status "$FACTORY_QUEUE_DIR/status.json" "(R8-b)" 2 profile-check '<null>' '<null>'
+
+echo "=== (R8-c) a later passing preflight starts the oldest entry ==="
+set +e
+R8C_OUT=$("$Q" run-next 2>"$T/r8c.err")
+R8C_RC=$?
+set -e
+[[ "$R8C_RC" -eq 0 ]] || fail "(R8-c) exit $R8C_RC, want 0"
+[[ "$R8C_OUT" == "started b-old exit=0" ]] || fail "(R8-c) stdout: $R8C_OUT"
+[[ "$("$Q" count)" == "1" ]] || fail "(R8-c) pending count is not 1"
+assert_queue_status "$FACTORY_QUEUE_DIR/status.json" "(R8-c)" 1 '<null>' b-old 0
+
+echo "=== (R8-d) a target at exit 2 is deferred while another target starts ==="
+use_r8_queue busy-exit2
+write_busy_state busy-t t 2
+"$Q" add d-t --target t -- 'older t brief'
+"$Q" add d-u --target u -- 'newer u brief'
+rm -f "$RUN_LOG"
+R8D_OUT=$("$Q" run-next)
+R8D_WANT=$'deferred d-t target-busy=busy-t\nstarted d-u exit=0'
+[[ "$R8D_OUT" == "$R8D_WANT" ]] || fail "(R8-d) stdout: $R8D_OUT"
+[[ "$(sed -n 's/^id=//p' "$RUN_LOG")" == "d-u" ]] || fail "(R8-d) run stub got the wrong entry"
+shopt -s nullglob
+r8d_t=("$PENDING"/*-d-t.json)
+r8d_u=("$STARTED"/*-d-u.json)
+shopt -u nullglob
+[[ "${#r8d_t[@]}" -eq 1 ]] || fail "(R8-d) d-t did not stay pending"
+[[ "${#r8d_u[@]}" -eq 1 ]] || fail "(R8-d) d-u did not start"
+assert_queue_status "$FACTORY_QUEUE_DIR/status.json" "(R8-d)" 1 '<null>' d-u 0
+
+echo "=== (R8-e) exit 75 and exit null also defer the target ==="
+for R8E_CASE in 75 null; do
+  use_r8_queue "busy-$R8E_CASE"
+  write_busy_state "busy-$R8E_CASE" t "$R8E_CASE"
+  "$Q" add "e$R8E_CASE-t" --target t -- 'older t brief'
+  "$Q" add "e$R8E_CASE-u" --target u -- 'newer u brief'
+  rm -f "$RUN_LOG"
+  R8E_OUT=$("$Q" run-next)
+  R8E_WANT=$(printf 'deferred e%s-t target-busy=busy-%s\nstarted e%s-u exit=0' \
+    "$R8E_CASE" "$R8E_CASE" "$R8E_CASE")
+  [[ "$R8E_OUT" == "$R8E_WANT" ]] \
+    || fail "(R8-e $R8E_CASE) stdout: $R8E_OUT"
+  [[ "$(sed -n 's/^id=//p' "$RUN_LOG")" == "e$R8E_CASE-u" ]] \
+    || fail "(R8-e $R8E_CASE) run stub got the wrong entry"
+  assert_queue_status "$FACTORY_QUEUE_DIR/status.json" \
+    "(R8-e $R8E_CASE)" 1 '<null>' "e$R8E_CASE-u" 0
+done
+
+echo "=== (R8-f) exit 0 or 1 on the target does not defer ==="
+for R8F_EXIT in 0 1; do
+  use_r8_queue "target-exit-$R8F_EXIT"
+  write_busy_state "busy-$R8F_EXIT" t "$R8F_EXIT"
+  "$Q" add "f$R8F_EXIT-t" --target t -- 'brief'
+  rm -f "$RUN_LOG"
+  R8F_OUT=$("$Q" run-next)
+  [[ "$R8F_OUT" == "started f$R8F_EXIT-t exit=0" ]] \
+    || fail "(R8-f $R8F_EXIT) stdout: $R8F_OUT"
+  [[ "$("$Q" count)" == "0" ]] || fail "(R8-f $R8F_EXIT) entry stayed pending"
+  assert_queue_status "$FACTORY_QUEUE_DIR/status.json" \
+    "(R8-f $R8F_EXIT)" 0 '<null>' "f$R8F_EXIT-t" 0
+done
+
+echo "=== (R8-g) FACTORY_QUEUE_SERIAL_TARGET=0 starts the oldest entry regardless ==="
+use_r8_queue serial-off
+write_busy_state busy-g t 2
+"$Q" add g-t --target t -- 'older t brief'
+"$Q" add g-u --target u -- 'newer u brief'
+rm -f "$RUN_LOG"
+R8G_OUT=$(FACTORY_QUEUE_SERIAL_TARGET=0 "$Q" run-next)
+[[ "$R8G_OUT" == "started g-t exit=0" ]] || fail "(R8-g) stdout: $R8G_OUT"
+[[ "$R8G_OUT" != *deferred* ]] || fail "(R8-g) entry was deferred"
+[[ "$(sed -n 's/^id=//p' "$RUN_LOG")" == "g-t" ]] || fail "(R8-g) run stub got the wrong entry"
+assert_queue_status "$FACTORY_QUEUE_DIR/status.json" "(R8-g)" 1 '<null>' g-t 0
+
+echo "=== (R8-h) a non-code-cli entry stays pending and the next entry starts ==="
+use_r8_queue kind-video
+"$Q" add h-1-video --target t -- 'video brief'
+"$Q" add h-2-code --target u -- 'code brief'
+set_entry_kind h-1-video video
+rm -f "$RUN_LOG"
+set +e
+R8H_OUT=$("$Q" run-next 2>"$T/r8h.err")
+R8H_RC=$?
+set -e
+[[ "$R8H_RC" -eq 0 ]] || fail "(R8-h) exit $R8H_RC, want 0"
+[[ "$R8H_OUT" == "started h-2-code exit=0" ]] || fail "(R8-h) stdout: $R8H_OUT"
+grep -Fq 'not code-cli' "$T/r8h.err" || fail "(R8-h) missing warning: $(cat "$T/r8h.err")"
+shopt -s nullglob
+r8h_video=("$PENDING"/*-h-1-video.json)
+r8h_code=("$STARTED"/*-h-2-code.json)
+shopt -u nullglob
+[[ "${#r8h_video[@]}" -eq 1 ]] || fail "(R8-h) video entry did not stay pending"
+[[ "${#r8h_code[@]}" -eq 1 ]] || fail "(R8-h) code entry did not start"
+assert_queue_status "$FACTORY_QUEUE_DIR/status.json" "(R8-h)" 1 '<null>' h-2-code 0
+
+echo "=== (R8-i) run stdout/stderr are appended to queue-<id>.log ==="
+use_r8_queue output-log
+"$Q" add i-log --target t -- 'log brief'
+LOG="$FACTORY_LOG_DIR/queue-i-log.log"
+printf 'before run\n' > "$LOG"
+rm -f "$RUN_LOG"
+set +e
+R8I_OUT=$(STUB_RUN_NOISE=1 "$Q" run-next 2>"$T/r8i.err")
+R8I_RC=$?
+set -e
+[[ "$R8I_RC" -eq 0 ]] || fail "(R8-i) exit $R8I_RC, want 0"
+[[ "$R8I_OUT" == "started i-log exit=0" ]] || fail "(R8-i) stdout: $R8I_OUT"
+[[ -f "$LOG" ]] || fail "(R8-i) missing $LOG"
+grep -Fqx 'before run' "$LOG" || fail "(R8-i) existing log content was lost"
+grep -Fqx 'run-stdout-i-log' "$LOG" || fail "(R8-i) missing run stdout in log"
+grep -Fqx 'run-stderr-i-log' "$LOG" || fail "(R8-i) missing run stderr in log"
+[[ ! -s "$T/r8i.err" ]] || fail "(R8-i) run output leaked to stderr: $(cat "$T/r8i.err")"
+assert_queue_status "$FACTORY_QUEUE_DIR/status.json" "(R8-i)" 0 '<null>' i-log 0
+
+echo "=== (R8-j) status last records {id, exit} and is carried over ==="
+use_r8_queue status-last
+"$Q" add j-one --target t -- 'last brief'
+rm -f "$RUN_LOG"
+set +e
+R8J_OUT=$(STUB_RUN_RC=7 "$Q" run-next)
+R8J_RC=$?
+set -e
+[[ "$R8J_RC" -eq 0 ]] || fail "(R8-j) exit $R8J_RC, want 0"
+[[ "$R8J_OUT" == "started j-one exit=7" ]] || fail "(R8-j) stdout: $R8J_OUT"
+assert_queue_status "$FACTORY_QUEUE_DIR/status.json" "(R8-j start)" 0 '<null>' j-one 7
+set +e
+R8J2_OUT=$("$Q" run-next)
+R8J2_RC=$?
+set -e
+[[ "$R8J2_RC" -eq 0 ]] || fail "(R8-j carry) exit $R8J2_RC, want 0"
+[[ -z "$R8J2_OUT" ]] || fail "(R8-j carry) stdout: $R8J2_OUT"
+assert_queue_status "$FACTORY_QUEUE_DIR/status.json" "(R8-j carry)" 0 '<null>' j-one 7
 
 echo "test_factory_queue: PASS"
