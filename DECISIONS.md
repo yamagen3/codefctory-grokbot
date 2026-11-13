@@ -120,3 +120,9 @@ Tool-body upgrades (DSH, OpenCode, Agent SDK) are **not** driven by “a newer v
 - **レビューや保守の CC 実行も上限を共有する。** `factory-provider-state ingest` で、factory-step の外で当たった上限も記録できる。枠そのものの分割は要判断（TODO）。
 - **factory-update は近いリセットなら待ってから適用する（既定 90 分まで）。** 一般的な上限文言だけでは退行を隠さないよう、`deferred-provider` にするのは rc 75、factory-step の上限マーカー、または判定時点で CC が実際に上限中のときに限る。3 回続けて延期したら `update-deferred-repeated` で知らせる。
 - **park された run は自動で再開できる。** `factory-run-local` は `local/runs/<id>/state.json` に段階・ラウンド・sha を残し、`bin/factory-resume` が CC の上限明けに exit 75 の run（spec / gate-claude）を古い順に再開する（gate 段階で sha が同じなら IMPL をやり直さない）。`factory-inbox` は上限中のプロバイダーと park 中の run を表示し、上限中は人の対応待ちに数えない。
+## 2026-11-13 — 改善ループ第 5 回（上限ループの最終回、Fable medium）
+- **CC の上限で park した gate は人を呼ばない。** gate が exit 75 で、かつ `factory-provider-state check claude-code` が上限中を返すときは `gate-unavailable` を送らない。それ以外の exit 75（判定なし等）は今までどおり通知する。
+- **同じ run id は同時に 1 つだけ。** `factory-run-local` は `local/runs/<id>/.run.lock` を取り、取れなければ state にも作業ツリーにも触らず exit 75。再開時は保存済みの round と sha を最初の state 書き込みで消さない。`work` と `max_rounds` も state に残す。
+- **強制終了された run は「孤立」として知らせ、自動再開はしない。** exit が null のまま 15 分以上更新が無く、lock も空いている run は `factory-resume` が exit 137 に書き換え、`run-aborted` を 1 回だけ通知する。途中状態が不明なので、再開は人か Grok が判断する。
+- **定期実行の入口は `bin/factory-tick` 1 本。** resume（待たずに即 park）→ inbox check の順に走り、`local/status/tick.json` に結果を残す。タイマー（cron / systemd / Grok のループ）の設置はオーナー判断で、`factory-setup` は入れない。
+- **改善ループは上限の 5 回で終了。** 第 5 回レビューも CONVERGED: no だったが、残りは要判断・要認証情報・P2 の項目が中心で、TODO に記録した。

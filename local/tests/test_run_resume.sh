@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Parked runs save state and resume by themselves after a Claude Code limit.
+# Parked, in-flight, and orphaned runs: state, locks, and resume after a Claude Code limit.
 # Offline: local bare origin, stubs, no network, no secrets.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -10,11 +10,11 @@ fail() { echo "test_run_resume: FAIL $*" >&2; exit 1; }
 unset FACTORY_AGMSG_TEAM FACTORY_RUNS_DIR FACTORY_NOTIFY_DIR FACTORY_WORK_DIR \
   FACTORY_GROK_HOOK_DIR FACTORY_ORIGIN_REINIT FACTORY_MAX_ROUNDS \
   FACTORY_GROK_MODE FACTORY_GROK_STUB FACTORY_CLAUDE_GATE_STUB FACTORY_RESUME \
-  FACTORY_PROVIDER_STATE_DIR || true
+  FACTORY_PROVIDER_STATE_DIR FACTORY_RESUME_ORPHAN_SEC || true
 export GIT_AUTHOR_NAME=factory GIT_AUTHOR_EMAIL=factory@localhost
 export GIT_COMMITTER_NAME=factory GIT_COMMITTER_EMAIL=factory@localhost
 
-echo "=== part B-style fake root ==="
+echo "=== fake root ==="
 FAKE="$T/root"
 mkdir -p "$FAKE/bin" "$FAKE/local/origin"
 for f in factory-run-local factory-common.sh factory-feedback factory-notify \
@@ -42,9 +42,9 @@ cat > "$FAKE/bin/factory-provider-state" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 cmd="${1:-}"; shift || true
+state="$(cat "${PROVIDER_STATE_FILE:?}" 2>/dev/null || echo ok)"
 case "$cmd" in
   check)
-    state="$(cat "${PROVIDER_STATE_FILE:?}" 2>/dev/null || echo ok)"
     if [[ "$state" == "limited" ]]; then
       echo "limited 9999999999 2099-01-01T00:00:00+00:00"
       exit 75
@@ -52,6 +52,7 @@ case "$cmd" in
     echo "ok"
     ;;
   wait)
+    [[ "$state" == "limited" ]] && exit 75
     exit 0
     ;;
   *)
@@ -129,6 +130,10 @@ set -euo pipefail
 n=$(( $(cat "$GATE_CLAUDE_COUNTER" 2>/dev/null || echo 0) + 1 ))
 printf '%s\n' "$n" > "$GATE_CLAUDE_COUNTER"
 printf 'gate-claude\n' >> "${STEP_LOG:?}"
+if [[ -n "${GATE_CLAUDE_BLOCK_FIFO:-}" ]]; then
+  : > "${GATE_CLAUDE_BLOCK_READY:?}"
+  read -r _ < "$GATE_CLAUDE_BLOCK_FIFO" || true
+fi
 read -r -a codes <<< "${GATE_CLAUDE_CODES:-0}"
 idx=$((n - 1))
 if [[ "$idx" -ge "${#codes[@]}" ]]; then idx=$(( ${#codes[@]} - 1 )); fi
@@ -211,10 +216,11 @@ run_factory() {
 
 run_resume() {
   local name="$1"; shift
-  local resume_args=()
+  local resume_args=() extra_env=()
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
       --dry-run) resume_args+=(--dry-run) ;;
+      *=*) extra_env+=("$1") ;;
       *) fail "run_resume: bad argument: $1" ;;
     esac
     shift
@@ -237,6 +243,7 @@ run_resume() {
     MERGE_COUNTER="$T/merge-count-$name" \
     STEP_LOG="$T/steps-$name.log" \
     GATE_CLAUDE_CODES="${GATE_CODES_RESUME:-0}" \
+    "${extra_env[@]}" \
     "$FAKE/bin/factory-resume" "${resume_args[@]}" >"$T/resume-$name.log" 2>&1
   RESUME_RC=$?
   set -e
@@ -261,81 +268,218 @@ assert_state() {
   [[ "$got" == "$want" ]] || fail "state $key=$got, want $want ($run_dir/state.json)"
 }
 
-echo "=== (a) gate limit parks, resume finishes without rerunning IMPL ==="
-write_provider ok
+notify_glob() {
+  compgen -G "$1/*-$2.txt" || true
+}
+
+notify_count() {
+  local files
+  files="$(compgen -G "$1/*-$2.txt" || true)"
+  if [[ -z "$files" ]]; then
+    echo 0
+  else
+    printf '%s\n' "$files" | wc -l | tr -d ' '
+  fi
+}
+
+wait_for_file() {
+  local path="$1" tries="${2:-200}" i
+  for ((i = 0; i < tries; i++)); do
+    [[ -e "$path" ]] && return 0
+    sleep 0.05
+  done
+  return 1
+}
+
+echo "=== (a) gate exits 75 with a limited provider: no gate-unavailable notification ==="
+write_provider limited
 run_factory a FACTORY_SKIP_CC_SPEC=1 GATE_CLAUDE_CODES="75 75"
 [[ "$RUN_RC" -eq 75 ]] || fail "case a: initial exit $RUN_RC, want 75: $(cat "$T/log-a")"
 assert_state "$RUN_RUNS/a" stage "gate-claude"
 assert_state "$RUN_RUNS/a" exit "75"
-assert_state "$RUN_RUNS/a" id "a"
-assert_state "$RUN_RUNS/a" target "t"
-assert_state "$RUN_RUNS/a" round "1"
-[[ -n "$(state_value "$RUN_RUNS/a" sha)" ]] || fail "case a: state sha is empty"
-[[ -n "$(state_value "$RUN_RUNS/a" updated_at)" ]] || fail "case a: state updated_at is empty"
-[[ -f "$RUN_RUNS/a/brief.txt" ]] || fail "case a: brief.txt was not written"
-[[ "$(cat "$RUN_RUNS/a/brief.txt")" == "brief for a" ]] || fail "case a: brief.txt content changed"
-[[ "$(cat "$T/impl-count-a")" -eq 1 ]] || fail "case a: initial impl count was not 1"
-
-echo "=== (d) --dry-run lists the run and calls no steps ==="
-gate_before="$(cat "$T/gate-claude-count-a")"
-run_resume a --dry-run
-[[ "$RESUME_RC" -eq 0 ]] || fail "case d: exit $RESUME_RC, want 0: $(cat "$T/resume-a.log")"
-grep -q 'resumed a exit=75' "$T/resume-a.log" || fail "case d: dry-run did not print the run id"
-[[ ! -e "$T/merge-count-a" ]] || fail "case d: dry-run called merge"
-[[ "$(cat "$T/gate-claude-count-a")" -eq "$gate_before" ]] || fail "case d: dry-run called gate"
-assert_state "$RUN_RUNS/a" exit "75"
-
-echo "=== (a) resume from gate-claude skips IMPL/GUARD/CI and merges ==="
-GATE_CODES_RESUME=0 run_resume a
-[[ "$RESUME_RC" -eq 0 ]] || fail "case a: resume exit $RESUME_RC, want 0: $(cat "$T/resume-a.log")"
-grep -q 'resumed a exit=0' "$T/resume-a.log" || fail "case a: missing resumed line"
-assert_state "$RUN_RUNS/a" exit "0"
-assert_state "$RUN_RUNS/a" stage "merge"
-[[ "$(cat "$T/impl-count-a")" -eq 1 ]] || fail "case a: resume reran IMPL ($(cat "$T/impl-count-a") total)"
-[[ "$(cat "$T/merge-count-a")" -eq 1 ]] || fail "case a: merge ran $(cat "$T/merge-count-a") times, want 1"
-if grep -q '=== ROUND 1 IMPL ===' "$T/resume-a.log"; then
-  fail "case a: resume ran the IMPL stage"
-fi
-
-echo "=== (b) a limited provider stops before any step stub runs ==="
-mkdir -p "$T/runs-b/b"
-cat > "$T/runs-b/b/state.json" <<'JSON'
-{"exit": 75, "grok_mode": null, "grok_stub": "pass", "id": "b", "round": 1, "sha": null, "stage": "gate-claude", "target": "t", "updated_at": "2026-01-01T00:00:00+00:00"}
-JSON
-printf 'brief for b\n' > "$T/runs-b/b/brief.txt"
-write_provider limited
-run_resume b
-[[ "$RESUME_RC" -eq 75 ]] || fail "case b: exit $RESUME_RC, want 75: $(cat "$T/resume-b.log")"
-grep -q 'limited ' "$T/resume-b.log" || fail "case b: provider limited line was not printed"
-[[ ! -e "$T/steps-b.log" ]] || fail "case b: a step stub ran: $(cat "$T/steps-b.log")"
-[[ ! -e "$T/runs-b/b/.resume.lock" ]] || fail "case b: factory-resume took the lock while limited"
-assert_state "$T/runs-b/b" exit "75"
+assert_state "$RUN_RUNS/a" work "$T/work-a"
+assert_state "$RUN_RUNS/a" max_rounds "3"
+[[ -z "$(notify_glob "$RUN_NOTIFY" gate-unavailable)" ]] \
+  || fail "case a: gate-unavailable notified while the provider was limited"
 write_provider ok
 
-echo "=== (c) a spec-stage park reruns SPEC and then completes ==="
-run_factory c SPEC_FAIL_AT=1 GATE_CLAUDE_CODES=0
+echo "=== (b) gate exits 75 with an ok provider: notification is sent ==="
+run_factory b FACTORY_SKIP_CC_SPEC=1 GATE_CLAUDE_CODES="75 75"
+[[ "$RUN_RC" -eq 75 ]] || fail "case b: initial exit $RUN_RC, want 75: $(cat "$T/log-b")"
+assert_state "$RUN_RUNS/b" exit "75"
+gate_notice="$(notify_glob "$RUN_NOTIFY" gate-unavailable)"
+[[ -n "$gate_notice" ]] || fail "case b: missing gate-unavailable notification"
+grep -Fq 'id=b' $gate_notice || fail "case b: notification lost id=b"
+
+echo "=== (c) a resume in flight keeps the parked round and sha ==="
+run_factory c FACTORY_SKIP_CC_SPEC=1 GATE_CLAUDE_CODES="75 75"
 [[ "$RUN_RC" -eq 75 ]] || fail "case c: initial exit $RUN_RC, want 75: $(cat "$T/log-c")"
-assert_state "$RUN_RUNS/c" stage "spec"
+assert_state "$RUN_RUNS/c" stage "gate-claude"
 assert_state "$RUN_RUNS/c" exit "75"
-[[ "$(cat "$T/spec-count-c")" -eq 1 ]] || fail "case c: initial spec count was not 1"
-if git -C "$T/work-c" rev-parse -q --verify "refs/tags/spec/c" >/dev/null 2>&1; then
-  fail "case c: spec tag exists after a failed SPEC"
-fi
+orig_round="$(state_value "$RUN_RUNS/c" round)"
+orig_sha="$(state_value "$RUN_RUNS/c" sha)"
+[[ -n "$orig_sha" ]] || fail "case c: parked state has no sha"
 
-run_resume c
-[[ "$RESUME_RC" -eq 0 ]] || fail "case c: resume exit $RESUME_RC, want 0: $(cat "$T/resume-c.log")"
-grep -q 'resumed c exit=0' "$T/resume-c.log" || fail "case c: missing resumed line"
+gate_before="$(cat "$T/gate-claude-count-c")"
+run_resume c --dry-run
+[[ "$RESUME_RC" -eq 0 ]] || fail "case c: dry-run exit $RESUME_RC, want 0: $(cat "$T/resume-c.log")"
+grep -q 'resumed c exit=75' "$T/resume-c.log" || fail "case c: dry-run did not list the run"
+[[ "$(cat "$T/gate-claude-count-c")" -eq "$gate_before" ]] || fail "case c: dry-run called the gate"
+
+FIFO="$T/gate-c.fifo"
+READY="$T/gate-c.ready"
+mkfifo "$FIFO"
+run_resume c GATE_CLAUDE_CODES=0 GATE_CLAUDE_BLOCK_FIFO="$FIFO" \
+  GATE_CLAUDE_BLOCK_READY="$READY" &
+resume_pid=$!
+wait_for_file "$READY" || fail "case c: resume never reached the blocking gate"
+assert_state "$RUN_RUNS/c" stage "gate-claude"
+assert_state "$RUN_RUNS/c" round "$orig_round"
+assert_state "$RUN_RUNS/c" sha "$orig_sha"
+
+echo "=== (d) a second run-local while (c) is blocked exits 75 and leaves HEAD alone ==="
+head_before="$(git -C "$T/work-c" rev-parse HEAD)"
+run_factory c FACTORY_SKIP_CC_SPEC=1 GATE_CLAUDE_CODES=0
+[[ "$RUN_RC" -eq 75 ]] || fail "case d: second run exit $RUN_RC, want 75: $(cat "$T/log-c")"
+grep -q 'factory-run-local: id=c is already running' "$T/log-c" \
+  || fail "case d: second run did not report the run lock"
+[[ "$(git -C "$T/work-c" rev-parse HEAD)" == "$head_before" ]] \
+  || fail "case d: second run changed the work tree HEAD"
+assert_state "$RUN_RUNS/c" round "$orig_round"
+assert_state "$RUN_RUNS/c" sha "$orig_sha"
+
+printf 'go\n' > "$FIFO"
+set +e
+wait "$resume_pid"
+resume_wait_ec=$?
+set -e
+[[ "$resume_wait_ec" -eq 0 ]] || fail "case d: blocked resume exited $resume_wait_ec"
+grep -q 'resumed c exit=0' "$T/resume-c.log" || fail "case d: resume did not finish"
 assert_state "$RUN_RUNS/c" exit "0"
-[[ "$(cat "$T/spec-count-c")" -eq 2 ]] || fail "case c: SPEC did not rerun ($(cat "$T/spec-count-c") total)"
-[[ "$(cat "$T/impl-count-c")" -eq 1 ]] || fail "case c: IMPL did not run once"
-[[ "$(cat "$T/merge-count-c")" -eq 1 ]] || fail "case c: merge did not run once"
+[[ "$(cat "$T/impl-count-c")" -eq 1 ]] || fail "case d: resume reran IMPL"
+[[ "$(cat "$T/merge-count-c")" -eq 1 ]] || fail "case d: resume did not merge"
 
-echo "=== (e) existing run-local tests still pass ==="
+echo "=== (e) an old null-exit run is orphaned exactly once ==="
+mkdir -p "$T/runs-e/e"
+cat > "$T/runs-e/e/state.json" <<JSON
+{"exit": null, "grok_mode": null, "grok_stub": "pass", "id": "e", "max_rounds": 3, "round": 2, "sha": "deadbeef", "stage": "impl", "target": "t", "updated_at": "2000-01-01T00:00:00+00:00", "work": "$T/work-e"}
+JSON
+write_provider ok
+run_resume e --dry-run
+[[ "$RESUME_RC" -eq 0 ]] || fail "case e: dry-run exit $RESUME_RC: $(cat "$T/resume-e.log")"
+grep -q '^orphaned e stage=impl$' "$T/resume-e.log" || fail "case e: dry-run did not print orphaned"
+assert_state "$T/runs-e/e" exit ""
+[[ "$(notify_count "$T/notify-e" run-aborted)" -eq 0 ]] || fail "case e: dry-run notified"
+
+run_resume e
+[[ "$RESUME_RC" -eq 0 ]] || fail "case e: exit $RESUME_RC: $(cat "$T/resume-e.log")"
+grep -q '^orphaned e stage=impl$' "$T/resume-e.log" || fail "case e: missing orphaned line"
+assert_state "$T/runs-e/e" exit "137"
+assert_state "$T/runs-e/e" stage "impl"
+assert_state "$T/runs-e/e" round "2"
+aborted="$(notify_glob "$T/notify-e" run-aborted)"
+[[ -n "$aborted" ]] || fail "case e: missing run-aborted notification"
+grep -Fq 'id=e orphaned stage=impl round=2' $aborted \
+  || fail "case e: run-aborted message lost its fields"
+
+run_resume e
+[[ "$RESUME_RC" -eq 0 ]] || fail "case e: second exit $RESUME_RC: $(cat "$T/resume-e.log")"
+if grep -q '^orphaned ' "$T/resume-e.log"; then
+  fail "case e: second call orphaned the state again"
+fi
+assert_state "$T/runs-e/e" exit "137"
+[[ "$(notify_count "$T/notify-e" run-aborted)" -eq 1 ]] \
+  || fail "case e: run-aborted count is $(notify_count "$T/notify-e" run-aborted), want 1"
+[[ "$(grep -c 'run-aborted' "$T/notify-e/NOTIFY.log")" -eq 1 ]] \
+  || fail "case e: run-aborted was sent more than once"
+
+echo "=== (f) an old null-exit run with a held run lock is left alone ==="
+mkdir -p "$T/runs-f/f"
+cat > "$T/runs-f/f/state.json" <<JSON
+{"exit": null, "grok_mode": null, "grok_stub": "pass", "id": "f", "max_rounds": 3, "round": 1, "sha": "cafebabe", "stage": "impl", "target": "t", "updated_at": "2000-01-01T00:00:00+00:00", "work": "$T/work-f"}
+JSON
+HOLD_FIFO="$T/hold-f.fifo"
+mkfifo "$HOLD_FIFO"
+(
+  exec 8>"$T/runs-f/f/.run.lock"
+  flock -n 8 || exit 1
+  : > "$T/lock-f.ready"
+  read -r _ < "$HOLD_FIFO" || true
+) &
+holder_pid=$!
+wait_for_file "$T/lock-f.ready" || fail "case f: lock holder did not start"
+updated_before="$(state_value "$T/runs-f/f" updated_at)"
+run_resume f
+[[ "$RESUME_RC" -eq 0 ]] || fail "case f: exit $RESUME_RC: $(cat "$T/resume-f.log")"
+if grep -q '^orphaned ' "$T/resume-f.log"; then
+  fail "case f: orphaned a state whose run lock was held"
+fi
+assert_state "$T/runs-f/f" exit ""
+[[ "$(state_value "$T/runs-f/f" updated_at)" == "$updated_before" ]] \
+  || fail "case f: state was touched while the run lock was held"
+[[ "$(notify_count "$T/notify-f" run-aborted)" -eq 0 ]] \
+  || fail "case f: orphan notification sent while the run lock was held"
+printf 'release\n' > "$HOLD_FIFO"
+wait "$holder_pid" || true
+
+echo "=== (g) a run with a custom work dir resumes and merges ==="
+CUSTOM_WORK="$T/custom-work-g"
+run_factory g FACTORY_SKIP_CC_SPEC=1 GATE_CLAUDE_CODES="75 75" \
+  FACTORY_WORK_DIR="$CUSTOM_WORK" FACTORY_MAX_ROUNDS=4
+[[ "$RUN_RC" -eq 75 ]] || fail "case g: initial exit $RUN_RC, want 75: $(cat "$T/log-g")"
+assert_state "$RUN_RUNS/g" exit "75"
+assert_state "$RUN_RUNS/g" work "$CUSTOM_WORK"
+assert_state "$RUN_RUNS/g" max_rounds "4"
+[[ -e "$CUSTOM_WORK/.git" ]] || fail "case g: custom work tree missing"
+[[ ! -e "$T/work-g/.git" ]] || fail "case g: default work tree exists unexpectedly"
+
+GATE_CODES_RESUME=0 run_resume g FACTORY_MAX_ROUNDS=99
+[[ "$RESUME_RC" -eq 0 ]] || fail "case g: resume exit $RESUME_RC: $(cat "$T/resume-g.log")"
+grep -q 'resumed g exit=0' "$T/resume-g.log" || fail "case g: missing resumed line"
+assert_state "$RUN_RUNS/g" exit "0"
+assert_state "$RUN_RUNS/g" work "$CUSTOM_WORK"
+assert_state "$RUN_RUNS/g" max_rounds "4"
+[[ "$(cat "$T/merge-count-g")" -eq 1 ]] || fail "case g: resume did not merge"
+
+echo "=== regression: a limited provider stops before any step stub runs ==="
+mkdir -p "$T/runs-lim/lim"
+cat > "$T/runs-lim/lim/state.json" <<'JSON'
+{"exit": 75, "grok_mode": null, "grok_stub": "pass", "id": "lim", "round": 1, "sha": null, "stage": "gate-claude", "target": "t", "updated_at": "2026-01-01T00:00:00+00:00"}
+JSON
+printf 'brief for lim\n' > "$T/runs-lim/lim/brief.txt"
+write_provider limited
+run_resume lim
+[[ "$RESUME_RC" -eq 75 ]] || fail "case lim: exit $RESUME_RC, want 75: $(cat "$T/resume-lim.log")"
+grep -q 'limited ' "$T/resume-lim.log" || fail "case lim: provider limited line was not printed"
+[[ ! -e "$T/steps-lim.log" ]] || fail "case lim: a step stub ran: $(cat "$T/steps-lim.log")"
+[[ ! -e "$T/runs-lim/lim/.resume.lock" ]] || fail "case lim: resume lock taken while limited"
+assert_state "$T/runs-lim/lim" exit "75"
+write_provider ok
+
+echo "=== regression: a spec-stage park reruns SPEC and then completes ==="
+run_factory spec SPEC_FAIL_AT=1 GATE_CLAUDE_CODES=0
+[[ "$RUN_RC" -eq 75 ]] || fail "case spec: initial exit $RUN_RC, want 75: $(cat "$T/log-spec")"
+assert_state "$RUN_RUNS/spec" stage "spec"
+assert_state "$RUN_RUNS/spec" exit "75"
+[[ "$(cat "$T/spec-count-spec")" -eq 1 ]] || fail "case spec: initial spec count was not 1"
+if git -C "$T/work-spec" rev-parse -q --verify "refs/tags/spec/spec" >/dev/null 2>&1; then
+  fail "case spec: spec tag exists after a failed SPEC"
+fi
+run_resume spec
+[[ "$RESUME_RC" -eq 0 ]] || fail "case spec: resume exit $RESUME_RC: $(cat "$T/resume-spec.log")"
+assert_state "$RUN_RUNS/spec" exit "0"
+[[ "$(cat "$T/spec-count-spec")" -eq 2 ]] || fail "case spec: SPEC did not rerun"
+[[ "$(cat "$T/impl-count-spec")" -eq 1 ]] || fail "case spec: IMPL did not run once"
+[[ "$(cat "$T/merge-count-spec")" -eq 1 ]] || fail "case spec: merge did not run once"
+
+echo "=== (h) existing run-local tests still pass ==="
 env -u FACTORY_ROOT -u FACTORY_RUNS_DIR -u FACTORY_NOTIFY_DIR -u FACTORY_WORK_DIR \
-  -u FACTORY_RESUME -u FACTORY_PROVIDER_STATE_DIR \
+  -u FACTORY_RESUME -u FACTORY_PROVIDER_STATE_DIR -u FACTORY_MAX_ROUNDS \
+  -u FACTORY_RESUME_ORPHAN_SEC \
   bash "$ROOT/local/tests/test_goal_entry.sh"
 env -u FACTORY_ROOT -u FACTORY_RUNS_DIR -u FACTORY_NOTIFY_DIR -u FACTORY_WORK_DIR \
-  -u FACTORY_RESUME -u FACTORY_PROVIDER_STATE_DIR \
+  -u FACTORY_RESUME -u FACTORY_PROVIDER_STATE_DIR -u FACTORY_MAX_ROUNDS \
+  -u FACTORY_RESUME_ORPHAN_SEC \
   bash "$ROOT/local/tests/test_run_feedback.sh"
 
 echo "test_run_resume: PASS"
