@@ -15,7 +15,8 @@ Exit codes (daily/apply):
 Never prints secret values; only checks that env vars exist. No model calls in `check`.
 Test hooks (env): FACTORY_UPDATE_DIR, FACTORY_UPDATE_NPM_PREFIX, FACTORY_UPDATE_VERIFY_CMD,
 FACTORY_UPDATE_SKIP_POST=1, FACTORY_UPDATE_SKIP_DOCTOR=1, FACTORY_UPDATE_DOCTOR_CMD,
-FACTORY_UPDATE_PROVIDER_CHECK_CMD.
+FACTORY_UPDATE_PROVIDER_CHECK_CMD, FACTORY_UPDATE_PROVIDER_WAIT_CMD,
+FACTORY_UPDATE_PROVIDER_WAIT_SEC, FACTORY_UPDATE_MAX_DEFERRALS.
 """
 import datetime as dt
 import fcntl
@@ -48,6 +49,7 @@ PONG_CHECK = ("python3 -c \"import sys,json; d=json.loads(sys.stdin.read().strip
               "sys.exit(0 if d.get('stopReason')=='completed' and d.get('text','').strip().strip('.').lower()=='pong' else 1)\"")
 EXIT = {"nothing-to-do": 0, "updated-ok": 10, "needs-approval": 20, "rolled-back": 30,
         "deferred-provider": 40, "error": 1}
+PROVIDER_OUTAGE_SPECIFIC_MARKERS = ("factory-step: claude-code limited",)
 PROVIDER_OUTAGE_MARKERS = (
     "usage_limit_reached", "hit your 5-hour limit", "hit your weekly limit",
     "rate_limit_error", "overloaded_error", '"api_error_status":429',
@@ -63,6 +65,13 @@ def now():
 
 def log(*a):
     print("factory-update:", *a, file=sys.stderr, flush=True)
+
+
+def env_int(name, default):
+    try:
+        return int(os.environ.get(name, ""))
+    except (TypeError, ValueError):
+        return default
 
 
 def run(cmd, timeout=600, check=False, env=None, cwd=None, shell=False):
@@ -741,8 +750,17 @@ def provider_check_cmd():
 
 
 def provider_outage(rc, text):
+    if rc == 75:
+        return True
     low = (text or "").lower()
-    return rc == 75 or any(m in low for m in PROVIDER_OUTAGE_MARKERS)
+    if any(m in low for m in PROVIDER_OUTAGE_SPECIFIC_MARKERS):
+        return True
+    if not any(m in low for m in PROVIDER_OUTAGE_MARKERS):
+        return False
+    check_cmd = provider_check_cmd()
+    if not check_cmd:
+        return False
+    return run(["bash", "-c", check_cmd], timeout=120).returncode == 75
 
 
 def post_apply(changed_kinds):
@@ -776,6 +794,28 @@ def append_log(entry):
         f.write(entry + "\n")
 
 
+def record_deferred_streak(status):
+    """Track consecutive deferred-provider applies; any other outcome clears it."""
+    p = UPD / "deferred-streak.json"
+    if status != "deferred-provider":
+        try:
+            p.unlink()
+        except OSError:
+            pass
+        return None
+    t = now().isoformat(timespec="seconds")
+    try:
+        data = json.loads(p.read_text())
+        count = int(data.get("count", 0))
+        first = data.get("first") or t
+    except (OSError, ValueError, TypeError):
+        count, first = 0, t
+    streak = {"count": max(0, count) + 1, "first": first, "last": t}
+    UPD.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(streak, indent=2, ensure_ascii=False) + "\n")
+    return streak
+
+
 def apply_log_entry(res, d, pending):
     return (f"- {res['finished']}: **{res['status']}** — applied: {', '.join(res['applied']) or 'none'}"
             + (f"; reason: {res.get('rollback_reason')}" if res.get("rollback_reason") else "")
@@ -799,13 +839,32 @@ def do_apply(rep):
     if check_cmd:
         p = run(["bash", "-c", check_cmd], timeout=120)
         if p.returncode == 75:
-            res["status"] = "deferred-provider"
-            res["defer_reason"] = "claude-code limited: " + p.stdout.strip()[:200]
-            res["finished"] = now().isoformat(timespec="seconds")
-            (d / "result.json").write_text(json.dumps(res, indent=2, ensure_ascii=False))
-            append_log(apply_log_entry(res, d, pending))
-            log(f"deferred: {res['defer_reason']}")
-            return res
+            still_limited = True
+            wait_sec = env_int("FACTORY_UPDATE_PROVIDER_WAIT_SEC", 5400)
+            if wait_sec > 0:
+                wait_cmd = os.environ.get("FACTORY_UPDATE_PROVIDER_WAIT_CMD") or (
+                    f"{ROOT}/bin/factory-provider-state wait claude-code --max-sec {wait_sec}")
+                log(f"provider limited; waiting up to {wait_sec}s before deferring")
+                w = run(["bash", "-c", wait_cmd], timeout=wait_sec + 300)
+                if w.returncode == 0:
+                    p2 = run(["bash", "-c", check_cmd], timeout=120)
+                    if p2.returncode == 0:
+                        still_limited = False
+                        log("provider wait cleared the limit; continuing")
+                    else:
+                        if p2.returncode == 75:
+                            p = p2
+                        log(f"provider still unavailable after wait (rc={p2.returncode}); deferring")
+                else:
+                    log(f"provider wait did not clear the limit (rc={w.returncode}); deferring")
+            if still_limited:
+                res["status"] = "deferred-provider"
+                res["defer_reason"] = "claude-code limited: " + p.stdout.strip()[:200]
+                res["finished"] = now().isoformat(timespec="seconds")
+                (d / "result.json").write_text(json.dumps(res, indent=2, ensure_ascii=False))
+                append_log(apply_log_entry(res, d, pending))
+                log(f"deferred: {res['defer_reason']}")
+                return res
     snap = Snapshot(d / "snapshot")
     staging = Path(tempfile.mkdtemp(prefix="factory-update-stage-"))
     order = {"npm": 0, "cc-sdk": 0.5, "agmsg-skill": 1, "oc-copy": 2, "uv": 3, "python": 4, "apt": 5}
@@ -936,7 +995,7 @@ def rollback(snap):
 
 
 # ---------- summary / daily ----------
-def write_summary(status, rep=None, res=None, err=None):
+def write_summary(status, rep=None, res=None, err=None, streak=None):
     t = now().isoformat(timespec="seconds")
     L = [f"# factory-update summary", "", f"- status: **{status}**", f"- time: {t}", f"- exit code: {EXIT.get(status, 1)}"]
     if rep and rep.get("_path"):
@@ -946,6 +1005,8 @@ def write_summary(status, rep=None, res=None, err=None):
         L.append(f"- applied: {', '.join(res.get('applied', [])) or 'none'}")
         if res.get("defer_reason"):
             L.append(f"- deferred: {res['defer_reason']}")
+        if streak and streak.get("count", 0) >= env_int("FACTORY_UPDATE_MAX_DEFERRALS", 3):
+            L.append(f"- deferred {streak['count']} times in a row since {streak['first']}")
         if res.get("rollback_reason"):
             L.append(f"- rolled back, reason: {res['rollback_reason']}")
             L.append(f"- factory-doctor after rollback rc={res.get('doctor_after_rollback_rc')}")
@@ -1033,14 +1094,21 @@ def main(argv):
             if daily and rep.get("errors") and not any(a["class"] == "auto" for a in rep["actions"]):
                 write_summary("error", rep, None, "; ".join(rep["errors"])); return EXIT["error"]
             res = do_apply(rep) if any(a["class"] == "auto" for a in rep["actions"]) else None
+            streak = record_deferred_streak(res["status"] if res else "nothing-to-do")
             st = final_status(rep, res)
-            write_summary(st, rep, res, "; ".join(rep.get("errors", [])) or None)
+            write_summary(st, rep, res, "; ".join(rep.get("errors", [])) or None, streak)
             if st == "deferred-provider":
                 reason = (res or {}).get("defer_reason", "")
                 try:
                     run([str(ROOT / "bin/factory-notify"), "update-deferred", reason], timeout=120)
                 except Exception as e:
                     log(f"notify failed (ignored): {e}")
+                if streak and streak["count"] >= env_int("FACTORY_UPDATE_MAX_DEFERRALS", 3):
+                    try:
+                        run([str(ROOT / "bin/factory-notify"), "update-deferred-repeated",
+                             f"{reason} count={streak['count']}"], timeout=120)
+                    except Exception as e:
+                        log(f"repeat notify failed (ignored): {e}")
             # updated-ok with pending approvals → report as needs-approval but keep the "updated" fact in summary
             if res and res["status"] == "updated-ok" and st == "needs-approval":
                 return EXIT["needs-approval"]

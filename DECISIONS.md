@@ -113,3 +113,10 @@ Tool-body upgrades (DSH, OpenCode, Agent SDK) are **not** driven by “a newer v
 - **セキュリティ更新の検証失敗を、プロバイダー障害と退行に分ける。** CC が上限中なら `factory-update` は何も適用せず `deferred-provider`（exit 40）で終わる。検証中に上限・過負荷の痕跡（または rc 75）で落ちた場合は、検証済みの状態に戻すためロールバックはするが、`rolled-back`（退行）ではなく `deferred-provider`（退行ではない）と記録し、`update-deferred` を通知して翌日の実行で再試行する。未検証の更新を残さないため、「ロールバックしない」ではなく「退行として扱わない」を選んだ。
 - **Fable 抜きで進めた回。** Fable（CC）が 11:20 JST まで上限のため、オーナーの指示（t79u）と第 2 回の保留項目「quota parking（429 の文言サンプルが必要）」を元に、今夜採れた実サンプルで OpenCode（flash, max）が実装した。CC が止まっていても工場の改善が回ることの実証も兼ねる。Fable の検証は次のレビューで行う。
 - **代替オーケストレーター / gate（OpenCode や Codex による SPEC・gate）は提案のみ。** モデル設定と認証情報に関わるため実装しない（TODO）。
+## 2026-11-13 — 改善ループ第 4 回（Fable レビュー、CC 上限の実経路と自動再開）
+- **Fable（claude-fable-5-2）は常に effort medium で使う。** xhigh / max は使わない（オーナー指示 t80）。1 回のレビューで CC の 5 時間枠を使い切るのを避けるため。第 4 回のレビューは medium で約 4 分、13 ターンで終わった。
+- **上限の判定は実際の sidecar 形式で行う。** sidecar は結果文を `result_head` に書くので、classifier は `result_head` を優先して読み、最終行ではなく結果レコードを後ろから探す。結果レコードが無いとき（SDK が例外で終わる等）は step の stderr / 結果テキストから「hit your … limit」等を拾い、exit 0 の step には適用しない。
+- **過負荷（529 / overloaded_error）は利用上限と区別する。** 1 時間ではなく短時間（既定 300 秒）だけ park する。`provider-limited` 通知は上限の記録 1 件につき 1 回。
+- **レビューや保守の CC 実行も上限を共有する。** `factory-provider-state ingest` で、factory-step の外で当たった上限も記録できる。枠そのものの分割は要判断（TODO）。
+- **factory-update は近いリセットなら待ってから適用する（既定 90 分まで）。** 一般的な上限文言だけでは退行を隠さないよう、`deferred-provider` にするのは rc 75、factory-step の上限マーカー、または判定時点で CC が実際に上限中のときに限る。3 回続けて延期したら `update-deferred-repeated` で知らせる。
+- **park された run は自動で再開できる。** `factory-run-local` は `local/runs/<id>/state.json` に段階・ラウンド・sha を残し、`bin/factory-resume` が CC の上限明けに exit 75 の run（spec / gate-claude）を古い順に再開する（gate 段階で sha が同じなら IMPL をやり直さない）。`factory-inbox` は上限中のプロバイダーと park 中の run を表示し、上限中は人の対応待ちに数えない。

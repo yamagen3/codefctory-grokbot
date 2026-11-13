@@ -131,3 +131,13 @@
 - [ ] 実の DSH 経路で sidecar の新フィールドが記録されることを、次に CC が上限に達したときに確認する（今回はスタブでのテストのみ）。
 - [ ] 【要判断・要認証情報】CC 不通時の代替 SPEC/gate。案は、OpenCode（flash, max）を gate の 2 次判定に使う、または `docs/extensibility.md` のアダプター経由で別プロバイダーを使う。モデル設定の変更と新しい鍵が要る。
 - [ ] 【要判断】上限の枠を工場の実行とレビュー・保守で分ける（例: レビューは別アカウント・別トークン、または工場の実行中はレビューを止める）。
+## 改善ループ第 4 回（2026-11-13、Fable medium）由来
+- [x] R4-T1: 実 sidecar 形式（`result_head`、複数 writer）での上限判定、結果レコードが無いときの stderr 判定、過負荷の短時間 park、通知は 1 回、`ingest` でレビュー側の上限も記録。
+- [x] R4-T2: factory-update の事前待機（既定 5400 秒）、退行を隠さない判定、連続延期の通知。
+- [x] R4-T3: run の `state.json` と `bin/factory-resume` で park された run を自動再開。
+- [x] R4-T4: inbox に上限中プロバイダーと park 中 run を表示、attention で数える。
+- [ ] `factory-resume` を定期的に（または上限明けに）呼ぶ仕組み（cron / routine）を決める。今は手動か外側のループから呼ぶ。
+- [ ] Fable のレビュー実行（`fable-*.sh`）で、終わったあと `factory-provider-state ingest claude-code` を呼ぶようにする。
+- [ ] 【要判断】`pr_merge` が `main` の更新を取り込まずにマージする件、および同じ id の再実行で保留中の作業クローンを消す件（R4-F10、第 2 回からの持ち越し）。
+- [ ] 並列 IMPL のタイムアウト処理・`/tmp` ログ固定・負けた workspace の残留（R4-F11、持ち越し。launcher フラグは要判断）。
+- [ ] パイプライン記述子とプロバイダー名の継ぎ目はまだ docs のみ（R4-F12、読み取り専用の記述子なら実装可）。

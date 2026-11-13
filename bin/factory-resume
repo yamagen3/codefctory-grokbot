@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Resume runs parked on Claude Code's usage limit.
+# Usage: factory-resume [--dry-run]
+set -euo pipefail
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+
+DRY_RUN=0
+case "${1:-}" in
+  "") ;;
+  --dry-run) DRY_RUN=1 ;;
+  *) die "usage: factory-resume [--dry-run]" ;;
+esac
+[[ "$#" -le 1 ]] || die "usage: factory-resume [--dry-run]"
+
+PS="$FACTORY_ROOT/bin/factory-provider-state"
+if [[ ! -x "$PS" ]]; then
+  PS=$(command -v factory-provider-state || true)
+fi
+[[ -n "$PS" ]] || die "missing factory-provider-state"
+set +e
+CHECK_OUT=$("$PS" check claude-code)
+CHECK_EC=$?
+set -e
+if [[ "$CHECK_EC" -eq 75 ]]; then
+  printf '%s\n' "$CHECK_OUT"
+  exit 75
+fi
+[[ "$CHECK_EC" -eq 0 ]] || die "factory-provider-state check claude-code failed (exit $CHECK_EC)"
+
+RUNS_DIR="${FACTORY_RUNS_DIR:-$FACTORY_ROOT/local/runs}"
+shopt -s nullglob
+states=("$RUNS_DIR"/*/state.json)
+shopt -u nullglob
+[[ "${#states[@]}" -gt 0 ]] || exit 0
+
+mapfile -d '' -t records < <(python3 - "${states[@]}" <<'PY'
+import json
+import os
+import sys
+
+candidates = []
+for path in sys.argv[1:]:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except Exception:
+        continue
+    if not isinstance(doc, dict):
+        continue
+    if doc.get("exit") != 75 or doc.get("stage") not in ("spec", "gate-claude"):
+        continue
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        continue
+    candidates.append((mtime, path, doc))
+
+for _mtime, path, doc in sorted(candidates, key=lambda item: (item[0], item[1])):
+    run_dir = os.path.dirname(path)
+    fields = [
+        path,
+        run_dir,
+        str(doc.get("id") or ""),
+        str(doc.get("target") or ""),
+        str(doc.get("grok_mode") or ""),
+        str(doc.get("grok_stub") or ""),
+        str(doc.get("exit")),
+    ]
+    sys.stdout.write("\0".join(fields) + "\0")
+PY
+)
+
+for ((i = 0; i < ${#records[@]}; i += 7)); do
+  state_path="${records[i]}"
+  run_dir="${records[i + 1]}"
+  id="${records[i + 2]}"
+  target="${records[i + 3]}"
+  grok_mode="${records[i + 4]}"
+  grok_stub="${records[i + 5]}"
+  saved_exit="${records[i + 6]}"
+  [[ -n "$id" ]] || id="$(basename "$run_dir")"
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "resumed $id exit=$saved_exit"
+    continue
+  fi
+
+  exec 9>"$run_dir/.resume.lock"
+  if ! flock -n 9; then
+    exec 9>&-
+    continue
+  fi
+
+  # Re-check under the lock: another process may have resumed this run.
+  if ! python3 - "$state_path" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    doc = json.load(fh)
+raise SystemExit(0 if doc.get("exit") == 75 and doc.get("stage") in ("spec", "gate-claude") else 1)
+PY
+  then
+    exec 9>&-
+    continue
+  fi
+
+  unset FACTORY_GROK_MODE FACTORY_GROK_STUB FACTORY_TARGET_NAME || true
+  [[ -z "$target" ]] || export FACTORY_TARGET_NAME="$target"
+  [[ -z "$grok_mode" ]] || export FACTORY_GROK_MODE="$grok_mode"
+  [[ -z "$grok_stub" ]] || export FACTORY_GROK_STUB="$grok_stub"
+
+  set +e
+  FACTORY_RESUME=1 factory-run-local "$id" "$(cat "$run_dir/brief.txt" 2>/dev/null)"
+  ec=$?
+  set -e
+  echo "resumed $id exit=$ec"
+  exec 9>&-
+done
+
+exit 0
