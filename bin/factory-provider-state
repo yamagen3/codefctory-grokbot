@@ -4,11 +4,15 @@
 State lives in $FACTORY_PROVIDER_STATE_DIR (default <repo>/local/status/providers).
 
   classify <usage-jsonl-file>   limited <reset_epoch> <reason> | ok
+  classify-text <file>...       same, from the last 200 lines of each text file
+  ingest <provider> <file>      classify a JSON object or JSONL and record a limit
   mark <provider> <reset_epoch> <reason...>
   clear <provider>
   check <provider>              limited <reset_epoch> <iso> (exit 75) | ok
+  should-notify <provider>      exit 0 once per state file (sets notified=true)
   wait <provider> [--max-sec N] sleep until reset when it is close enough (exit 0), else exit 75
 """
+import fcntl
 import json
 import os
 import re
@@ -72,22 +76,59 @@ def iso_time(epoch):
     return datetime.fromtimestamp(epoch).astimezone().isoformat(timespec="seconds")
 
 
-def read_last_json(path):
+RESULT_KEYS = ("api_error", "api_error_status", "result", "result_head")
+
+
+def is_result_record(data):
+    if not isinstance(data, dict):
+        return False
+    if data.get("source") == "claude-agent-sdk.result":
+        return True
+    if data.get("type") == "result":
+        return True
+    return any(key in data and data[key] is not None for key in RESULT_KEYS)
+
+
+def read_result_record(path):
+    records = []
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
-            lines = [line.strip() for line in fh if line.strip()]
+            for line in fh:
+                try:
+                    data = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if is_result_record(data):
+                    records.append(data)
     except OSError:
         return None
-    if not lines:
+    return records[-1] if records else None
+
+
+def read_result_any(path):
+    """A whole-file JSON object (pretty-printed allowed) or JSONL."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
         return None
     try:
-        data = json.loads(lines[-1])
+        data = json.loads(text)
     except (TypeError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+        return read_result_record(path)
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        for item in reversed(data):
+            if is_result_record(item):
+                return item
+    return read_result_record(path)
 
 
 def result_head(data):
+    head = data.get("result_head")
+    if isinstance(head, str):
+        return head
     result = data.get("result")
     return result[:300] if isinstance(result, str) else None
 
@@ -116,6 +157,25 @@ def limit_reason(data):
     if status is not None:
         return "api_error_status=" + str(status)
     return "usage_limit"
+
+
+def is_overload(data, reason):
+    status = status_number(data.get("api_error_status"))
+    return reason == "overloaded_error" or (
+        status == 529 and data.get("api_error") != "usage_limit_reached"
+    )
+
+
+def classify_record(data):
+    if data is None or not is_limited(data):
+        return None
+    now = int(time.time())
+    reason = limit_reason(data)
+    if is_overload(data, reason):
+        epoch = now + env_int("FACTORY_PROVIDER_OVERLOAD_PARK_SEC", 300)
+    else:
+        epoch = parse_reset(result_head(data), now)
+    return epoch, reason
 
 
 def parse_reset(head, now):
@@ -186,16 +246,8 @@ def active_reset(provider):
     return None
 
 
-def write_state(provider, reset_epoch, reason):
-    path = state_path(provider)
+def write_state_doc(path, doc):
     path.parent.mkdir(parents=True, exist_ok=True)
-    doc = {
-        "provider": provider,
-        "state": "limited",
-        "reset_epoch": reset_epoch,
-        "reason": reason,
-        "marked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-    }
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -212,14 +264,90 @@ def write_state(provider, reset_epoch, reason):
         raise
 
 
+def write_state(provider, reset_epoch, reason):
+    path = state_path(provider)
+    doc = {
+        "provider": provider,
+        "state": "limited",
+        "reset_epoch": reset_epoch,
+        "reason": reason,
+        "marked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    write_state_doc(path, doc)
+
+
+def print_classification(result):
+    if result is None:
+        print("ok")
+    else:
+        print("limited {} {}".format(result[0], result[1]))
+
+
 def cmd_classify(args):
-    data = read_last_json(args[0]) if len(args) == 1 else None
-    if data is None or not is_limited(data):
+    data = read_result_record(args[0]) if len(args) == 1 else None
+    print_classification(classify_record(data))
+    return 0
+
+
+def read_text_tail(path, max_lines=200):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = [line.rstrip("\n") for line in fh]
+    except OSError:
+        return []
+    return lines[-max_lines:]
+
+
+def text_limit_reason(text):
+    if "usage_limit_reached" in text:
+        return "usage_limit_reached"
+    api_error = re.search(r'"api_error"\s*:\s*"([^"]+)"', text)
+    if api_error:
+        return api_error.group(1)
+    status = re.search(r'"api_error_status"\s*:\s*(429|529)', text)
+    if status:
+        return "api_error_status=" + status.group(1)
+    return "usage_limit"
+
+
+def cmd_classify_text(args):
+    lines = []
+    for path in args:
+        lines.extend(read_text_tail(path))
+    text = "\n".join(lines)
+    if not (
+        "usage_limit_reached" in text
+        or re.search(r"hit your .{0,40}limit", text, re.IGNORECASE)
+        or re.search(r'"api_error_status"\s*:\s*(429|529)', text)
+    ):
         print("ok")
         return 0
     now = int(time.time())
-    epoch = parse_reset(result_head(data), now)
-    print("limited {} {}".format(epoch, limit_reason(data)))
+    epoch = parse_reset(text, now)
+    print("limited {} {}".format(epoch, text_limit_reason(text)))
+    return 0
+
+
+def cmd_ingest(args):
+    if len(args) != 2:
+        return usage_error("ingest <provider> <file>")
+    provider, path = args
+    try:
+        state_path(provider)
+    except ValueError as exc:
+        print("factory-provider-state: {}".format(exc), file=sys.stderr)
+        return 2
+    result = classify_record(read_result_any(path))
+    if result is None:
+        print("ok")
+        return 0
+    epoch, reason = result
+    try:
+        write_state(provider, epoch, reason)
+    except OSError as exc:
+        print("factory-provider-state: {}".format(exc), file=sys.stderr)
+        return 2
+    print("limited {} {}".format(epoch, reason))
     return 0
 
 
@@ -242,6 +370,38 @@ def cmd_clear(args):
     try:
         remove_state(args[0])
     except ValueError as exc:
+        print("factory-provider-state: {}".format(exc), file=sys.stderr)
+        return 2
+    return 0
+
+
+def cmd_should_notify(args):
+    if len(args) != 1:
+        return usage_error("should-notify <provider>")
+    provider = args[0]
+    try:
+        path = state_path(provider)
+        if not path.exists():
+            return 1
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            fcntl.flock(dir_fd, fcntl.LOCK_EX)
+            try:
+                if active_reset(provider) is None:
+                    return 1
+                data = read_state(provider)
+                if data is None or data.get("notified"):
+                    return 1
+                data["notified"] = True
+                write_state_doc(path, data)
+            finally:
+                fcntl.flock(dir_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(dir_fd)
+    except ValueError as exc:
+        print("factory-provider-state: {}".format(exc), file=sys.stderr)
+        return 2
+    except OSError as exc:
         print("factory-provider-state: {}".format(exc), file=sys.stderr)
         return 2
     return 0
@@ -300,21 +460,23 @@ def usage_error(text):
 
 
 def main(argv):
+    usage = "{classify|classify-text|ingest|mark|clear|check|should-notify|wait} ..."
     if len(argv) < 2:
-        return usage_error(
-            "{classify|mark|clear|check|wait} ..."
-        )
+        return usage_error(usage)
     cmd, args = argv[1], argv[2:]
     handlers = {
         "classify": cmd_classify,
+        "classify-text": cmd_classify_text,
+        "ingest": cmd_ingest,
         "mark": cmd_mark,
         "clear": cmd_clear,
         "check": cmd_check,
+        "should-notify": cmd_should_notify,
         "wait": cmd_wait,
     }
     handler = handlers.get(cmd)
     if handler is None:
-        return usage_error("{classify|mark|clear|check|wait} ...")
+        return usage_error(usage)
     return handler(args)
 
 

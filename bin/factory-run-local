@@ -7,6 +7,7 @@
 #   FACTORY_SKIP_CC_SPEC=1 — reuse existing spec on branch (tests)
 #   FACTORY_MAX_ROUNDS=3
 #   FACTORY_ORIGIN_REINIT=1 — wipe and re-scaffold the bare origin (default: reuse existing)
+#   FACTORY_RESUME=1 — resume a parked run from $RUN_DIR/state.json (work tree must exist)
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
 
@@ -15,15 +16,97 @@ ID="${1:-}"; shift || true
 BRIEF="${*:-}"
 NAME="${FACTORY_TARGET_NAME:-}"
 [[ -n "$NAME" ]] || die "set FACTORY_TARGET_NAME (target bare-origin name, e.g. animal-trendcast)"
-[[ -n "$BRIEF" || "${FACTORY_SKIP_CC_SPEC:-}" == "1" ]] || die "usage: factory-run-local <id> <brief...> (or FACTORY_SKIP_CC_SPEC=1)"
+RESUME="${FACTORY_RESUME:-}"
+if [[ "$RESUME" != "1" ]]; then
+  [[ -n "$BRIEF" || "${FACTORY_SKIP_CC_SPEC:-}" == "1" ]] || die "usage: factory-run-local <id> <brief...> (or FACTORY_SKIP_CC_SPEC=1)"
+fi
 WORK="${FACTORY_WORK_DIR:-$FACTORY_ROOT/local/work/${ID}}"
 MAX="${FACTORY_MAX_ROUNDS:-3}"
 RUN_DIR="${FACTORY_RUNS_DIR:-$FACTORY_ROOT/local/runs}/${ID}"
 mkdir -p "$RUN_DIR"
-STAGE=setup
+
+save_state() {
+  local exit_code="${1:-null}"
+  python3 - "$RUN_DIR/state.json" "$ID" "$NAME" "${STAGE:-setup}" "${ROUND:-0}" "${SHA:-}" "$exit_code" "${FACTORY_GROK_MODE:-}" "${FACTORY_GROK_STUB:-}" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from datetime import datetime, timezone
+
+path, run_id, target, stage, round_raw, sha, exit_raw, grok_mode, grok_stub = sys.argv[1:10]
+
+
+def optional(value):
+    return value if value else None
+
+
+doc = {
+    "id": run_id,
+    "target": target,
+    "stage": stage,
+    "round": int(round_raw or 0),
+    "sha": optional(sha),
+    "exit": None if exit_raw == "null" else int(exit_raw),
+    "grok_mode": optional(grok_mode),
+    "grok_stub": optional(grok_stub),
+    "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+}
+fd, tmp = tempfile.mkstemp(prefix=".state.json.", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, sort_keys=True)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+PY
+}
+
+state_field() {
+  python3 - "$RUN_DIR/state.json" "$1" <<'PY'
+import json
+import sys
+
+path, key = sys.argv[1:3]
+with open(path, encoding="utf-8") as fh:
+    value = json.load(fh).get(key)
+print("" if value is None else value)
+PY
+}
+
+RESUME_STAGE=""
+RESUME_ROUND=0
+RESUME_SHA=""
+if [[ "$RESUME" == "1" ]]; then
+  [[ -e "$WORK/.git" ]] || die "resume: no git work tree at $WORK"
+  [[ -f "$RUN_DIR/state.json" ]] || die "resume: missing $RUN_DIR/state.json"
+  RESUME_STAGE=$(state_field stage)
+  RESUME_ROUND=$(state_field round)
+  RESUME_SHA=$(state_field sha)
+  [[ "$RESUME_ROUND" =~ ^-?[0-9]+$ ]] || RESUME_ROUND=0
+fi
+
 # Default stub=pass for local auto tests; real Grok review: FACTORY_GROK_MODE=pending and unset FACTORY_GROK_STUB.
 if [[ -z "${FACTORY_GROK_MODE:-}" && -z "${FACTORY_GROK_STUB:-}" ]]; then
   export FACTORY_GROK_STUB=pass
+fi
+
+if [[ "$RESUME" == "1" ]]; then
+  STAGE="${RESUME_STAGE:-setup}"
+  save_state
+else
+  STAGE=setup
+  save_state
+fi
+if [[ "$RESUME" != "1" && -n "$BRIEF" ]]; then
+  printf '%s\n' "$BRIEF" > "$RUN_DIR/brief.txt"
 fi
 
 echo "=== factory-run-local id=$ID ==="
@@ -32,6 +115,7 @@ export FACTORY_USAGE_RUN_ID="$ID" FACTORY_TARGET_NAME="$NAME"
 RUN_T0=$(date +%s%3N)
 usage_finish() {
   local ec=$?
+  save_state "$ec" || true
   case $ec in 0|2|3|75) ;; *) factory-notify run-aborted "id=${ID} exit=${ec} round=${ROUND:-0} stage=${STAGE:-setup}" >/dev/null 2>&1 || true ;; esac
   local st; case $ec in 0) st=merged ;; 2) st=grok-pending ;; *) st="exit-$ec" ;; esac
   "$FACTORY_ROOT/bin/factory-usage" run-summary "$ID" --wall-ms $(( $(date +%s%3N) - RUN_T0 )) --status "$st" \
@@ -39,33 +123,55 @@ usage_finish() {
   "$FACTORY_ROOT/bin/factory-usage" balance --snapshot --quiet >/dev/null 2>&1 || true
 }
 trap usage_finish EXIT
-ORIGIN_BARE="${FACTORY_ORIGIN_ROOT:-$FACTORY_ROOT/local/origin}/${NAME}.git"
-# Never wipe an existing origin (init re-scaffolds). Force with FACTORY_ORIGIN_REINIT=1.
-if [[ ! -d "$ORIGIN_BARE" || "${FACTORY_ORIGIN_REINIT:-}" == "1" ]]; then
-  factory-local-origin init "$NAME" >/dev/null
+if [[ "$RESUME" != "1" ]]; then
+  ORIGIN_BARE="${FACTORY_ORIGIN_ROOT:-$FACTORY_ROOT/local/origin}/${NAME}.git"
+  # Never wipe an existing origin (init re-scaffolds). Force with FACTORY_ORIGIN_REINIT=1.
+  if [[ ! -d "$ORIGIN_BARE" || "${FACTORY_ORIGIN_REINIT:-}" == "1" ]]; then
+    factory-local-origin init "$NAME" >/dev/null
+  fi
+  factory-local-origin clone "$NAME" "$WORK" >/dev/null
 fi
-factory-local-origin clone "$NAME" "$WORK" >/dev/null
 cd "$WORK"
 
-if [[ "${FACTORY_SKIP_CC_SPEC:-}" != "1" ]]; then
-  echo "=== SPEC ==="
+SPEC_FROZEN=0
+if [[ "$RESUME" == "1" ]] && git -C "$WORK" rev-parse -q --verify "refs/tags/spec/${ID}" >/dev/null 2>&1; then
+  SPEC_FROZEN=1
+fi
+if [[ "$SPEC_FROZEN" != "1" ]]; then
+  if [[ "${FACTORY_SKIP_CC_SPEC:-}" != "1" ]]; then
+    echo "=== SPEC ==="
+    STAGE=spec
+    save_state
+    factory-stall-retry spec -- factory-spec-step "$WORK" "$ID" "$BRIEF"
+  else
+    STAGE=spec
+    save_state
+    git checkout -B "factory/${ID}"
+  fi
+
+  echo "=== FREEZE spec/${ID} (local auto-approve; see DECISIONS.md) ==="
   STAGE=spec
-  factory-stall-retry spec -- factory-spec-step "$WORK" "$ID" "$BRIEF"
-else
-  STAGE=spec
-  git checkout -B "factory/${ID}"
+  save_state
+  # Ensure protected paths committed
+  git add -A
+  git -c user.email=factory@localhost -c user.name=factory commit -m "factory(${ID}): spec freeze" || true
+  git tag -f "spec/${ID}"
+  git push origin "factory/${ID}" || true
+  git push origin "spec/${ID}" || true
 fi
 
-echo "=== FREEZE spec/${ID} (local auto-approve; see DECISIONS.md) ==="
-STAGE=spec
-# Ensure protected paths committed
-git add -A
-git -c user.email=factory@localhost -c user.name=factory commit -m "factory(${ID}): spec freeze" || true
-git tag -f "spec/${ID}"
-git push origin "factory/${ID}" || true
-git push origin "spec/${ID}" || true
-
-ROUND=0
+if [[ "$RESUME" == "1" ]]; then
+  ROUND=$(( ${RESUME_ROUND:-0} - 1 ))
+else
+  ROUND=0
+fi
+SKIP_TO_GATE=0
+if [[ "$RESUME" == "1" && "$RESUME_STAGE" == "gate-claude" ]]; then
+  HEAD_SHA=$(git -C "$WORK" rev-parse HEAD 2>/dev/null || true)
+  if [[ -n "$RESUME_SHA" && "$RESUME_SHA" == "$HEAD_SHA" ]]; then
+    SKIP_TO_GATE=1
+  fi
+fi
 while true; do
   ROUND=$((ROUND + 1))
   export FACTORY_USAGE_ROUND="$ROUND"
@@ -75,44 +181,53 @@ while true; do
     exit 3
   fi
   factory-labels set-round "$WORK" "$ID" "$ROUND" >/dev/null
-  echo "=== ROUND $ROUND IMPL ==="
-  STAGE=impl
-  IMPL_PROMPT="Implement per spec/PRODUCT.md; make acceptance tests pass; stdlib only. Do not modify spec/, tests/acceptance/, or .github/."
-  IMPL_PROMPT+="$(factory-feedback prompt "$ID" "$ROUND")"
-  factory-stall-retry impl -- factory-impl-step "$WORK" "$ID" "$IMPL_PROMPT"
-  SHA=$(git -C "$WORK" rev-parse HEAD)
-  git -C "$WORK" push origin "factory/${ID}" || true
-
-  echo "=== GUARD ==="
-  STAGE=guard
-  GUARD_LOG="$RUN_DIR/guard-r${ROUND}.log"
-  if factory-guard "$WORK" "$ID" >"$GUARD_LOG" 2>&1; then
-    cat "$GUARD_LOG"
-    factory-status set "$WORK" "$SHA" guard success "ok"
+  if [[ "$SKIP_TO_GATE" == "1" ]]; then
+    SKIP_TO_GATE=0
+    SHA=$(git -C "$WORK" rev-parse HEAD)
   else
-    cat "$GUARD_LOG"
-    factory-status set "$WORK" "$SHA" guard failure "protected paths changed"
-    echo "factory-run-local: guard failed round=$ROUND"
-    factory-feedback write "$ID" "$ROUND" guard "protected paths changed" "$GUARD_LOG"
-    continue
-  fi
+    echo "=== ROUND $ROUND IMPL ==="
+    STAGE=impl
+    save_state
+    IMPL_PROMPT="Implement per spec/PRODUCT.md; make acceptance tests pass; stdlib only. Do not modify spec/, tests/acceptance/, or .github/."
+    IMPL_PROMPT+="$(factory-feedback prompt "$ID" "$ROUND")"
+    factory-stall-retry impl -- factory-impl-step "$WORK" "$ID" "$IMPL_PROMPT"
+    SHA=$(git -C "$WORK" rev-parse HEAD)
+    git -C "$WORK" push origin "factory/${ID}" || true
 
-  echo "=== CI ==="
-  STAGE=ci
-  CI_LOG="$RUN_DIR/ci-r${ROUND}.log"
-  if factory-ci "$WORK" >"$CI_LOG" 2>&1; then
-    cat "$CI_LOG"
-    factory-status set "$WORK" "$SHA" ci success "ok"
-  else
-    cat "$CI_LOG"
-    factory-status set "$WORK" "$SHA" ci failure "tests failed"
-    echo "factory-run-local: ci failed round=$ROUND"
-    factory-feedback write "$ID" "$ROUND" ci "tests failed" "$CI_LOG"
-    continue
+    echo "=== GUARD ==="
+    STAGE=guard
+    save_state
+    GUARD_LOG="$RUN_DIR/guard-r${ROUND}.log"
+    if factory-guard "$WORK" "$ID" >"$GUARD_LOG" 2>&1; then
+      cat "$GUARD_LOG"
+      factory-status set "$WORK" "$SHA" guard success "ok"
+    else
+      cat "$GUARD_LOG"
+      factory-status set "$WORK" "$SHA" guard failure "protected paths changed"
+      echo "factory-run-local: guard failed round=$ROUND"
+      factory-feedback write "$ID" "$ROUND" guard "protected paths changed" "$GUARD_LOG"
+      continue
+    fi
+
+    echo "=== CI ==="
+    STAGE=ci
+    save_state
+    CI_LOG="$RUN_DIR/ci-r${ROUND}.log"
+    if factory-ci "$WORK" >"$CI_LOG" 2>&1; then
+      cat "$CI_LOG"
+      factory-status set "$WORK" "$SHA" ci success "ok"
+    else
+      cat "$CI_LOG"
+      factory-status set "$WORK" "$SHA" ci failure "tests failed"
+      echo "factory-run-local: ci failed round=$ROUND"
+      factory-feedback write "$ID" "$ROUND" ci "tests failed" "$CI_LOG"
+      continue
+    fi
   fi
 
   echo "=== GATE/CLAUDE ==="
   STAGE=gate-claude
+  save_state
   set +e
   factory-stall-retry gate-claude -- factory-gate-claude "$WORK" "$ID" "$SHA"
   GATE_EC=$?
@@ -139,6 +254,7 @@ while true; do
 
   echo "=== GATE/GROK ==="
   STAGE=gate-grok
+  save_state
   set +e
   factory-gate-grok "$WORK" "$ID" "$SHA"
   GROK_EC=$?
@@ -172,6 +288,7 @@ PY
 
   echo "=== MERGE ==="
   STAGE=merge
+  save_state
   factory-merge "$WORK" "$ID"
   factory-notify merged "id=${ID} sha=$SHA rounds=$ROUND"
   echo "factory-run-local: DONE merged id=$ID sha=$SHA rounds=$ROUND"

@@ -10,6 +10,7 @@ source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
 
 HOOK="${FACTORY_GROK_HOOK_DIR:-$FACTORY_ROOT/local/grok-hooks}"
 NOTIFY="${FACTORY_NOTIFY_DIR:-$FACTORY_ROOT/local/notify}"
+export FACTORY_ROOT
 
 exec python3 - "$HOOK" "$NOTIFY" "$@" <<'PY'
 import json
@@ -27,6 +28,7 @@ ATTENTION_KINDS = {
     "grok-rejected",
     "run-aborted",
     "gate-unavailable",
+    "update-deferred-repeated",
 }
 
 USAGE = (
@@ -70,6 +72,38 @@ def file_mtime(path):
         return os.path.getmtime(path)
     except OSError:
         return 0.0
+
+
+def as_int(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def iso_time(epoch):
+    return datetime.fromtimestamp(epoch).astimezone().isoformat(timespec="seconds")
+
+
+def read_json_object(path, label):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        warn(f"skipping {label}: {exc}")
+        return None
+    if not isinstance(record, dict):
+        warn(f"skipping {label}: not a JSON object")
+        return None
+    return record
 
 
 def read_acked(notify):
@@ -136,14 +170,8 @@ def pending_items(hook):
         path = os.path.join(hook, name)
         if not os.path.isfile(path):
             continue
-        try:
-            with open(path, encoding="utf-8") as handle:
-                record = json.load(handle)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            warn(f"skipping {name}: {exc}")
-            continue
-        if not isinstance(record, dict):
-            warn(f"skipping {name}: not a JSON object")
+        record = read_json_object(path, name)
+        if record is None:
             continue
         if record.get("mode") != "pending":
             continue
@@ -160,6 +188,7 @@ def pending_items(hook):
             "sha": sha,
             "bundle": as_text(record.get("bundle")),
             "age_sec": age,
+            "attention": True,
         }
         result = os.path.join(hook, f"result-{file_sha}.json")
         if os.path.isfile(result):
@@ -193,9 +222,9 @@ def notification_items(notify, include_all):
         item = read_notification(path, name)
         if item is None:
             continue
-        if not include_all:
-            if item["kind"] not in ATTENTION_KINDS or name in acked:
-                continue
+        item["attention"] = item["kind"] in ATTENTION_KINDS and name not in acked
+        if not include_all and not item["attention"]:
+            continue
         sort_time = parse_time(item["time"])
         if sort_time is None:
             sort_time = file_mtime(path)
@@ -203,8 +232,90 @@ def notification_items(notify, include_all):
     return items
 
 
-def collect(hook, notify, include_all=False):
-    items = pending_items(hook) + notification_items(notify, include_all)
+def provider_items(state_dir, now):
+    items = []
+    if not os.path.isdir(state_dir):
+        return items
+    try:
+        names = sorted(os.listdir(state_dir))
+    except OSError as exc:
+        warn(f"cannot read {state_dir}: {exc}")
+        return items
+
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(state_dir, name)
+        if not os.path.isfile(path):
+            continue
+        record = read_json_object(path, name)
+        if record is None:
+            continue
+        reset = as_int(record.get("reset_epoch"))
+        if reset is None or reset <= now:
+            continue
+        try:
+            until = iso_time(reset)
+        except (OverflowError, OSError, ValueError):
+            warn(f"skipping {name}: invalid reset_epoch")
+            continue
+        provider = as_text(record.get("provider")) or name[: -len(".json")]
+        item = {
+            "kind": "provider-limited",
+            "provider": provider,
+            "until": until,
+            "resume_in_sec": max(0, int(reset - now)),
+            "reason": as_text(record.get("reason")),
+            "attention": False,
+        }
+        items.append((reset, item))
+    return items
+
+
+def parked_items(runs_dir, provider_limited):
+    items = []
+    if not os.path.isdir(runs_dir):
+        return items
+    try:
+        names = sorted(os.listdir(runs_dir))
+    except OSError as exc:
+        warn(f"cannot read {runs_dir}: {exc}")
+        return items
+
+    for name in names:
+        run_dir = os.path.join(runs_dir, name)
+        if not os.path.isdir(run_dir):
+            continue
+        path = os.path.join(run_dir, "state.json")
+        if not os.path.isfile(path):
+            continue
+        record = read_json_object(path, os.path.join(name, "state.json"))
+        if record is None:
+            continue
+        if as_int(record.get("exit")) != 75:
+            continue
+        item = {
+            "kind": "run-parked",
+            "id": as_text(record.get("id")) or name,
+            "stage": as_text(record.get("stage")),
+            "round": record.get("round", 0),
+            "sha": as_text(record.get("sha")),
+            "action": "factory-resume",
+            "attention": not provider_limited,
+        }
+        items.append((file_mtime(path), item))
+    return items
+
+
+def collect(hook, notify, provider_state, runs, include_all=False):
+    now = time.time()
+    providers = provider_items(provider_state, now)
+    items = (
+        pending_items(hook)
+        + notification_items(notify, include_all)
+        + providers
+        + parked_items(runs, bool(providers))
+    )
     items.sort(key=lambda pair: pair[0])
     return [item for _, item in items]
 
@@ -214,8 +325,26 @@ def print_list(items, as_json):
         print(json.dumps(items, ensure_ascii=False))
         return
     for item in items:
+        kind = item.get("kind")
         if "file" in item:
             values = [item["kind"], item["time"], item["message"], item["file"]]
+        elif kind == "provider-limited":
+            values = [
+                item["kind"],
+                item["provider"],
+                item["until"],
+                item["resume_in_sec"],
+                item["reason"],
+            ]
+        elif kind == "run-parked":
+            values = [
+                item["kind"],
+                item["id"],
+                item["stage"],
+                item["round"],
+                item["sha"],
+                item["action"],
+            ]
         else:
             values = [
                 item["id"],
@@ -278,8 +407,19 @@ def ack(notify, names):
     return 0
 
 
+def attention_count(items):
+    return sum(1 for item in items if item.get("attention"))
+
+
 def main(argv):
     hook, notify = argv[1], argv[2]
+    root = os.environ.get("FACTORY_ROOT", "")
+    provider_state = os.environ.get(
+        "FACTORY_PROVIDER_STATE_DIR"
+    ) or os.path.join(root, "local", "status", "providers")
+    runs = os.environ.get("FACTORY_RUNS_DIR") or os.path.join(
+        root, "local", "runs"
+    )
     args = argv[3:]
     command = args[0] if args else ""
 
@@ -294,21 +434,23 @@ def main(argv):
             else:
                 print(USAGE, file=sys.stderr)
                 return 1
-        print_list(collect(hook, notify, include_all), as_json)
+        print_list(
+            collect(hook, notify, provider_state, runs, include_all), as_json
+        )
         return 0
 
     if command == "count":
         if len(args) != 1:
             print(USAGE, file=sys.stderr)
             return 1
-        print(len(collect(hook, notify)))
+        print(attention_count(collect(hook, notify, provider_state, runs)))
         return 0
 
     if command == "check":
         if len(args) != 1:
             print(USAGE, file=sys.stderr)
             return 1
-        count = len(collect(hook, notify))
+        count = attention_count(collect(hook, notify, provider_state, runs))
         print(count)
         return 10 if count else 0
 
