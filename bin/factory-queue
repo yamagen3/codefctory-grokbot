@@ -1,0 +1,442 @@
+#!/usr/bin/env bash
+# Persistent intake queue for code-cli runs.
+# Usage:
+#   factory-queue add <id> --target <name> [--grok-mode M | --grok-stub S] \
+#     (--brief-file F | -- <brief...>)
+#   factory-queue list [--json]
+#   factory-queue count
+#   factory-queue remove <id>
+#   factory-queue run-next
+#
+# Entries live in $FACTORY_QUEUE_DIR (default local/queue):
+#   pending/  waiting entries
+#   started/  entries handed to factory-run-local (one per run-next call)
+set -euo pipefail
+CALLER_PATH="${PATH:-}"
+source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
+# Keep the caller's PATH first so tests and hosts can stub provider/run hooks.
+if [[ -n "$CALLER_PATH" ]]; then
+  export PATH="$CALLER_PATH:$PATH"
+fi
+unset CALLER_PATH
+exec python3 - "$@" <<'PY'
+import fcntl
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+USAGE = (
+    "usage: factory-queue add <id> --target <name> "
+    "[--grok-mode M | --grok-stub S] (--brief-file F | -- <brief...>) | "
+    "list [--json] | count | remove <id> | run-next"
+)
+
+
+def warn(message):
+    print("factory-queue: {}".format(message), file=sys.stderr)
+
+
+def usage_error(message=None):
+    if message:
+        warn(message)
+    print(USAGE, file=sys.stderr)
+    return 2
+
+
+def fail(message):
+    warn(message)
+    return 1
+
+
+def root_dir():
+    raw = os.environ.get("FACTORY_ROOT")
+    if raw:
+        return Path(raw)
+    return Path.cwd()
+
+
+def queue_dir():
+    raw = os.environ.get("FACTORY_QUEUE_DIR")
+    if raw:
+        return Path(raw).expanduser()
+    return root_dir() / "local" / "queue"
+
+
+def runs_dir():
+    raw = os.environ.get("FACTORY_RUNS_DIR")
+    if raw:
+        return Path(raw).expanduser()
+    return root_dir() / "local" / "runs"
+
+
+def id_from_name(name):
+    stem = name[:-5] if name.endswith(".json") else name
+    parts = stem.split("-", 1)
+    return parts[1] if len(parts) == 2 else stem
+
+
+def read_entry(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        warn("skipping {}: {}".format(path, exc))
+        return None
+    if not isinstance(doc, dict):
+        warn("skipping {}: not a JSON object".format(path))
+        return None
+    return doc
+
+
+def entries(directory):
+    found = []
+    if not directory.is_dir():
+        return found
+    try:
+        paths = sorted(directory.iterdir())
+    except OSError as exc:
+        warn("cannot read {}: {}".format(directory, exc))
+        return found
+    for path in paths:
+        if not path.name.endswith(".json") or not path.is_file():
+            continue
+        doc = read_entry(path)
+        if doc is not None:
+            found.append((path, doc))
+    return found
+
+
+def queued_epoch(path, doc):
+    value = doc.get("queued_at")
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except ValueError:
+            pass
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def mtime_ns(path):
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def sorted_entries(directory):
+    return sorted(
+        entries(directory),
+        key=lambda pair: (queued_epoch(pair[0], pair[1]), mtime_ns(pair[0]), pair[0].name),
+    )
+
+
+def entry_id(path, doc):
+    value = doc.get("id")
+    if isinstance(value, str) and value:
+        return value
+    return id_from_name(path.name)
+
+
+def write_entry(queue, doc):
+    pending = queue / "pending"
+    pending.mkdir(parents=True, exist_ok=True)
+    (queue / "started").mkdir(parents=True, exist_ok=True)
+    queued = doc.get("queued_at")
+    try:
+        parsed = datetime.fromisoformat(str(queued).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        stamp = parsed.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    except (TypeError, ValueError):
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    destination = pending / "{}-{}.json".format(stamp, doc["id"])
+    fd, tmp = tempfile.mkstemp(prefix=".queue-entry.", dir=str(pending))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, destination)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def cmd_add(args):
+    if not args:
+        return usage_error()
+    run_id = args[0]
+    rest = args[1:]
+    if not ID_RE.match(run_id):
+        return fail("invalid id: {!r}".format(run_id))
+
+    target = None
+    brief_file = None
+    brief_words = None
+    grok_mode = None
+    grok_stub = None
+    i = 0
+    while i < len(rest):
+        arg = rest[i]
+        if arg == "--target":
+            if i + 1 >= len(rest):
+                return usage_error("--target needs a value")
+            target = rest[i + 1]
+            i += 2
+        elif arg == "--grok-mode":
+            if i + 1 >= len(rest):
+                return usage_error("--grok-mode needs a value")
+            grok_mode = rest[i + 1]
+            i += 2
+        elif arg == "--grok-stub":
+            if i + 1 >= len(rest):
+                return usage_error("--grok-stub needs a value")
+            grok_stub = rest[i + 1]
+            i += 2
+        elif arg == "--brief-file":
+            if i + 1 >= len(rest):
+                return usage_error("--brief-file needs a value")
+            brief_file = rest[i + 1]
+            i += 2
+        elif arg == "--":
+            brief_words = rest[i + 1 :]
+            i = len(rest)
+        else:
+            return usage_error("unexpected argument: {}".format(arg))
+
+    if target is None or target == "":
+        return usage_error("--target is required")
+    if grok_mode is not None and grok_stub is not None:
+        return usage_error("--grok-mode and --grok-stub are mutually exclusive")
+    if grok_mode is not None and grok_mode == "":
+        return usage_error("--grok-mode needs a non-empty value")
+    if grok_stub is not None and grok_stub == "":
+        return usage_error("--grok-stub needs a non-empty value")
+    if brief_file is not None and brief_words is not None:
+        return usage_error("--brief-file and -- are mutually exclusive")
+    if brief_file is None and brief_words is None:
+        return usage_error("one of --brief-file or -- <brief...> is required")
+
+    if brief_file is not None:
+        try:
+            brief = Path(brief_file).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            return fail("cannot read brief file {}: {}".format(brief_file, exc))
+    else:
+        brief = " ".join(brief_words)
+
+    queue = queue_dir()
+    for subdir in ("pending", "started"):
+        for path, doc in entries(queue / subdir):
+            if entry_id(path, doc) == run_id or id_from_name(path.name) == run_id:
+                return fail("id {} is already in {}/".format(run_id, subdir))
+    state = runs_dir() / run_id / "state.json"
+    if state.exists():
+        return fail("id {} already has {}".format(run_id, state))
+
+    now = datetime.now(timezone.utc)
+    if grok_mode is None and grok_stub is None:
+        grok_mode = "pending"
+    doc = {
+        "schema": 1,
+        "id": run_id,
+        "kind": "code-cli",
+        "target": target,
+        "brief": brief,
+        "grok_mode": grok_mode,
+        "grok_stub": grok_stub,
+        "queued_at": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    write_entry(queue, doc)
+    return 0
+
+
+def cmd_list(args):
+    as_json = False
+    for arg in args:
+        if arg == "--json":
+            as_json = True
+        else:
+            return usage_error("unexpected argument: {}".format(arg))
+    items = [doc for _path, doc in sorted_entries(queue_dir() / "pending")]
+    if as_json:
+        print(json.dumps(items, ensure_ascii=False, sort_keys=True))
+        return 0
+    for doc in items:
+        values = [
+            str(doc.get("id", "")),
+            str(doc.get("target", "")),
+            str(doc.get("queued_at", "")),
+            "" if doc.get("grok_mode") is None else str(doc.get("grok_mode")),
+            "" if doc.get("grok_stub") is None else str(doc.get("grok_stub")),
+        ]
+        cells = [
+            value.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+            for value in values
+        ]
+        print("\t".join(cells))
+    return 0
+
+
+def cmd_count(args):
+    if args:
+        return usage_error("count takes no arguments")
+    print(len(entries(queue_dir() / "pending")))
+    return 0
+
+
+def cmd_remove(args):
+    if len(args) != 1:
+        return usage_error("remove <id>")
+    run_id = args[0]
+    if not ID_RE.match(run_id):
+        return fail("invalid id: {!r}".format(run_id))
+    queue = queue_dir()
+    matches = [
+        path
+        for path, doc in entries(queue / "pending")
+        if entry_id(path, doc) == run_id or id_from_name(path.name) == run_id
+    ]
+    if matches:
+        for path in matches:
+            try:
+                path.unlink()
+            except OSError as exc:
+                return fail("cannot remove {}: {}".format(path, exc))
+        return 0
+    started = [
+        path
+        for path, doc in entries(queue / "started")
+        if entry_id(path, doc) == run_id or id_from_name(path.name) == run_id
+    ]
+    if started:
+        return fail("id {} is started; only pending entries can be removed".format(run_id))
+    return fail("no pending entry: {}".format(run_id))
+
+
+def provider_check_argv():
+    raw = os.environ.get("FACTORY_QUEUE_PROVIDER_CMD") or os.environ.get(
+        "FACTORY_QUEUE_PROVIDER_CHECK_CMD"
+    )
+    if raw:
+        return shlex.split(raw)
+    return ["factory-provider-state", "check", "claude-code"]
+
+
+def run_argv():
+    raw = os.environ.get("FACTORY_QUEUE_RUN_CMD") or "factory-run-local"
+    argv = shlex.split(raw)
+    return argv or ["factory-run-local"]
+
+
+def check_provider():
+    argv = provider_check_argv()
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as exc:
+        warn("provider check failed: {}".format(exc))
+        return 0
+    if proc.returncode != 75:
+        return 0
+    sys.stdout.write(proc.stdout)
+    if proc.stdout and not proc.stdout.endswith("\n"):
+        sys.stdout.write("\n")
+    sys.stderr.write(proc.stderr)
+    return 75
+
+
+def cmd_run_next(args):
+    # Equivalent to flock -n on <queue>/.lock: a held lock means another
+    # run-next call owns the queue, so this call is a quiet no-op.
+    if args:
+        return usage_error("run-next takes no arguments")
+    queue = queue_dir()
+    queue.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(str(queue / ".lock"), os.O_CREAT | os.O_RDWR, 0o666)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+
+        pending = sorted_entries(queue / "pending")
+        if not pending:
+            return 0
+        if check_provider() == 75:
+            return 75
+
+        path, entry = pending[0]
+        run_id = entry_id(path, entry)
+        target = "" if entry.get("target") is None else str(entry.get("target"))
+        brief = "" if entry.get("brief") is None else str(entry.get("brief"))
+
+        started = queue / "started"
+        started.mkdir(parents=True, exist_ok=True)
+        os.replace(path, started / path.name)
+
+        env = os.environ.copy()
+        env.pop("FACTORY_GROK_MODE", None)
+        env.pop("FACTORY_GROK_STUB", None)
+        env["FACTORY_TARGET_NAME"] = target
+        mode = entry.get("grok_mode")
+        stub = entry.get("grok_stub")
+        if isinstance(mode, str) and mode:
+            env["FACTORY_GROK_MODE"] = mode
+        elif isinstance(stub, str) and stub:
+            env["FACTORY_GROK_STUB"] = stub
+        else:
+            # Never let factory-run-local fall back to its stub=pass default.
+            env["FACTORY_GROK_MODE"] = "pending"
+
+        argv = run_argv() + [run_id, brief]
+        try:
+            ec = subprocess.run(argv, env=env, stdout=sys.stderr, stderr=sys.stderr).returncode
+        except OSError as exc:
+            warn("run command failed to start: {}".format(exc))
+            ec = 127
+        print("started {} exit={}".format(run_id, ec))
+        return 0
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(lock_fd)
+
+
+def main(argv):
+    if len(argv) < 2:
+        return usage_error()
+    command, args = argv[1], argv[2:]
+    handlers = {
+        "add": cmd_add,
+        "list": cmd_list,
+        "count": cmd_count,
+        "remove": cmd_remove,
+        "run-next": cmd_run_next,
+    }
+    handler = handlers.get(command)
+    if handler is None:
+        return usage_error("unknown command: {}".format(command))
+    return handler(args)
+
+
+sys.exit(main(sys.argv))
+PY

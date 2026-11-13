@@ -257,7 +257,7 @@ PY
     fi
   fi
   if [[ "$attempts" -ge "$MAX_ATTEMPTS" ]]; then
-    python3 - "$state_path" <<'PY'
+    if ! python3 - "$state_path" <<'PY'
 import json
 import os
 import sys
@@ -282,6 +282,9 @@ except Exception:
         pass
     raise
 PY
+    then
+      echo "factory-resume: WARN could not mark $id as exit 1 in $state_path; continuing" >&2
+    fi
     exec 9>&-
     echo "gave-up $id attempts=$attempts"
     factory-notify run-aborted "id=${id} resume limit stage=${locked_stage} attempts=${attempts}" || true
@@ -313,29 +316,44 @@ PY
   FACTORY_RESUME=1 factory-run-local "$id" "$(cat "$run_dir/brief.txt" 2>/dev/null)"
   ec=$?
   set -e
-  if [[ "$ec" -ne 75 ]]; then
-    rm -f "$attempt_path"
-  else
-    set +e
-    "$PS" check claude-code >/dev/null 2>&1
-    provider_ec=$?
-    set -e
-    if [[ "$provider_ec" -eq 75 ]]; then
-      current_raw="$(cat "$attempt_path" 2>/dev/null || true)"
-      current_raw="${current_raw//[[:space:]]/}"
-      current="$attempts"
-      if [[ "$current_raw" =~ ^[0-9]+$ ]]; then
-        current=$((10#$current_raw))
-      fi
-      if [[ "$current" -gt 0 ]]; then
-        current=$((current - 1))
-        if [[ "$current" -eq 0 ]]; then
-          rm -f "$attempt_path"
-        else
-          printf '%s\n' "$current" > "$attempt_path"
+  # A resume can die before it saves state (for example, a missing work tree),
+  # leaving the parked exit 75 behind. Only clear the attempt when the saved
+  # exit proves the run actually left the parked state.
+  if saved_exit=$(python3 - "$state_path" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    value = json.load(fh).get("exit")
+print("" if value is None else value)
+PY
+  ); then
+    if [[ "$saved_exit" == "75" ]]; then
+      set +e
+      "$PS" check claude-code >/dev/null 2>&1
+      provider_ec=$?
+      set -e
+      if [[ "$provider_ec" -eq 75 ]]; then
+        current_raw="$(cat "$attempt_path" 2>/dev/null || true)"
+        current_raw="${current_raw//[[:space:]]/}"
+        current="$attempts"
+        if [[ "$current_raw" =~ ^[0-9]+$ ]]; then
+          current=$((10#$current_raw))
+        fi
+        if [[ "$current" -gt 0 ]]; then
+          current=$((current - 1))
+          if [[ "$current" -eq 0 ]]; then
+            rm -f "$attempt_path"
+          else
+            printf '%s\n' "$current" > "$attempt_path"
+          fi
         fi
       fi
+    else
+      rm -f "$attempt_path"
     fi
+  else
+    echo "factory-resume: WARN could not read exit from $state_path; keeping resume-attempts" >&2
   fi
   echo "resumed $id exit=$ec"
   exec 9>&-

@@ -2,7 +2,9 @@
 
 A model profile is one JSON record of the brain model, the maker model, the loop limits, the gates, and the prompt files that are tuned to them. It exists so a configuration can be named and checked without editing eight files by eye.
 
-**The profile is descriptive in this step.** No script reads it to set a model, effort, round limit, or prompt. Behaviour is byte-identical to the configuration before profiles existed. Wiring scripts to consume the profile, and any second profile, are later steps and need an owner decision.
+**The profile is enforced at run start and recorded in this step.** `factory-doctor` reports profile drift, and `factory-run-local` reads the active profile id and runs `factory-profile check` before any step. A run whose profile does not match the live configuration exits 1 before doing work, and a resume is refused when its saved profile differs from the active one. The id is recorded in `state.json` and in usage step and run records.
+
+**The profile is still not read for values.** No script reads it to set a model, effort, round limit, or prompt; those values continue to come from the live files. With the matching default profile, behaviour is byte-identical to the configuration before profiles existed. Wiring scripts to consume profile values, and any second profile, are later steps and need an owner decision.
 
 **Adding or switching a profile is an owner decision.** Prompts, effort, gate rules, round limits, and parallelism are tuned together to the brain model. A profile is not a one-line model switch, and a new profile does not by itself change how the factory runs.
 
@@ -39,19 +41,20 @@ factory-profile check
 
 ### `check`
 
-`check` compares the selected profile with the live files and prints one line per mismatch, naming the profile key. It exits 1 when anything drifted and prints `ok` when the profile matches.
+`check` compares the selected profile with the live files and prints one line per mismatch, naming the profile key. It exits 1 when anything drifted and prints `ok` when the profile matches. Pinned values are matched with anchored patterns, not loose substrings, so a prefix or a longer value does not pass.
 
 | Profile key | File | Expected live text |
 |---|---|---|
-| `brain.model` | `config/factory.patch.yml` | `model: <brain.model>` |
-| `brain.effort` | `config/factory.patch.yml` | `CLAUDE_CODE_EFFORT_LEVEL: '<brain.effort>'` |
-| `brain.step_timeout_ms` | `config/factory.patch.yml` | `timeoutMs: <brain.step_timeout_ms>` |
+| `brain.model` | `config/factory.patch.yml` | a line matching `^\s*model: <brain.model>\s*$` |
+| `brain.effort` | `config/factory.patch.yml` | a line with `CLAUDE_CODE_EFFORT_LEVEL: '<brain.effort>'` |
+| `brain.effort` | `lib/factory_usage.py` | `"FACTORY_CC_EXPECT_EFFORT", "<brain.effort>"` |
+| `brain.step_timeout_ms` | `config/factory.patch.yml` | a line matching `timeoutMs: <brain.step_timeout_ms>\s*$` |
 | `maker.model` | `bin/factory-common.sh` | `"model": "<maker.model>"` |
 | `maker.reasoning_effort` | `bin/factory-common.sh` | `"reasoningEffort": "<maker.reasoning_effort>"` |
-| `brain.spec_goal_turns` | `bin/factory-common.sh` | `FACTORY_CC_GOAL_TURNS:-<brain.spec_goal_turns>` |
-| `loop.max_rounds` | `bin/factory-run-local` | `FACTORY_MAX_ROUNDS:-<loop.max_rounds>` |
-| `loop.stall_timeout_sec` | `bin/factory-stall-retry` | `FACTORY_STALL_TIMEOUT_SEC:-<loop.stall_timeout_sec>` |
-| `maker.parallel_default` | `bin/factory-impl-step` | `PARALLEL=<maker.parallel_default>` |
+| `brain.spec_goal_turns` | `bin/factory-common.sh` | `FACTORY_CC_GOAL_TURNS:-<brain.spec_goal_turns>}` |
+| `loop.max_rounds` | `bin/factory-run-local` | `FACTORY_MAX_ROUNDS:-<loop.max_rounds>}` |
+| `loop.stall_timeout_sec` | `bin/factory-stall-retry` | `FACTORY_STALL_TIMEOUT_SEC:-<loop.stall_timeout_sec>}` |
+| `maker.parallel_default` | `bin/factory-impl-step` | every standalone `PARALLEL=<maker.parallel_default>` default line |
 | `maker.parallel_max` | `bin/factory-impl-step` | `-gt <maker.parallel_max>` |
 | `prompts.spec` | `prompts.spec.file` | anchor present |
 | `prompts.gate_claude` | `prompts.gate_claude.file` | anchor present |

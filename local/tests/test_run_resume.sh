@@ -604,6 +604,51 @@ run_resume r6e FACTORY_NOTIFY_FAIL=1
 assert_state "$T/runs-r6e/o1" exit "137"
 assert_state "$T/runs-r6e/o2" exit "137"
 
+echo "=== (r7-a) a resume that dies before saving state still counts as an attempt ==="
+write_provider ok
+run_factory r7a FACTORY_SKIP_CC_SPEC=1 GATE_CLAUDE_CODES="75 75"
+[[ "$RUN_RC" -eq 75 ]] || fail "r7-a: initial exit $RUN_RC, want 75: $(cat "$T/log-r7a")"
+assert_state "$RUN_RUNS/r7a" stage "gate-claude"
+assert_state "$RUN_RUNS/r7a" exit "75"
+rm -rf "$T/work-r7a"
+for attempt in 1 2; do
+  run_resume r7a FACTORY_RESUME_MAX_ATTEMPTS=2
+  [[ "$RESUME_RC" -eq 0 ]] || fail "r7-a: attempt $attempt exit $RESUME_RC, want 0: $(cat "$T/resume-r7a.log")"
+  grep -q '^resumed r7a exit=1$' "$T/resume-r7a.log" \
+    || fail "r7-a: attempt $attempt did not report the early exit"
+  [[ -f "$RUN_RUNS/r7a/resume-attempts" ]] \
+    || fail "r7-a: attempt $attempt removed resume-attempts"
+  [[ "$(cat "$RUN_RUNS/r7a/resume-attempts")" -eq "$attempt" ]] \
+    || fail "r7-a: attempt file is $(cat "$RUN_RUNS/r7a/resume-attempts"), want $attempt"
+  assert_state "$RUN_RUNS/r7a" exit "75"
+done
+[[ "$(notify_count "$T/notify-r7a" run-aborted)" -eq 0 ]] \
+  || fail "r7-a: an early exit sent run-aborted"
+run_resume r7a FACTORY_RESUME_MAX_ATTEMPTS=2
+[[ "$RESUME_RC" -eq 0 ]] || fail "r7-a: gave-up exit $RESUME_RC, want 0: $(cat "$T/resume-r7a.log")"
+grep -q '^gave-up r7a attempts=2$' "$T/resume-r7a.log" || fail "r7-a: missing gave-up line"
+if grep -q '^resumed r7a ' "$T/resume-r7a.log"; then
+  fail "r7-a: resumed past the attempt cap"
+fi
+assert_state "$RUN_RUNS/r7a" exit "1"
+assert_state "$RUN_RUNS/r7a" stage "gate-claude"
+[[ "$(cat "$RUN_RUNS/r7a/resume-attempts")" -eq 2 ]] \
+  || fail "r7-a: gave-up changed resume-attempts"
+[[ "$(notify_count "$T/notify-r7a" run-aborted)" -eq 1 ]] \
+  || fail "r7-a: run-aborted count is $(notify_count "$T/notify-r7a" run-aborted), want 1"
+
+echo "=== (r7-b) a successful resume still removes resume-attempts ==="
+write_provider ok
+run_factory r7b FACTORY_SKIP_CC_SPEC=1 GATE_CLAUDE_CODES="75 75"
+[[ "$RUN_RC" -eq 75 ]] || fail "r7-b: initial exit $RUN_RC, want 75: $(cat "$T/log-r7b")"
+printf '1\n' > "$RUN_RUNS/r7b/resume-attempts"
+GATE_CODES_RESUME=0 run_resume r7b FACTORY_RESUME_MAX_ATTEMPTS=5
+[[ "$RESUME_RC" -eq 0 ]] || fail "r7-b: resume exit $RESUME_RC, want 0: $(cat "$T/resume-r7b.log")"
+grep -q '^resumed r7b exit=0$' "$T/resume-r7b.log" || fail "r7-b: missing resumed line"
+[[ ! -e "$RUN_RUNS/r7b/resume-attempts" ]] \
+  || fail "r7-b: resume-attempts survived a completed resume"
+assert_state "$RUN_RUNS/r7b" exit "0"
+
 echo "=== (h) existing run-local tests still pass ==="
 env -u FACTORY_ROOT -u FACTORY_RUNS_DIR -u FACTORY_NOTIFY_DIR -u FACTORY_WORK_DIR \
   -u FACTORY_RESUME -u FACTORY_PROVIDER_STATE_DIR -u FACTORY_MAX_ROUNDS \

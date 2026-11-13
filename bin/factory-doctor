@@ -35,6 +35,19 @@ PATCH_YML="$FACTORY_ROOT/config/factory.patch.yml"
 grep -qE '^\s*model: claude-opus-5-5\s*$' "$PATCH_YML" && ok "CC model pin claude-opus-5-5" || warn "CC model pin claude-opus-5-5 missing in factory.patch.yml"
 grep -q "CLAUDE_CODE_EFFORT_LEVEL: 'xhigh'" "$PATCH_YML" && ok "CC effort pin xhigh" || warn "CC effort pin xhigh missing in factory.patch.yml"
 [[ -f "$CC_JS" ]] && { grep -q 'claude-agent-sdk.init' "$CC_JS" && ok "CC init capture (effective model/effort) patch" || warn "CC init capture patch missing (run factory-setup)"; }
+# Model profile drift. The profile loader is read-only and never starts a model.
+PROFILE_ID="$("$FACTORY_ROOT/bin/factory-profile" id 2>/dev/null || true)"
+if PROFILE_CHECK="$("$FACTORY_ROOT/bin/factory-profile" check 2>&1)"; then
+  ok "model profile ${PROFILE_ID:-unknown} matches live configuration"
+else
+  profile_detail=0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    bad "model profile ${PROFILE_ID:-unknown}: $line"
+    profile_detail=1
+  done <<<"$PROFILE_CHECK"
+  [[ "$profile_detail" -eq 1 ]] || bad "model profile ${PROFILE_ID:-unknown} check failed with no detail"
+fi
 [[ -f "$FACTORY_ROOT/plugin/cc-allowlist/allowlist.js" ]] && ok "allowlist.js" || bad "allowlist.js missing"
 if [[ -d "$FACTORY_ROOT/plugin/node_modules/@deepseek-ai/schemastery" ]]; then
   ok "plugin deps (@deepseek-ai/schemastery)"

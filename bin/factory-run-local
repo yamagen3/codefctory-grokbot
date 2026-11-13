@@ -22,6 +22,7 @@ if [[ "$RESUME" != "1" ]]; then
 fi
 WORK="${FACTORY_WORK_DIR:-$FACTORY_ROOT/local/work/${ID}}"
 MAX="${FACTORY_MAX_ROUNDS:-3}"
+PROFILE=""
 RUN_DIR="${FACTORY_RUNS_DIR:-$FACTORY_ROOT/local/runs}/${ID}"
 mkdir -p "$RUN_DIR"
 exec 8>"$RUN_DIR/.run.lock"
@@ -31,15 +32,15 @@ if ! flock -n 8; then
 fi
 
 save_state() {
-  local exit_code="${1:-null}"
-  python3 - "$RUN_DIR/state.json" "$ID" "$NAME" "${STAGE:-setup}" "${ROUND:-0}" "${SHA:-}" "$exit_code" "${FACTORY_GROK_MODE:-}" "${FACTORY_GROK_STUB:-}" "$WORK" "$MAX" <<'PY'
+  local exit_code="${1:-null}" profile="${2-${PROFILE:-}}"
+  python3 - "$RUN_DIR/state.json" "$ID" "$NAME" "${STAGE:-setup}" "${ROUND:-0}" "${SHA:-}" "$exit_code" "${FACTORY_GROK_MODE:-}" "${FACTORY_GROK_STUB:-}" "$WORK" "$MAX" "$profile" <<'PY'
 import json
 import os
 import sys
 import tempfile
 from datetime import datetime, timezone
 
-path, run_id, target, stage, round_raw, sha, exit_raw, grok_mode, grok_stub, work, max_raw = sys.argv[1:12]
+path, run_id, target, stage, round_raw, sha, exit_raw, grok_mode, grok_stub, work, max_raw, profile = sys.argv[1:13]
 
 
 def optional(value):
@@ -57,6 +58,7 @@ doc = {
     "grok_stub": optional(grok_stub),
     "work": optional(work),
     "max_rounds": int(max_raw or 0),
+    "profile": optional(profile),
     "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
 }
 fd, tmp = tempfile.mkstemp(prefix=".state.json.", dir=os.path.dirname(path))
@@ -91,12 +93,15 @@ PY
 RESUME_STAGE=""
 RESUME_ROUND=0
 RESUME_SHA=""
+RESUME_PROFILE=""
 if [[ "$RESUME" == "1" ]]; then
   [[ -e "$WORK/.git" ]] || die "resume: no git work tree at $WORK"
   [[ -f "$RUN_DIR/state.json" ]] || die "resume: missing $RUN_DIR/state.json"
   RESUME_STAGE=$(state_field stage)
   RESUME_ROUND=$(state_field round)
   RESUME_SHA=$(state_field sha)
+  RESUME_PROFILE=$(state_field profile)
+  PROFILE="$RESUME_PROFILE"
   [[ "$RESUME_ROUND" =~ ^-?[0-9]+$ ]] || RESUME_ROUND=0
 fi
 
@@ -132,6 +137,40 @@ usage_finish() {
   "$FACTORY_ROOT/bin/factory-usage" balance --snapshot --quiet >/dev/null 2>&1 || true
 }
 trap usage_finish EXIT
+
+# A selected model profile is enforced at run start. Fake roots in older tests
+# have neither the loader nor profiles/, so they keep the null-profile path.
+if [[ -x "$FACTORY_ROOT/bin/factory-profile" && -d "$FACTORY_ROOT/profiles" ]]; then
+  _factory_profile_id_out=""
+  _factory_profile_check_out=""
+  _factory_profile_id_rc=0
+  _factory_profile_check_rc=0
+  _factory_profile_id_out=$("$FACTORY_ROOT/bin/factory-profile" id 2>&1) || _factory_profile_id_rc=$?
+  _factory_profile_check_out=$("$FACTORY_ROOT/bin/factory-profile" check 2>&1) || _factory_profile_check_rc=$?
+  if [[ "$_factory_profile_id_rc" -ne 0 || "$_factory_profile_check_rc" -ne 0 ]]; then
+    [[ -n "$_factory_profile_id_out" ]] && printf '%s\n' "$_factory_profile_id_out" >&2
+    [[ -n "$_factory_profile_check_out" ]] && printf '%s\n' "$_factory_profile_check_out" >&2
+    echo "factory-run-local: profile does not match the live configuration; switching profiles is not wired" >&2
+    exit 1
+  fi
+  PROFILE="$_factory_profile_id_out"
+  export FACTORY_MODEL_PROFILE_ID="$PROFILE"
+  if [[ "$RESUME" == "1" ]]; then
+    SAVED_PROFILE=$(state_field profile)
+    if [[ -n "$SAVED_PROFILE" && "$SAVED_PROFILE" != "$PROFILE" ]]; then
+      echo "factory-run-local: saved profile ${SAVED_PROFILE} differs from active profile ${PROFILE}" >&2
+      echo "factory-run-local: profile does not match the live configuration; switching profiles is not wired" >&2
+      PROFILE="$SAVED_PROFILE"
+      exit 1
+    fi
+  fi
+  save_state
+else
+  # No loader/profiles tree: the profile is null and the run is unchanged.
+  PROFILE=""
+  unset FACTORY_MODEL_PROFILE_ID
+fi
+
 if [[ "$RESUME" != "1" ]]; then
   ORIGIN_BARE="${FACTORY_ORIGIN_ROOT:-$FACTORY_ROOT/local/origin}/${NAME}.git"
   # Never wipe an existing origin (init re-scaffolds). Force with FACTORY_ORIGIN_REINIT=1.

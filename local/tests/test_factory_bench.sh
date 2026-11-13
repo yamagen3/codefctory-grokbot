@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# factory-bench: validate the seed tasks and score stub results offline.
+# factory-bench: validate tasks, collect stub runs, and score stub results offline.
 # No model, network, dsh, claude, opencode, or gh calls.
 set -euo pipefail
 
@@ -161,5 +161,248 @@ echo "=== (h) malformed result JSON exits 2 ==="
 score stub-malformed
 [[ "$SCORE_RC" -eq 2 ]] || fail "(h) score exit $SCORE_RC, want 2"
 grep -qi "invalid JSON" "$SCORE_ERR" || fail "(h) malformed JSON not reported: $(cat "$SCORE_ERR")"
+
+TASK_ID=$(python3 -c 'import json, pathlib, sys
+print(json.loads(sorted(pathlib.Path(sys.argv[1]).glob("*/task.json"))[0].read_text())["id"])' "$TASKS")
+
+COLLECT="$T/collect"
+RUNS="$COLLECT/runs"
+USAGE="$COLLECT/usage"
+RESULTS="$T/results"
+mkdir -p "$RUNS" "$USAGE/2026-01-01" "$USAGE/2026-01-02"
+
+python3 - "$RUNS" "$USAGE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+runs = Path(sys.argv[1])
+usage = Path(sys.argv[2])
+
+
+def state(run_id, **overrides):
+    directory = runs / run_id
+    directory.mkdir(parents=True, exist_ok=True)
+    doc = {
+        "id": run_id,
+        "target": "bench",
+        "stage": "merge",
+        "round": 1,
+        "sha": "abc",
+        "exit": 0,
+        "grok_mode": None,
+        "grok_stub": None,
+        "work": None,
+        "max_rounds": 3,
+        "updated_at": "2026-01-01T00:00:00+00:00",
+    }
+    doc.update(overrides)
+    (directory / "state.json").write_text(
+        json.dumps(doc, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def feedback(run_id, round_number, stage):
+    directory = runs / run_id
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"feedback-r{round_number}.md").write_text(
+        f"# Round {round_number} failed at {stage}\n"
+        "summary: stub\n",
+        encoding="utf-8",
+    )
+
+
+def append(kind, day, records):
+    directory = usage / day
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / f"{kind}.jsonl").open("a", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+
+state("run-merged", round=2, profile="bench-profile")
+feedback("run-merged", 1, "gate-claude")
+append("steps", "2026-01-01", [
+    {"run_id": "run-merged", "provider": "claude-code", "step": "spec",
+     "cost_usd_estimate": 0.25, "total_tokens": 7},
+    {"run_id": "run-merged", "provider": "opencode", "step": "impl",
+     "total_tokens": 1000},
+    {"run_id": "other-run", "provider": "claude-code", "step": "spec",
+     "cost_usd_estimate": 9.0},
+])
+append("steps", "2026-01-02", [
+    {"run_id": "run-merged", "provider": "claude-code",
+     "step": "gate-claude", "cost_usd_estimate": 0.5},
+    {"run_id": "run-merged", "provider": "opencode", "step": "impl",
+     "total_tokens": 500},
+])
+append("runs", "2026-01-01", [
+    {"run_id": "run-merged", "wall_ms": 1000},
+    {"run_id": "other-run", "wall_ms": 9999},
+])
+append("runs", "2026-01-02", [{"run_id": "run-merged", "wall_ms": 2500}])
+
+state("run-max", profile="bench-max", exit=3, stage="ci")
+feedback("run-max", 1, "ci")
+
+state("run-parked", profile="bench-parked", exit=75, stage="gate-claude")
+
+state("run-unfinished", profile="bench-unfinished", exit=2, stage="gate-grok")
+feedback("run-unfinished", 1, "gate-grok")
+
+state("run-noprofile", stage="merge")
+
+state("run-checks", profile="bench-checks")
+
+state("run-nocost", profile="bench-nocost")
+append("steps", "2026-01-02", [
+    {"run_id": "run-nocost", "provider": "claude-code", "step": "spec"},
+    {"run_id": "run-nocost", "provider": "opencode", "step": "impl"},
+])
+PY
+
+echo "=== collect (a) merged run keeps gate history and sums usage ==="
+run "$BENCH" collect run-merged --task "$TASK_ID" --out "$RESULTS" \
+  --runs "$RUNS" --usage "$USAGE"
+[[ "$RC" -eq 0 ]] || fail "collect (a) exit $RC: $(cat "$T/err")"
+python3 - "$RESULTS/bench-profile/$TASK_ID.json" "$TASK_ID" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    doc = json.load(handle)
+assert doc["task"] == sys.argv[2], doc
+assert doc["profile"] == "bench-profile", doc
+assert doc["source"] == "recorded", doc
+assert doc["status"] == "merged", doc
+assert doc["rounds"] == 2, doc
+assert doc["gate_claude"] == ["fail", "pass"], doc
+assert doc["grok"] == "pass", doc
+assert doc["checks"] == {}, doc
+assert doc["wall_ms"] == 3500, doc
+assert doc["cost"] == {"cc_usd": 0.75, "oc_tokens": 1500}, doc
+print("collect (a) result ok")
+PY
+
+echo "=== collect (b) max-rounds with a ci failure has no gate entry ==="
+run "$BENCH" collect run-max --task "$TASK_ID" --out "$RESULTS" \
+  --runs "$RUNS" --usage "$USAGE" --profile bench-max
+[[ "$RC" -eq 0 ]] || fail "collect (b) exit $RC: $(cat "$T/err")"
+python3 - "$RESULTS/bench-max/$TASK_ID.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    doc = json.load(handle)
+assert doc["status"] == "max-rounds", doc
+assert doc["rounds"] == 1, doc
+assert doc["gate_claude"] == [], doc
+assert doc["grok"] is None, doc
+print("collect (b) result ok")
+PY
+
+echo "=== collect (c) parked run is skipped by score ==="
+run "$BENCH" collect run-parked --task "$TASK_ID" --out "$RESULTS" \
+  --runs "$RUNS" --usage "$USAGE"
+[[ "$RC" -eq 0 ]] || fail "collect (c) exit $RC: $(cat "$T/err")"
+score bench-parked --min-pass 0
+[[ "$SCORE_RC" -eq 0 ]] || fail "collect (c) score exit $SCORE_RC: $(cat "$SCORE_ERR")"
+[[ "$(json_get skipped)" == "1" ]] || fail "collect (c) skipped $(json_get skipped), want 1"
+python3 - "$SCORE_OUT" "$TASK_ID" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    report = json.load(handle)
+row = next(item for item in report["tasks"] if item["task"] == sys.argv[2])
+assert row["outcome"] == "skipped", row
+print("collect (c) skipped ok")
+PY
+
+echo "=== collect (d) exit 2 is not finished ==="
+run "$BENCH" collect run-unfinished --task "$TASK_ID" --out "$RESULTS" \
+  --runs "$RUNS" --usage "$USAGE"
+[[ "$RC" -eq 1 ]] || fail "collect (d) exit $RC, want 1"
+grep -q "run not finished" "$T/err" || fail "collect (d): $(cat "$T/err")"
+[[ ! -e "$RESULTS/bench-unfinished/$TASK_ID.json" ]] \
+  || fail "collect (d) wrote a result for an unfinished run"
+
+echo "=== collect (e) no profile exits 2 ==="
+run "$BENCH" collect run-noprofile --task "$TASK_ID" --out "$RESULTS" \
+  --runs "$RUNS" --usage "$USAGE"
+[[ "$RC" -eq 2 ]] || fail "collect (e) exit $RC, want 2"
+grep -qi "profile" "$T/err" || fail "collect (e): $(cat "$T/err")"
+
+echo "=== collect (f) --checks are copied and score the task ==="
+python3 - "$TASKS" "$T/checks.json" "$TASK_ID" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+tasks = Path(sys.argv[1])
+task = json.loads((tasks / sys.argv[3] / "task.json").read_text(encoding="utf-8"))
+checks = {check["name"]: True for check in task["checks"]}
+Path(sys.argv[2]).write_text(json.dumps(checks, indent=2) + "\n", encoding="utf-8")
+PY
+run "$BENCH" collect run-checks --task "$TASK_ID" --out "$RESULTS" \
+  --runs "$RUNS" --usage "$USAGE" --checks "$T/checks.json"
+[[ "$RC" -eq 0 ]] || fail "collect (f) exit $RC: $(cat "$T/err")"
+python3 - "$RESULTS/bench-checks/$TASK_ID.json" "$T/checks.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    doc = json.load(handle)
+with open(sys.argv[2], encoding="utf-8") as handle:
+    checks = json.load(handle)
+assert doc["checks"] == checks, doc
+print("collect (f) checks ok")
+PY
+rm -rf "$T/one-task"
+mkdir -p "$T/one-task"
+cp -R "$TASKS/$TASK_ID" "$T/one-task/"
+score bench-checks --tasks "$T/one-task"
+[[ "$SCORE_RC" -eq 0 ]] || fail "collect (f) score exit $SCORE_RC: $(cat "$SCORE_ERR")"
+python3 - "$SCORE_OUT" "$TASK_ID" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    report = json.load(handle)
+row = next(item for item in report["tasks"] if item["task"] == sys.argv[2])
+assert row["outcome"] == "pass", row
+assert row["failed_checks"] == [], row
+print("collect (f) score ok")
+PY
+
+echo "=== collect (g) an existing result needs --force ==="
+run "$BENCH" collect run-checks --task "$TASK_ID" --out "$RESULTS" \
+  --runs "$RUNS" --usage "$USAGE" --checks "$T/checks.json"
+[[ "$RC" -eq 1 ]] || fail "collect (g) exit $RC, want 1"
+grep -q -- "--force" "$T/err" || fail "collect (g): $(cat "$T/err")"
+run "$BENCH" collect run-checks --task "$TASK_ID" --out "$RESULTS" \
+  --runs "$RUNS" --usage "$USAGE" --checks "$T/checks.json" --force
+[[ "$RC" -eq 0 ]] || fail "collect (g) --force exit $RC: $(cat "$T/err")"
+
+echo "=== collect (h) missing usage fields stay null ==="
+run "$BENCH" collect run-nocost --task "$TASK_ID" --out "$RESULTS" \
+  --runs "$RUNS" --usage "$USAGE"
+[[ "$RC" -eq 0 ]] || fail "collect (h) exit $RC: $(cat "$T/err")"
+python3 - "$RESULTS/bench-nocost/$TASK_ID.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    doc = json.load(handle)
+assert doc["wall_ms"] == 0, doc
+assert doc["cost"] == {"cc_usd": None, "oc_tokens": None}, doc
+print("collect (h) null costs ok")
+PY
+
+echo "=== collect (i) a conflicting profile exits 2 ==="
+run "$BENCH" collect run-merged --task "$TASK_ID" --out "$RESULTS" \
+  --runs "$RUNS" --usage "$USAGE" --profile other-profile
+[[ "$RC" -eq 2 ]] || fail "collect (i) exit $RC, want 2"
+grep -q "does not match" "$T/err" || fail "collect (i): $(cat "$T/err")"
 
 echo "test_factory_bench: PASS"

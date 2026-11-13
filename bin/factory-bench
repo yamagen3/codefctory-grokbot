@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
-"""factory-bench — validate benchmark tasks and score recorded results offline.
+"""factory-bench — validate tasks, collect finished runs, and score results offline.
 
 Usage:
   factory-bench validate [--tasks DIR]
+  factory-bench collect <run-id> --task <task-id> --out <results-dir>
+                        [--profile ID] [--runs DIR] [--usage DIR]
+                        [--checks FILE] [--tasks DIR] [--force]
   factory-bench score <results-dir> --profile <id> [--tasks DIR] [--json] [--min-pass X]
 
-This tool only reads JSON files. It never starts a factory run, calls a model,
+This tool only reads files. It never starts a factory run, calls a model,
 or uses the network.
 """
 import argparse
 import json
 import math
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 DEFAULT_TASKS = Path(__file__).resolve().parent.parent / "bench" / "tasks"
+DEFAULT_RUNS = Path(__file__).resolve().parent.parent / "local" / "runs"
+DEFAULT_USAGE = Path(__file__).resolve().parent.parent / "local" / "usage"
 RESULT_STATUSES = {"merged", "max-rounds", "aborted", "parked"}
+EXIT_STATUSES = {0: "merged", 3: "max-rounds", 75: "parked"}
 SOURCES = {"recorded", "stub"}
 GATE_VALUES = {"pass", "fail"}
 RESULT_FIELDS = (
@@ -32,9 +40,14 @@ RESULT_FIELDS = (
     "cost",
 )
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+FEEDBACK_LINE = re.compile(r"^# Round \d+ failed at (\S+)")
 
 
 class InputError(Exception):
+    pass
+
+
+class NotFinished(Exception):
     pass
 
 
@@ -55,6 +68,173 @@ def read_json(path):
         return json.loads(text)
     except json.JSONDecodeError as exc:
         raise InputError(f"{path}: invalid JSON: {exc}") from exc
+
+
+def require_plain_name(value, label):
+    if (
+        not isinstance(value, str)
+        or not value
+        or value in (".", "..")
+        or "/" in value
+        or "\\" in value
+        or "\0" in value
+    ):
+        raise InputError(f"{label}: invalid name {value!r}")
+
+
+def load_checks(path):
+    doc = read_json(path)
+    if not isinstance(doc, dict):
+        raise InputError(f"{path}: checks must be a JSON object of name -> true/false")
+    for name, value in doc.items():
+        if not isinstance(value, bool):
+            raise InputError(f"{path}: checks[{name!r}] must be true or false")
+    return doc
+
+
+def read_usage_records(usage_dir, kind):
+    files = []
+    direct = usage_dir / f"{kind}.jsonl"
+    if direct.is_file():
+        files.append(direct)
+    files.extend(sorted(usage_dir.glob(f"*/{kind}.jsonl")))
+    records = []
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+    return records
+
+
+def collect_usage(usage_dir, run_id):
+    steps = [
+        record
+        for record in read_usage_records(usage_dir, "steps")
+        if record.get("run_id") == run_id
+    ]
+    summaries = [
+        record
+        for record in read_usage_records(usage_dir, "runs")
+        if record.get("run_id") == run_id
+    ]
+    wall_ms = sum(
+        record["wall_ms"]
+        for record in summaries
+        if is_number(record.get("wall_ms"))
+    )
+    cc_costs = [
+        record["cost_usd_estimate"]
+        for record in steps
+        if record.get("provider") == "claude-code"
+        and is_number(record.get("cost_usd_estimate"))
+    ]
+    oc_tokens = [
+        record["total_tokens"]
+        for record in steps
+        if record.get("provider") == "opencode"
+        and isinstance(record.get("total_tokens"), int)
+        and not isinstance(record.get("total_tokens"), bool)
+    ]
+    return (
+        wall_ms,
+        sum(cc_costs) if cc_costs else None,
+        sum(oc_tokens) if oc_tokens else None,
+    )
+
+
+def read_feedback_stage(path):
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            first_line = handle.readline().strip()
+    except OSError as exc:
+        raise InputError(f"{path}: {exc}") from exc
+    match = FEEDBACK_LINE.match(first_line)
+    return match.group(1) if match else None
+
+
+def collect_gates(run_dir, rounds, status):
+    gate_claude = []
+    stages = set()
+    for round_number in range(1, rounds + 1):
+        path = run_dir / f"feedback-r{round_number}.md"
+        if path.is_file():
+            stage = read_feedback_stage(path)
+            if stage is None:
+                continue
+            stages.add(stage)
+            if stage == "gate-claude":
+                gate_claude.append("fail")
+            elif stage == "gate-grok":
+                gate_claude.append("pass")
+        elif status == "merged" and round_number == rounds:
+            gate_claude.append("pass")
+    if status == "merged":
+        grok = "pass"
+    elif "gate-grok" in stages:
+        grok = "fail"
+    else:
+        grok = None
+    return gate_claude, grok
+
+
+def status_from_state(state):
+    exit_code = state.get("exit")
+    if exit_code is None or exit_code == 2:
+        raise NotFinished("exit is 2 or null" if exit_code == 2 else "exit is null")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        raise InputError(f"state.exit must be an integer or null, got {exit_code!r}")
+    return EXIT_STATUSES.get(exit_code, "aborted")
+
+
+def profile_from_state(explicit, state):
+    saved = state.get("profile")
+    if saved is not None and not isinstance(saved, str):
+        raise InputError("state.profile must be a string when set")
+    saved = saved.strip() if isinstance(saved, str) else ""
+    explicit = explicit.strip() if isinstance(explicit, str) else ""
+    if explicit and saved and explicit != saved:
+        raise InputError(
+            f"--profile {explicit!r} does not match state.profile {saved!r}"
+        )
+    profile = explicit or saved
+    if not profile:
+        raise InputError("profile not set; pass --profile or set state.profile")
+    if not SAFE_ID.match(profile):
+        raise InputError(
+            "profile must use only letters, digits, dot, dash, or underscore"
+        )
+    return profile
+
+
+def write_json_atomic(path, doc):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    except OSError as exc:
+        raise InputError(f"{path}: {exc}") from exc
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(doc, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise InputError(f"{path}: {exc}") from exc
 
 
 def validate_task(doc, path, directory_name):
@@ -442,6 +622,82 @@ def cmd_validate(args):
     return 0
 
 
+def cmd_collect(args):
+    try:
+        run_id = args.run_id
+        task_id = args.task
+        require_plain_name(run_id, "run id")
+        require_plain_name(task_id, "task id")
+
+        runs_raw = args.runs or os.environ.get("FACTORY_RUNS_DIR")
+        usage_raw = args.usage or os.environ.get("FACTORY_USAGE_DIR")
+        runs_dir = Path(runs_raw).expanduser() if runs_raw else DEFAULT_RUNS
+        usage_dir = Path(usage_raw).expanduser() if usage_raw else DEFAULT_USAGE
+        run_dir = runs_dir / run_id
+        state = read_json(run_dir / "state.json")
+        if not isinstance(state, dict):
+            raise InputError(f"{run_dir / 'state.json'}: top level must be a JSON object")
+
+        try:
+            status = status_from_state(state)
+        except NotFinished as exc:
+            print(f"factory-bench: run not finished ({exc})", file=sys.stderr)
+            return 1
+
+        profile = profile_from_state(args.profile, state)
+
+        rounds = state.get("round")
+        if (
+            not isinstance(rounds, int)
+            or isinstance(rounds, bool)
+            or rounds < 0
+        ):
+            raise InputError("state.round must be a non-negative integer")
+
+        checks = load_checks(Path(args.checks).expanduser()) if args.checks else {}
+        gate_claude, grok = collect_gates(run_dir, rounds, status)
+        wall_ms, cc_usd, oc_tokens = collect_usage(usage_dir, run_id)
+
+        doc = {
+            "task": task_id,
+            "profile": profile,
+            "source": "recorded",
+            "status": status,
+            "rounds": rounds,
+            "gate_claude": gate_claude,
+            "grok": grok,
+            "checks": checks,
+            "wall_ms": wall_ms,
+            "cost": {"cc_usd": cc_usd, "oc_tokens": oc_tokens},
+        }
+
+        results_dir = Path(args.out).expanduser()
+        path = results_dir / profile / f"{task_id}.json"
+        problems = validate_result(doc, path, profile, task_id)
+        if problems:
+            for problem in problems:
+                print(f"factory-bench: {problem}", file=sys.stderr)
+            return 2
+
+        if os.path.lexists(path):
+            if path.is_dir():
+                raise InputError(f"{path}: result path is a directory")
+            if not args.force:
+                print(
+                    f"factory-bench: refusing to overwrite {path} (use --force)",
+                    file=sys.stderr,
+                )
+                return 1
+
+        write_json_atomic(path, doc)
+    except InputError as exc:
+        print(f"factory-bench: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"wrote {path}")
+    return 0
+
+
 def cmd_score(args):
     tasks_dir = Path(args.tasks).expanduser() if args.tasks else DEFAULT_TASKS
     tasks, problems = load_tasks(tasks_dir)
@@ -487,7 +743,10 @@ def cmd_score(args):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="factory-bench",
-        description="Validate benchmark tasks and score recorded results offline.",
+        description=(
+            "Validate benchmark tasks, collect finished runs, and score "
+            "recorded results offline."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -498,6 +757,38 @@ def build_parser():
         help="task set directory (default: bench/tasks)",
     )
     validate.set_defaults(func=cmd_validate)
+
+    collect = subparsers.add_parser(
+        "collect", help="turn a finished run into a recorded result"
+    )
+    collect.add_argument("run_id", metavar="RUN-ID")
+    collect.add_argument("--task", required=True, metavar="TASK-ID")
+    collect.add_argument("--out", required=True, metavar="RESULTS-DIR")
+    collect.add_argument("--profile", metavar="ID")
+    collect.add_argument(
+        "--runs",
+        metavar="DIR",
+        help="run state directory (default: $FACTORY_RUNS_DIR or local/runs)",
+    )
+    collect.add_argument(
+        "--usage",
+        metavar="DIR",
+        help="usage directory (default: $FACTORY_USAGE_DIR or local/usage)",
+    )
+    collect.add_argument(
+        "--checks",
+        metavar="FILE",
+        help="JSON object of check name -> true/false",
+    )
+    collect.add_argument(
+        "--tasks",
+        metavar="DIR",
+        help="task set directory (accepted for parity with score)",
+    )
+    collect.add_argument(
+        "--force", action="store_true", help="overwrite an existing result"
+    )
+    collect.set_defaults(func=cmd_collect)
 
     score = subparsers.add_parser(
         "score", help="score one profile's recorded results"

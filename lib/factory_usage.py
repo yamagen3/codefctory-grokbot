@@ -274,6 +274,7 @@ def record_step(provider, started_at, ended_at, duration_ms, exit_code, result_t
     step, oc_slot = normalize_step(raw_step)
     rec = {
         "run_id": ctx.get("run_id") or None, "target": ctx.get("target") or None,
+        "profile": os.environ.get("FACTORY_MODEL_PROFILE_ID") or None,
         "round": int(ctx["round"]) if str(ctx.get("round") or "").isdigit() else None,
         "step": step,
         "provider": provider, "started_at": started_at, "ended_at": ended_at, "duration_ms": duration_ms,
@@ -403,6 +404,7 @@ def run_summary(run_id, wall_ms=None, status=None):
         wall_ms = int((dt.datetime.fromisoformat(max(ends)) - dt.datetime.fromisoformat(min(starts))).total_seconds() * 1000)
     target = next((r["target"] for r in recs if r.get("target")), None)
     summ = {"ts": now_iso(), "run_id": run_id, "target": target, "status": status, "wall_ms": wall_ms,
+            "profile": next((r["profile"] for r in recs if r.get("profile")), None),
             "rounds": max([r["round"] for r in recs if r.get("round")], default=None),
             "by_provider": {k[0]: v for k, v in agg.items()}}
     append("runs", summ)
