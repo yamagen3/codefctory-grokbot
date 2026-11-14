@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # A checkout that is not /workspace/factory, with HOME that is not /home/box,
-# still renders patch paths, keeps CC pins, and passes the no-secret scan.
+# still resolves its own paths, keeps CC pins, and passes the no-secret scan.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 fail() { echo "test_fresh_paths: FAIL $*" >&2; exit 1; }
 
-grep -q 'npm ci --omit=dev' "$ROOT/bin/factory-setup" || fail "factory-setup does not npm ci plugin deps"
-grep -q 'failed to load or run' "$ROOT/bin/factory-step" || fail "factory-step does not fail a plugin that did not run"
+grep -q '@anthropic-ai/claude-code@$CC_PIN' "$ROOT/bin/factory-setup" || fail "factory-setup does not install the pinned claude CLI"
+grep -q 'failed to load or run' "$ROOT/bin/factory-step" || fail "factory-step does not fail a step that did not run"
 
 # local/tests must not be gitignored (doctor runs two of these files).
 if git -C "$ROOT" check-ignore -q -- local/tests/test_github_backend.py \
@@ -14,64 +14,25 @@ if git -C "$ROOT" check-ignore -q -- local/tests/test_github_backend.py \
   fail "local/tests is gitignored"
 fi
 
-# $1 home, $2 logical FACTORY_ROOT written into the patch, $3 dest file.
-# The yaml and helper always come from this checkout ($ROOT).
-render_one() {
-  local home="$1" fact_root="$2" dest="$3"
-  env -u FACTORY_DSH_PROFILE_NM HOME="$home" FACTORY_ROOT="$fact_root" \
-    bash -c 'source "$1/bin/factory-common.sh"; factory_render_patch "$1/config/factory.patch.yml" "$2"' \
-    bash "$ROOT" "$dest"
-}
-
-# This tree, with a non-box HOME.
+# The runner and hook derive every path from the checkout (no rendered patch, no ~/.dsh).
 HOME_TMP="$(mktemp -d /tmp/factory-home-XXXXXX)"
-RENDER="$(mktemp /tmp/factory-patch-render-XXXXXX.yml)"
-trap 'rm -rf "$HOME_TMP" "$RENDER" ${CLONE:+"$CLONE"}' EXIT
-render_one "$HOME_TMP" "$ROOT" "$RENDER"
-grep -q "$HOME_TMP/.dsh/profiles/headless/node_modules/@deepseek-ai/dsh-subagent-claude-code/lib/index.js" "$RENDER" \
-  || fail "rendered patch did not use HOME for the CC plugin"
-grep -q "$ROOT/plugin/index.js" "$RENDER" || fail "rendered patch did not use the checkout for the orchestrator"
-grep -q "$ROOT/bin/opencode-acp-isolated" "$RENDER" || fail "rendered patch did not use the checkout for the launcher"
-grep -q 'model: claude-opus-5-5' "$RENDER" || fail "CC model pin dropped"
-grep -q "CLAUDE_CODE_EFFORT_LEVEL: 'xhigh'" "$RENDER" || fail "CC effort pin dropped"
-if [[ "$HOME_TMP" != /home/box ]]; then
-  grep -q '/home/box' "$RENDER" && fail "rendered patch still contains /home/box"
+trap 'rm -rf "$HOME_TMP" ${CLONE:+"$CLONE"}' EXIT
+(cd /tmp && env -u FACTORY_ROOT HOME="$HOME_TMP" python3 - "$ROOT" <<'PY') || fail "runner paths do not follow the checkout"
+import sys
+root = sys.argv[1]
+sys.path.insert(0, root + "/lib")
+import factory_step as fs
+assert str(fs.ROOT) == root, (fs.ROOT, root)
+cfg = fs.load_cc_config()
+assert cfg["model"] == "claude-opus-5-5" and cfg["effort"] == "xhigh", cfg
+hook = fs.cc_settings(fs.ROOT / "lib/cc/hook.mjs")["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+assert root + "/lib/cc/hook.mjs" in hook, hook
+for bad in ("/home/box", ".dsh"):
+    assert bad not in hook, hook
+PY
+if grep -rqE '/home/box|\.dsh/profiles' "$ROOT/lib/factory_step.py" "$ROOT/lib/cc" "$ROOT/bin/factory-step"; then
+  fail "runner still hardcodes /home/box or the DSH profile"
 fi
-if [[ "$ROOT" != /workspace/factory ]]; then
-  grep -Eq '/workspace/factory([/"'"'"'[:space:]]|$)' "$RENDER" && fail "rendered patch still contains /workspace/factory"
-fi
-
-# Original host values render back to the historical paths.
-ORIG="$(mktemp /tmp/factory-patch-orig-XXXXXX.yml)"
-render_one /home/box /workspace/factory "$ORIG"
-grep -q '/home/box/.dsh/profiles/headless/node_modules/@deepseek-ai/dsh-subagent-claude-code/lib/index.js' "$ORIG" \
-  || fail "original host HOME did not render the historical DSH path"
-grep -q '/workspace/factory/plugin/index.js' "$ORIG" || fail "original host root did not render the historical plugin path"
-rm -f "$ORIG"
-
-# A root that starts with the legacy prefix must not be rewritten a second time.
-DOT="$(mktemp /tmp/factory-patch-dot-XXXXXX.yml)"
-render_one /home/factory /workspace/factory.v2 "$DOT"
-grep -Fq '/workspace/factory.v2/plugin/index.js' "$DOT" || fail "dot-suffix root missing"
-grep -Fq '/workspace/factory.v2/bin/opencode-acp-isolated' "$DOT" || fail "dot-suffix launcher missing"
-grep -Fq '/workspace/factory.v2.v2' "$DOT" && fail "dot-suffix root was rewritten twice"
-rm -f "$DOT"
-NEST="$(mktemp /tmp/factory-patch-nest-XXXXXX.yml)"
-render_one /home/factory /workspace/factory/extra "$NEST"
-grep -Fq '/workspace/factory/extra/plugin/index.js' "$NEST" || fail "nested root missing"
-grep -Fq '/workspace/factory/extra/extra' "$NEST" && fail "nested root was rewritten twice"
-rm -f "$NEST"
-# A file that still has the old literals is rewritten once, including a dot-suffix root.
-LEG_SRC="$(mktemp /tmp/factory-patch-leg-XXXXXX.yml)"
-LEG="$(mktemp /tmp/factory-patch-legout-XXXXXX.yml)"
-printf '%s\n' "plugin: /workspace/factory/plugin/index.js" "nm: /home/box/.dsh/profiles/headless/node_modules/pkg" > "$LEG_SRC"
-env -u FACTORY_DSH_PROFILE_NM HOME=/home/factory FACTORY_ROOT=/workspace/factory.v2 \
-  bash -c 'source "$1/bin/factory-common.sh"; factory_render_patch "$2" "$3"' \
-  bash "$ROOT" "$LEG_SRC" "$LEG"
-grep -Fq 'plugin: /workspace/factory.v2/plugin/index.js' "$LEG" || fail "legacy literal was not rewritten once"
-grep -Fq '/workspace/factory.v2.v2' "$LEG" && fail "legacy literal dot-suffix was rewritten twice"
-grep -Fq 'nm: /home/factory/.dsh/profiles/headless/node_modules/pkg' "$LEG" || fail "legacy DSH literal was not rewritten"
-rm -f "$LEG_SRC" "$LEG"
 
 # Common derives the checkout when FACTORY_ROOT is unset.
 derived="$(env -u FACTORY_ROOT bash -c 'source "'"$ROOT"'/bin/factory-common.sh"; printf %s "$FACTORY_ROOT"')"

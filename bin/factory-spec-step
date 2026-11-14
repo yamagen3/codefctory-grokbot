@@ -27,8 +27,8 @@ if [[ -f pyproject.toml ]]; then
   PKG_HINT=$(python3 -c "import re,pathlib; t=pathlib.Path('pyproject.toml').read_text(); m=re.search(r'(?m)^name\s*=\s*\"([^\"]+)\"', t); print(m.group(1) if m else '')" 2>/dev/null || true)
 fi
 
-# Skill bodies for this step are appended by pstackQueryOverlay() inside the
-# Agent SDK system prompt. Do not paste the skill library into this task.
+# Skill bodies for this step are appended to the system prompt by factory-step
+# (lib/cc/pstack-session.js, --append-system-prompt-file). Do not paste the skill library into this task.
 # The task itself is Claude Code's /goal condition (docs/goal.md).
 TASK="$(factory_cc_spec_prompt "$BRIEF" "${PKG_HINT:-unknown}")"
 

@@ -12,44 +12,6 @@ unset _factory_common_dir
 export FACTORY_ROOT
 export PATH="${HOME}/.local/bin:${FACTORY_ROOT}/bin:${PATH}"
 
-# DSH headless profile node_modules for the invoking user.
-# Original host: HOME=/home/box, so this is /home/box/.dsh/profiles/headless/node_modules.
-factory_dsh_profile_nm() {
-  if [[ -n "${FACTORY_DSH_PROFILE_NM:-}" ]]; then
-    printf '%s\n' "$FACTORY_DSH_PROFILE_NM"
-  else
-    printf '%s\n' "${HOME}/.dsh/profiles/headless/node_modules"
-  fi
-}
-
-# Render config/factory.patch.yml for this host.
-# Tokens: __FACTORY_ROOT__ and __FACTORY_DSH_NM__.
-# Legacy absolute paths are rewritten first, then tokens are expanded.
-# The new root may itself start with /workspace/factory (factory.v2 or factory/extra).
-# Expanding tokens first would let the legacy pass rewrite those new paths again.
-# A path boundary is / or end, not '.': /workspace/factory.v2 is a different directory.
-# When the host already is /home/box and /workspace/factory, the text is unchanged.
-factory_render_patch() {
-  local src="${1:?}" dest="${2:?}"
-  local nm
-  nm="$(factory_dsh_profile_nm)"
-  python3 - "$src" "$dest" "$FACTORY_ROOT" "$nm" <<'PY'
-import pathlib, re, sys
-src, dest, root, nm = sys.argv[1:]
-text = pathlib.Path(src).read_text()
-
-def sub_exact(text, old, new):
-    if not old or old == new:
-        return text
-    return re.sub(re.escape(old) + r"(?![A-Za-z0-9_.-])", lambda _m: new, text)
-
-text = sub_exact(text, "/workspace/factory", root)
-text = sub_exact(text, "/home/box/.dsh/profiles/headless/node_modules", nm)
-text = text.replace("__FACTORY_ROOT__", root).replace("__FACTORY_DSH_NM__", nm)
-pathlib.Path(dest).write_text(text)
-PY
-}
-
 die() { echo "factory: $*" >&2; exit 1; }
 require_cmd() { command -v "$1" >/dev/null || die "missing command: $1"; }
 
@@ -148,7 +110,7 @@ if problems:
 # first line: the docs cap it at 4,000 characters
 # (https://code.claude.com/docs/en/goal). The brief and the rest of the SPEC
 # instructions follow that line, in full, so a long brief is not truncated and
-# is not stuffed into the condition. DSH /goal is not used.
+# is not stuffed into the condition. bin/factory-step passes this prompt to `claude -p`.
 factory_cc_spec_prompt() {
   local brief="${1:-}" pkg="${2:-unknown}" turns="${FACTORY_CC_GOAL_TURNS:-12}"
   local condition prompt

@@ -8,28 +8,23 @@ echo "factory-setup: root=$FACTORY_ROOT home=$HOME"
 # Dirs
 mkdir -p "$FACTORY_ROOT/local"/{status,labels,notify,logs,prs,grok-hooks,origin,work,tests}
 
-# Plugin deps are gitignored. A fresh clone cannot load @deepseek-ai/schemastery until this runs.
-# npm ci is idempotent: a second setup reinstalls the lockfile and leaves the same tree.
-if [[ -f "$FACTORY_ROOT/plugin/package-lock.json" ]] && command -v npm >/dev/null; then
-  echo "factory-setup: plugin deps (npm ci)"
-  (cd "$FACTORY_ROOT/plugin" && npm ci --omit=dev)
+# Standard Claude Code CLI at the pinned version (config/claude-code.json). The factory drives
+# `claude -p` directly; there is no DSH, plugin, or Agent SDK to install (DECISIONS 2026-11-14).
+# Installing the pin is not an upgrade: a newer version goes through factory-update approval.
+CC_PIN=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$FACTORY_ROOT/config/claude-code.json")
+CC_HAVE=$(claude --version 2>/dev/null | awk '{print $1}' || true)
+if [[ "$CC_HAVE" == "$CC_PIN" ]]; then
+  echo "factory-setup: claude $CC_HAVE (pinned)"
+elif command -v npm >/dev/null; then
+  echo "factory-setup: installing @anthropic-ai/claude-code@$CC_PIN (have ${CC_HAVE:-none})"
+  npm install -g --prefix "$HOME/.local" --no-audit --no-fund "@anthropic-ai/claude-code@$CC_PIN"
+  CC_HAVE=$(claude --version 2>/dev/null | awk '{print $1}' || true)
+  [[ "$CC_HAVE" == "$CC_PIN" ]] || echo "factory-setup: WARN claude is ${CC_HAVE:-missing} after install, want $CC_PIN" >&2
 else
-  echo "factory-setup: WARN npm or plugin/package-lock.json missing; plugin deps not installed" >&2
+  echo "factory-setup: WARN npm missing; cannot install claude $CC_PIN" >&2
 fi
-
-# CC allowlist patch on profile-installed dsh-subagent-claude-code
-if [[ -x "$FACTORY_ROOT/scripts/apply-cc-allowlist-patch.sh" ]]; then
-  "$FACTORY_ROOT/scripts/apply-cc-allowlist-patch.sh"
-else
-  echo "factory-setup: WARN missing apply-cc-allowlist-patch.sh" >&2
-fi
-
-# Ensure vendor node_modules symlink for any leftover vendor copy
-VENDOR_NM="$FACTORY_ROOT/plugin/cc-allowlist/vendor/node_modules"
-PROFILE_NM="$(factory_dsh_profile_nm)"
-if [[ -d "$PROFILE_NM" ]]; then
-  mkdir -p "$(dirname "$VENDOR_NM")"
-  ln -sfn "$PROFILE_NM" "$VENDOR_NM"
+if npm ls -g --prefix "$HOME/.local" --depth=0 @deepseek-ai/dsh >/dev/null 2>&1; then
+  echo "factory-setup: NOTE @deepseek-ai/dsh is installed but unused; remove with: npm uninstall -g --prefix \"\$HOME/.local\" @deepseek-ai/dsh"
 fi
 
 # Python 3.12 via uv if missing

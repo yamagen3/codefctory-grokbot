@@ -45,10 +45,10 @@ factory-profile check
 
 | Profile key | File | Expected live text |
 |---|---|---|
-| `brain.model` | `config/factory.patch.yml` | a line matching `^\s*model: <brain.model>\s*$` |
-| `brain.effort` | `config/factory.patch.yml` | a line with `CLAUDE_CODE_EFFORT_LEVEL: '<brain.effort>'` |
+| `brain.model` | `config/claude-code.json` | a line `"model": "<brain.model>"` |
+| `brain.effort` | `config/claude-code.json` | a line `"effort": "<brain.effort>"` |
 | `brain.effort` | `lib/factory_usage.py` | `"FACTORY_CC_EXPECT_EFFORT", "<brain.effort>"` |
-| `brain.step_timeout_ms` | `config/factory.patch.yml` | a line matching `timeoutMs: <brain.step_timeout_ms>\s*$` |
+| `brain.step_timeout_ms` | `config/claude-code.json` | a line `"timeoutMs": <brain.step_timeout_ms>` |
 | `maker.model` | `bin/factory-common.sh` | `"model": "<maker.model>"` |
 | `maker.reasoning_effort` | `bin/factory-common.sh` | `"reasoningEffort": "<maker.reasoning_effort>"` |
 | `brain.spec_goal_turns` | `bin/factory-common.sh` | `FACTORY_CC_GOAL_TURNS:-<brain.spec_goal_turns>}` |

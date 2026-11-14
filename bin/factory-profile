@@ -220,18 +220,18 @@ def check(doc):
     rules = [
         (
             "brain.model",
-            "config/factory.patch.yml",
-            r"(?m)^\s*model: " + model + r"\s*$",
+            "config/claude-code.json",
+            r'(?m)^\s*"model":\s*"' + model + r'",?\s*$',
         ),
         (
             "brain.effort",
-            "config/factory.patch.yml",
-            r"(?m)^\s*CLAUDE_CODE_EFFORT_LEVEL:\s*'" + effort + r"'\s*,?\s*$",
+            "config/claude-code.json",
+            r'(?m)^\s*"effort":\s*"' + effort + r'",?\s*$',
         ),
         (
             "brain.step_timeout_ms",
-            "config/factory.patch.yml",
-            r"(?m)^\s*timeoutMs: " + timeout_ms + r"\s*$",
+            "config/claude-code.json",
+            r'(?m)^\s*"timeoutMs":\s*' + timeout_ms + r',?\s*$',
         ),
         (
             "maker.model",

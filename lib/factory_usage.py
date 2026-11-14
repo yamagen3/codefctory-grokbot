@@ -90,23 +90,36 @@ def tokens_from_result(obj):
     return None, None, {}, "source_missing"
 
 
+CC_INIT = ("claude-cli.init", "claude-agent-sdk.init")
+CC_STOP = ("claude-cli.stop-hook", "claude-agent-sdk.stop-hook")
+CC_RESULT = ("claude-cli.result", "claude-agent-sdk.result")
+
+
 def tokens_from_cc_sidecar(text):
-    """Claude Agent SDK result usage written by our dsh-subagent-claude-code patch (FACTORY_CC_USAGE_FILE).
+    """Claude Code result usage written by the step runner (lib/factory_step.py) to FACTORY_CC_USAGE_FILE:
+    the `claude -p --output-format stream-json` init and result events, plus the Stop hook's effort.
+    Records from the retired DSH/Agent SDK patch (claude-agent-sdk.*) still parse.
     modelUsage (all model calls incl. subagents) is preferred; usage (main loop only) is the fallback."""
     extra = {}
+    d = None
     for l in (text or "").splitlines():
         try:
             j = json.loads(l)
         except json.JSONDecodeError:
             continue
-        if isinstance(j, dict) and j.get("source") == "claude-agent-sdk.init":
+        if not isinstance(j, dict):
+            continue
+        src = j.get("source")
+        if src in CC_INIT:
             extra["cc_model"] = j.get("model")
+            if j.get("claude_code_version"):
+                extra["cc_version"] = j.get("claude_code_version")
             if j.get("effort") is not None or "cc_effort" not in extra:
                 extra["cc_effort"] = j.get("effort")
-        if isinstance(j, dict) and j.get("source") == "claude-agent-sdk.stop-hook" and j.get("effort") is not None:
+        elif src in CC_STOP and j.get("effort") is not None:
             extra["cc_effort"] = j["effort"]  # effective level for the turn (post-downgrade)
-    d = next((json.loads(l) for l in reversed((text or "").splitlines())
-              if l.strip().startswith("{") and '"claude-agent-sdk.result"' in l), None)
+        elif src in CC_RESULT:
+            d = j
     if not isinstance(d, dict):
         return None, None, extra, "source_missing"
     mu = d.get("modelUsage")
@@ -120,9 +133,9 @@ def tokens_from_cc_sidecar(text):
                       "models": sorted(mu)})
         if any("thinkingTokens" in v for v in mu.values() if isinstance(v, dict)):
             extra["reasoning_tokens"] = tot("thinkingTokens")
-        return tot("inputTokens"), tot("outputTokens"), extra, "cc-sdk-sidecar.modelUsage"
+        return tot("inputTokens"), tot("outputTokens"), extra, "cc-sidecar.modelUsage"
     i, o, ex, src = tokens_from_result({"usage": d.get("usage")})
-    return i, o, {**extra, **ex}, ("cc-sdk-sidecar.usage" if src != "source_missing" else src)
+    return i, o, {**extra, **ex}, ("cc-sidecar.usage" if src != "source_missing" else src)
 
 
 def last_json_line(text):
@@ -234,13 +247,15 @@ def record_step(provider, started_at, ended_at, duration_ms, exit_code, result_t
     note = list(notes or [])
     if provider == "claude-code" and cc_usage_text:
         ci, co, cextra, csrc = tokens_from_cc_sidecar(cc_usage_text)
-        if src == "source_missing":
+        # The sidecar result (modelUsage: every model call incl. subagents, plus cost and
+        # turns) beats the runner payload's `usage`, which covers the main loop only.
+        if src == "source_missing" or csrc != "source_missing":
             i, o, extra, src = ci, co, cextra, csrc
         else:
             extra.update({k: v for k, v in cextra.items() if k in ("cc_model", "cc_effort")})
         want = os.environ.get("FACTORY_CC_EXPECT_EFFORT", "xhigh")
         if "cc_model" in cextra and cextra.get("cc_effort") is None:
-            note.append("effort not reported by SDK init (unverified)")
+            note.append("effort not reported by the CLI (unverified)")
         if cextra.get("cc_effort") and cextra["cc_effort"] != want:
             note.append(f"effort downgrade: requested {want}, effective {cextra['cc_effort']}")
     if src == "source_missing" and provider == "opencode":

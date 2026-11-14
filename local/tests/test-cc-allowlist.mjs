@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { isWriteAllowed, makeCanUseTool, extractFilePaths } from '../../plugin/cc-allowlist/allowlist.js'
+import { isWriteAllowed, makeCanUseTool, extractFilePaths } from '../../lib/cc/allowlist.js'
 
 const cwd = '/tmp/factory-prod'
 

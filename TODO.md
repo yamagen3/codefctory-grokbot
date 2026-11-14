@@ -58,7 +58,7 @@
 
 ## 使用量記録（factory-usage, 2026-11-05）
 - [x] JSONL 記録・`factory-usage show|summary|agmsg`・run 終了サマリ・テスト。
-- [x] CC tokens: subagent パッチの usage sidecar で記録（modelUsage）。[ ] DSH 上流に usage 素通しを要望（パッチ依存を外すため）。
+- [x] CC tokens: subagent パッチの usage sidecar で記録（modelUsage）。（DSH 撤去で不要: usage は stream-json `result` から取る）
 - [x] 並列 IMPL の OpenCode tokens はスロットの `FACTORY_OC_HOME` の stats 差分（共有 home を同時に読むと 0 または混線になる）。`impl-sN` は `step=impl` + `oc_slot`。`oc_model` / `oc_reasoning_effort` はスロットの opencode.json。
 - [ ] 共有 `/home/factory-oc` を同時に使う工程（`FACTORY_OC_HOME` なし）の stats 差分は今も混ざる。egress 制限とあわせて残る。
 - [ ] agmsg unread プローブは内部 API（`lib/storage.sh` の `storage_list_unread`）依存。存在しない team でも 0 を返すため、team/agent 名の誤りを検出できない。
@@ -69,7 +69,7 @@
 - [x] box 部分初期化からの OpenCode 隔離復旧（`factory-oc-provision`、doctor PASS / OC pong / leak 14/14）。
 - [x] `plugin/node_modules` は `factory-setup` が `npm ci --omit=dev` で入れる。doctor は `@deepseek-ai/schemastery` 欠落を FAIL。
 - [x] `factory-step` は plugin が `factory: step end` を出さず stdout も空なら exit 1（dsh が import 失敗を 0 で返しても成功扱いにしない）。
-- [ ] DSH が SDK ピンを上げたら `config/headless.pnpm-workspace.yaml` の overrides を外す（DSH のピン ≥ override なら不要）。
+- [x] ~~DSH が SDK ピンを上げたら overrides を外す~~（DSH 撤去で不要）。
 
 ## multi OpenCode / 隔離 follow-ups（2026-11-05）
 - [x] `FACTORY_OC_PARALLEL` impl-level fan-out + acceptance winner + per-slot `FACTORY_OC_HOME`。
@@ -79,7 +79,7 @@
 - [x] doctor が OpenCode `reasoningEffort=max` の欠落を FAIL する（ソース既定と live `opencode.json`）。
 - [x] 承認済み SDK 写しを 0.3.319 / Claude Code 2.1.319 に合わせた（インストールは box 側）。
 - [x] SPEC の CC プロンプトは Claude Code `/goal <条件>`（DSH `/goal` は親だけなので不使用）。
-- [ ] CC `/goal` が Agent SDK `persistSession: false` の query で複数 turn するか未検証。box では素の `/goal` が CC の usage 応答（0 model turn）になることだけ確認。
+- [x] ~~CC `/goal` が Agent SDK `persistSession: false` で複数 turn するか~~（標準 CLI へ移行。`-p` で /goal が回ることは公式文書）。旧メモ:box では素の `/goal` が CC の usage 応答（0 model turn）になることだけ確認。
 - [ ] CC が `/goal` 条件を先頭行だけとるか、プロンプト全体とるかは未再確認。ソースは条件を先頭行（4,000 文字以内）に固定し、brief 全文はその後に残す。
 - [ ] OpenCode に `/goal` 相当は無い。IMPL は通常プロンプトのまま。同等の完了条件を OC に渡すかは未決。
 - [x] `factory_oc_write_config` が max 無しの opencode.json を max 付きへ置き換え、2 回目は unchanged。
@@ -87,7 +87,7 @@
 - [ ] OpenCode egress 制限（`--unshare-net` + opencode.ai だけ通す proxy）。並列時のトークン混線（stats 差分）も悪化し得る。
 - [ ] launcher を root 所有の libexec へ移し checksum 照合（sudoers が box 書込可能スクリプトを root 実行している問題）。
 - [ ] `factory-cc` ユーザー + bwrap（CC の chmod allowlist 限界の本命）。
-- [ ] DSH plugin 内 multi-activation（Candidate B）は見送り。上流が one-shot を超えたら再検討。
+- [x] ~~DSH plugin 内 multi-activation~~（DSH 撤去で不要）。
 - [ ] 並列時の `FACTORY_IMPL_PARALLEL_TIMEOUT_SEC` を stall-retry とどう揃えるか。
 
 ## Fable レビュー第 1 回（2026-11-13、claude-fable-5-2）由来
@@ -174,3 +174,10 @@
 - [ ] 【要判断・要認証情報】CC 上限中も止まらず進めるための 2 つ目の頭脳（profile、新しい認証情報、先にベンチで比較）。
 - [ ] 【要判断】ベンチ: 隠しチェックの置き場所、誰がマージ後のツリーで走らせるか、既定 profile の基準値をお金をかけて記録するか。
 - [ ] 【要判断】手動で始めた run が動いた main にマージする場合の扱い（rebase して gate をやり直すか、却下して積み直すか）。
+## DSH 撤去（2026-11-14）の後片付け
+- [x] `factory-step` を標準 `claude -p` / `opencode run` に置き換え（DECISIONS 2026-11-14）。
+- [ ] マージ後、PC と box で `npm uninstall -g @deepseek-ai/dsh` と `~/.dsh` の削除（doctor が warn で知らせる）。
+- [ ] box の checkout が古い（2da5ab4 + ローカル変更）。更新して `factory-setup` を再実行。
+- [ ] box に factory-oc ユーザーが無い（11-13 バッチの別失敗）。`factory-oc-provision` で復旧。
+- [ ] Claude Code CLI 2.1.319 → 新しい版（2.1.32x）への更新は承認待ち。
+- [ ] `opencode run --format json` のイベント形は公式に文書化されていない。実機の形に合わせた parser（`oc_text` / `oc_error`）を版更新時に再確認。

@@ -82,7 +82,7 @@ RESULT_KEYS = ("api_error", "api_error_status", "result", "result_head")
 def is_result_record(data):
     if not isinstance(data, dict):
         return False
-    if data.get("source") == "claude-agent-sdk.result":
+    if data.get("source") in ("claude-cli.result", "claude-agent-sdk.result"):
         return True
     if data.get("type") == "result":
         return True

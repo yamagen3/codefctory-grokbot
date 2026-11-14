@@ -8,60 +8,43 @@ trap 'rm -rf "$T"' EXIT
 
 fail() { echo "test_step_timeout: FAIL $*" >&2; exit 1; }
 
-NODE="${NODE:-$(command -v node || true)}"
-if [[ -z "$NODE" && -x /usr/local/bin/node ]]; then NODE=/usr/local/bin/node; fi
-[[ -n "$NODE" && -x "$NODE" ]] || fail "node not found"
-
 unset FACTORY_AGMSG_TEAM
 
 echo "=== helper timeout resolution ==="
-helper_js="$(cat <<'JS'
-import {
-  DEFAULT_TIMEOUT_MS,
-  TIMEOUT_EXIT_CODE,
-  resolveTimeoutMs,
-  exitCodeFor,
-} from './plugin/step-timeout.js'
+(cd "$ROOT" && python3 - <<'PY') || fail "helper assertions failed"
+import sys
+sys.path.insert(0, "lib")
+from factory_step import DEFAULT_TIMEOUT_MS, TIMEOUT_EXIT_CODE, resolve_timeout_ms, exit_code_for
 
-if (DEFAULT_TIMEOUT_MS !== 1800000) throw new Error(`DEFAULT_TIMEOUT_MS=${DEFAULT_TIMEOUT_MS}`)
-if (TIMEOUT_EXIT_CODE !== 124) throw new Error(`TIMEOUT_EXIT_CODE=${TIMEOUT_EXIT_CODE}`)
-
-const cases = [
-  ['configured', resolveTimeoutMs(1800000, {}), 1800000],
-  ['undefined config', resolveTimeoutMs(undefined, {}), 1800000],
-  ['stall 3600', resolveTimeoutMs(1800000, { FACTORY_STALL_TIMEOUT_SEC: '3600' }), 3240000],
-  ['stall 5', resolveTimeoutMs(1800000, { FACTORY_STALL_TIMEOUT_SEC: '5' }), 2500],
-  ['step beats stall', resolveTimeoutMs(1800000, { FACTORY_STEP_TIMEOUT_MS: '1234', FACTORY_STALL_TIMEOUT_SEC: '3600' }), 1234],
-  ['step abc', resolveTimeoutMs(1800000, { FACTORY_STEP_TIMEOUT_MS: 'abc' }), 1800000],
-  ['step 0', resolveTimeoutMs(1800000, { FACTORY_STEP_TIMEOUT_MS: '0' }), 1800000],
-  ['step -5', resolveTimeoutMs(1800000, { FACTORY_STEP_TIMEOUT_MS: '-5' }), 1800000],
-  ['stall abc', resolveTimeoutMs(1800000, { FACTORY_STALL_TIMEOUT_SEC: 'abc' }), 1800000],
-  ['stall 0', resolveTimeoutMs(1800000, { FACTORY_STALL_TIMEOUT_SEC: '0' }), 1800000],
-  ['stall -5', resolveTimeoutMs(1800000, { FACTORY_STALL_TIMEOUT_SEC: '-5' }), 1800000],
+assert DEFAULT_TIMEOUT_MS == 1800000, DEFAULT_TIMEOUT_MS
+assert TIMEOUT_EXIT_CODE == 124, TIMEOUT_EXIT_CODE
+cases = [
+    ("configured", resolve_timeout_ms(1800000, {}), 1800000),
+    ("undefined config", resolve_timeout_ms(None, {}), 1800000),
+    ("stall 3600", resolve_timeout_ms(1800000, {"FACTORY_STALL_TIMEOUT_SEC": "3600"}), 3240000),
+    ("stall 5", resolve_timeout_ms(1800000, {"FACTORY_STALL_TIMEOUT_SEC": "5"}), 2500),
+    ("step beats stall", resolve_timeout_ms(1800000, {"FACTORY_STEP_TIMEOUT_MS": "1234", "FACTORY_STALL_TIMEOUT_SEC": "3600"}), 1234),
+    ("step abc", resolve_timeout_ms(1800000, {"FACTORY_STEP_TIMEOUT_MS": "abc"}), 1800000),
+    ("step 0", resolve_timeout_ms(1800000, {"FACTORY_STEP_TIMEOUT_MS": "0"}), 1800000),
+    ("step -5", resolve_timeout_ms(1800000, {"FACTORY_STEP_TIMEOUT_MS": "-5"}), 1800000),
+    ("stall abc", resolve_timeout_ms(1800000, {"FACTORY_STALL_TIMEOUT_SEC": "abc"}), 1800000),
+    ("stall 0", resolve_timeout_ms(1800000, {"FACTORY_STALL_TIMEOUT_SEC": "0"}), 1800000),
+    ("stall -5", resolve_timeout_ms(1800000, {"FACTORY_STALL_TIMEOUT_SEC": "-5"}), 1800000),
 ]
-for (const [name, got, want] of cases) {
-  if (got !== want) throw new Error(`${name}: got ${got}, want ${want}`)
-}
-
-const exits = [
-  ['completed despite timeout', exitCodeFor('completed', true), 0],
-  ['cancelled timed out', exitCodeFor('cancelled', true), 124],
-  ['error not timed out', exitCodeFor('error', false), 1],
+for name, got, want in cases:
+    assert got == want, f"{name}: got {got}, want {want}"
+exits = [
+    ("completed despite timeout", exit_code_for(True, True), 0),
+    ("not completed, timed out", exit_code_for(False, True), 124),
+    ("error not timed out", exit_code_for(False, False), 1),
 ]
-for (const [name, got, want] of exits) {
-  if (got !== want) throw new Error(`${name}: got ${got}, want ${want}`)
-}
-
-console.log(`helper ok (${cases.length + exits.length} cases)`)
-JS
-)"
-(cd "$ROOT" && "$NODE" --input-type=module -e "$helper_js") || fail "helper assertions failed"
-
-grep -Fq "step-timeout.js" "$ROOT/plugin/index.js" || fail "plugin/index.js does not import step-timeout.js"
-grep -Fq "inject = ['agents', 'subagents']" "$ROOT/plugin/index.js" || fail "plugin/index.js lost its inject list"
+for name, got, want in exits:
+    assert got == want, f"{name}: got {got}, want {want}"
+print(f"helper ok ({len(cases) + len(exits)} cases)")
+PY
 
 echo "=== factory-step propagates timeout exit 124 ==="
-FAKE_DSH="$T/fake-dsh"
+FAKE_DSH="$T/fake-runner"
 cat > "$FAKE_DSH" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' '{"stopReason":"timeout","output":[]}'
@@ -73,14 +56,14 @@ chmod +x "$FAKE_DSH"
 for fake_ec in 0 1 124; do
   set +e
   FACTORY_ROOT="$ROOT" \
-  FACTORY_DSH_BIN="$FAKE_DSH" \
+  FACTORY_STEP_RUNNER="$FAKE_DSH" \
   FACTORY_USAGE_DISABLE=1 \
   FACTORY_PROVIDER=claude-code \
   FAKE_EC="$fake_ec" \
     "$ROOT/bin/factory-step" --json x >"$T/step-${fake_ec}.out" 2>"$T/step-${fake_ec}.err"
   got=$?
   set -e
-  [[ "$got" -eq 124 ]] || fail "fake dsh exit ${fake_ec}: factory-step exited ${got}, want 124 (stderr: $(cat "$T/step-${fake_ec}.err"))"
+  [[ "$got" -eq 124 ]] || fail "fake runner exit ${fake_ec}: factory-step exited ${got}, want 124 (stderr: $(cat "$T/step-${fake_ec}.err"))"
 done
 
 echo "=== stall retry exports timeout and retries once ==="

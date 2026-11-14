@@ -11,74 +11,51 @@ attached to one specific provider or one specific product pipeline.
 
 ### `bin/factory-step` — provider adapter boundary
 
-`bin/factory-step` is the executable boundary between the orchestrator and a DSH
-provider. It takes the task as command-line input, selects `FACTORY_PROVIDER`
-(`claude-code` by default), renders `config/factory.patch.yml` for the current
-checkout, and runs `dsh --profile "$PROFILE" --patch "$PATCH" "$@"`. Usage tracking
-records wall time and tokens around that process.
+`bin/factory-step` is the executable boundary between the orchestrator and a model
+CLI. It takes the task as command-line input, selects `FACTORY_PROVIDER`
+(`claude-code` by default), checks the provider-limit state, and runs
+`lib/factory_step.py`, which starts one standard CLI process for the step (no DSH
+since 2026-11-14). Usage tracking records wall time and tokens around that process.
 
 The result is a JSON document when `--json` is used: `stopReason`, `output`, `text`,
-and optional `diagnostic` and `usage`. The plugin also writes a
-`factory: step end stopReason=… exit=N` line to stderr. The exit code comes from
-the plugin (`completed` → 0, anything else → 1). `factory-step` adopts the plugin
-exit code if `dsh` exits 0 anyway, and it treats a missing `factory: step end` line,
-or a failed activation reported over an otherwise-successful `dsh` exit, as an
-error.
+and optional `diagnostic` and `usage`. The runner also writes a
+`factory: step end stopReason=… exit=N` line to stderr (`completed` → 0, timeout →
+124, anything else → 1). `factory-step` treats a missing `factory: step end` line
+as an error and turns a provider limit into exit 75.
 
-Secret scrubbing happens here, per provider:
+Secret scrubbing happens in the runner, per provider:
 
-- Claude Code: `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are always unset.
-  `CLAUDE_CODE_OAUTH_TOKEN` is stashed as `FACTORY_CC_OAUTH_TOKEN`, and all
-  DeepSeek, OpenCode, and factory workspace keys are removed from the DSH parent.
-  The Claude Code subagent overlay re-injects only the OAuth token into the child.
+- Claude Code: `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are always removed,
+  as are all DeepSeek, OpenCode, and factory workspace keys. `factory-step` stashes
+  `CLAUDE_CODE_OAUTH_TOKEN` as `FACTORY_CC_OAUTH_TOKEN`; the runner gives the
+  `claude` child only `CLAUDE_CODE_OAUTH_TOKEN`. `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`
+  is removed: on 2.1.319 it forces permission mode `default` and blocks edits.
 - OpenCode: `OPENCODE_GO_KEY` (or `FACTORY_OC_API_KEY`) is required. The key is
   stashed as `FACTORY_OC_API_KEY`, all other provider and GitHub secrets are
-  removed, and the step runs in a private workspace. The ACP launcher maps the
+  removed, and the step runs in a private workspace. The isolated launcher maps the
   stash to `OPENCODE_API_KEY` only inside the bwrap sandbox.
 - Unknown provider: exit 2, no fallback.
 
-The scrub is a `case` statement, so every new provider needs a new branch even
-though the adapter shape is otherwise shared.
+The scrub is per provider, so every new provider needs a new branch even though the
+adapter shape is otherwise shared.
 
-### `plugin/index.js` — `startActivation` with any provider name
+### `lib/factory_step.py` — one runner function per provider
 
-The plugin's `Config.provider` is a free-form string (`claude-code` by default).
-`run()` passes it straight to `ctx.subagents.startActivation({ provider, ... })`;
-the plugin does not contain a role-to-provider table. A provider is usable as soon
-as DSH has a registered subagent under that name (registered in
-`config/factory.patch.yml`) and the caller can supply its credentials. The dummy
-parent agent (`dummyProvider` / `dummyModel`) is never called.
+`run_claude` builds the `claude -p` command line from `config/claude-code.json`
+(model, effort, permission mode, setting sources, denied tools) and wires the
+PreToolUse/Stop/StopFailure hooks in `lib/cc/hook.mjs` through `--settings`.
+`run_opencode` runs `sudo -n bin/opencode-acp-isolated run <task>`, which starts
+`opencode run --format json` inside bwrap. A new provider is a new runner function
+plus its env scrub.
 
-This is the cleanest provider seam: the plugin chooses a provider by name, not by
-vendor-specific code.
+### Test seams: `FACTORY_STEP_BIN`, `FACTORY_STEP_RUNNER`, `FACTORY_CLAUDE_BIN`
 
-### `config/factory.patch.yml` — provider registration
-
-The patch disables `headless-runner` and inserts the factory's providers and
-orchestrator:
-
-- `subagent-claude-code`, `providerName: claude-code`, pinned
-  `model: claude-opus-5-5`, `permissionMode: acceptEdits`, effort `xhigh`, and an
-  env allowlist for `FACTORY_CC_OAUTH_TOKEN`, `FACTORY_CC_STEP`, and
-  `CLAUDE_CODE_EFFORT_LEVEL`.
-- `subagent-acp-opencode`, `providerName: opencode`, launched as
-  `sudo -n bin/opencode-acp-isolated`, `permission: allow`, with an env allowlist
-  for `FACTORY_OC_API_KEY`, `FACTORY_OC_WORKSPACE`, `FACTORY_OC_HOME`, and a
-  minimal `PATH`.
-- `factory-orchestrator`, which reads the task and provider from
-  `headlessStartup` / `FACTORY_PROVIDER`.
-
-`__FACTORY_ROOT__` and `__FACTORY_DSH_NM__` are rendered by `factory-step` at run
-time. A new provider is registered by adding another subagent entry here with its
-own env allowlist.
-
-### Test seams: `FACTORY_STEP_BIN` and `FACTORY_DSH_BIN`
-
-`bin/factory-step` runs `${FACTORY_DSH_BIN:-dsh}`, so tests can replace the DSH
-process without a model call. `bin/factory-impl-step` invokes
-`${FACTORY_STEP_BIN:-factory-step}`, so tests can replace the whole step adapter.
-These two variables keep the role scripts testable offline. They do not remove the
-role-specific provider choice inside the scripts.
+`bin/factory-step` runs `${FACTORY_STEP_RUNNER:-python3 lib/factory_step.py}`, so
+tests can replace the runner without a model call; `FACTORY_CLAUDE_BIN` and
+`FACTORY_OC_LAUNCHER` replace only the CLI under the real runner.
+`bin/factory-impl-step` invokes `${FACTORY_STEP_BIN:-factory-step}`, so tests can
+replace the whole step adapter. These keep the role scripts testable offline. They
+do not remove the role-specific provider choice inside the scripts.
 
 ### `lib/factory_github/client.py` — Backend interface
 
@@ -160,7 +137,7 @@ reference implementation and stays the stable entry point for tests.
 
 ### Output JSON
 
-Keep today's plugin payload keys and extend them without breaking readers:
+Keep today's step payload keys and extend them without breaking readers:
 
 ```json
 {
@@ -233,14 +210,14 @@ entry. Each new agent needs all of the following before it can fill a role:
   agent, and fail rather than silently fall back.
 - **A `factory-update` rule in the `needs-approval` class.** Inventory the agent
   package/binary, launcher, sudoers file, and config pin. Every update to them is
-  `needs-approval`, never `auto`, in the same class as the Agent SDK pin, the
-  pstack SHA pin, and DSH channel changes. General OS security/patch updates keep
+  `needs-approval`, never `auto`, in the same class as the Claude Code CLI pin
+  and the pstack SHA pin. General OS security/patch updates keep
   their existing auto policy.
 - **Owner approval and credentials.** The provider is enabled only after the
   owner approves it and supplies its credential out of band.
 
-The provider registration itself is a `config/factory.patch.yml` entry plus an
-adapter branch; unknown providers fail closed.
+The provider registration itself is a runner function in `lib/factory_step.py`
+plus an adapter branch; unknown providers fail closed.
 
 ## 5. Pipeline descriptor (proposal)
 

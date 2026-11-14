@@ -1,5 +1,5 @@
-# Factory DSH config
+# Factory config
 
-- `factory.patch.yml` — used by `bin/factory-step` (`dsh --patch …`). Path tokens `__FACTORY_ROOT__` and `__FACTORY_DSH_NM__` are rendered at run time from the checkout and `$HOME/.dsh/profiles/headless/node_modules`.
-- `headless.package.json` — copy of `~/.dsh/profiles/headless/package.json` (deps; bundles = base+headless only)
-- Profile `cordis.patch.yml` is empty; all factory overlays live in `factory.patch.yml`
+- `claude-code.json` — the Claude Code CLI pin used by `lib/factory_step.py` and checked by `factory-doctor`: npm version, model, effort, permission mode, setting sources, denied tools, default step timeout. Changing it goes through `factory-update` (needs approval).
+- `pstack-skills.manifest` / `pstack-sha` — pinned pstack subset.
+- `profiles/` — pipeline profiles (`docs/profiles.md`).
