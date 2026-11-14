@@ -10,31 +10,31 @@ warn() { echo "WARN $*"; }
 echo "=== factory-doctor $(date -Iseconds) ==="
 
 # Tools
-for c in git python3 node dsh bwrap sudo timeout diff patch; do
+for c in git python3 node claude bwrap sudo timeout diff patch; do
   if command -v "$c" >/dev/null; then ok "cmd $c ($($c --version 2>&1 | head -1 | cut -c1-60))"; else bad "cmd missing: $c"; fi
 done
 command -v python3.12 >/dev/null && ok "python3.12 $(python3.12 -V 2>&1)" || bad "python3.12 missing"
 command -v uv >/dev/null && ok "uv $(uv --version 2>&1)" || warn "uv missing (optional after 3.12 installed)"
 command -v agmsg >/dev/null && ok "agmsg present" || warn "agmsg missing"
 
-# DSH / profile
-if [[ -d "$HOME/.dsh/profiles/headless" ]]; then ok "dsh headless profile"; else bad "dsh headless profile missing"; fi
-CC_JS="$HOME/.dsh/profiles/headless/node_modules/@deepseek-ai/dsh-subagent-claude-code/lib/index.js"
-if [[ -f "$CC_JS" ]]; then
-  if grep -q 'FACTORY_CC_STEP' "$CC_JS" && grep -q 'makeCanUseTool' "$CC_JS"; then
-    ok "CC allowlist patch applied"
-    grep -q 'FACTORY_CC_USAGE_FILE' "$CC_JS" && ok "CC usage sidecar patch applied" || warn "CC usage sidecar patch missing (CC tokens will be null; run factory-setup)"
-  else
-    bad "CC allowlist patch NOT applied (run factory-setup)"
-  fi
+# Claude Code: standard CLI at the pinned version, driven by lib/factory_step.py (no DSH).
+CC_CFG="$FACTORY_ROOT/config/claude-code.json"
+cc_cfg() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' "$CC_CFG" "$1"; }
+if [[ -f "$CC_CFG" ]]; then
+  CC_PIN="$(cc_cfg version)"
+  CC_HAVE="$(claude --version 2>/dev/null | awk '{print $1}' || true)"
+  [[ -n "$CC_HAVE" && "$CC_HAVE" == "$CC_PIN" ]] && ok "Claude Code $CC_HAVE (pin)" || bad "Claude Code is ${CC_HAVE:-missing}, pin is $CC_PIN (run factory-setup)"
+  [[ "$(cc_cfg model)" == claude-opus-5-5 ]] && ok "CC model pin claude-opus-5-5" || warn "CC model pin is $(cc_cfg model), DECISIONS says claude-opus-5-5"
+  [[ "$(cc_cfg effort)" == xhigh ]] && ok "CC effort pin xhigh" || warn "CC effort pin is $(cc_cfg effort), DECISIONS says xhigh"
+  [[ "$(cc_cfg permission_mode)" != bypassPermissions ]] && ok "CC permission mode $(cc_cfg permission_mode)" || bad "CC permission mode must not be bypassPermissions"
 else
-  bad "dsh-subagent-claude-code missing"
+  bad "config/claude-code.json missing"
 fi
-# CC model/effort pin (DECISIONS: claude-opus-5-5 + xhigh)
-PATCH_YML="$FACTORY_ROOT/config/factory.patch.yml"
-grep -qE '^\s*model: claude-opus-5-5\s*$' "$PATCH_YML" && ok "CC model pin claude-opus-5-5" || warn "CC model pin claude-opus-5-5 missing in factory.patch.yml"
-grep -q "CLAUDE_CODE_EFFORT_LEVEL: 'xhigh'" "$PATCH_YML" && ok "CC effort pin xhigh" || warn "CC effort pin xhigh missing in factory.patch.yml"
-[[ -f "$CC_JS" ]] && { grep -q 'claude-agent-sdk.init' "$CC_JS" && ok "CC init capture (effective model/effort) patch" || warn "CC init capture patch missing (run factory-setup)"; }
+[[ -f "$FACTORY_ROOT/lib/factory_step.py" ]] && ok "step runner lib/factory_step.py" || bad "lib/factory_step.py missing"
+[[ -f "$FACTORY_ROOT/lib/cc/hook.mjs" ]] && ok "CC hook lib/cc/hook.mjs" || bad "lib/cc/hook.mjs missing"
+if [[ -d "$HOME/.dsh" ]] || command -v dsh >/dev/null 2>&1; then
+  warn "DSH is still installed but unused (npm uninstall -g @deepseek-ai/dsh; ~/.dsh can go)"
+fi
 # Model profile drift. The profile loader is read-only and never starts a model.
 PROFILE_ID="$("$FACTORY_ROOT/bin/factory-profile" id 2>/dev/null || true)"
 if PROFILE_CHECK="$("$FACTORY_ROOT/bin/factory-profile" check 2>&1)"; then
@@ -48,12 +48,7 @@ else
   done <<<"$PROFILE_CHECK"
   [[ "$profile_detail" -eq 1 ]] || bad "model profile ${PROFILE_ID:-unknown} check failed with no detail"
 fi
-[[ -f "$FACTORY_ROOT/plugin/cc-allowlist/allowlist.js" ]] && ok "allowlist.js" || bad "allowlist.js missing"
-if [[ -d "$FACTORY_ROOT/plugin/node_modules/@deepseek-ai/schemastery" ]]; then
-  ok "plugin deps (@deepseek-ai/schemastery)"
-else
-  bad "plugin deps missing (run factory-setup; plugin/node_modules is not in git)"
-fi
+[[ -f "$FACTORY_ROOT/lib/cc/allowlist.js" ]] && ok "allowlist.js" || bad "allowlist.js missing"
 
 # Keys present by name only
 for v in OPENCODE_GO_KEY CLAUDE_CODE_OAUTH_TOKEN; do
@@ -92,15 +87,6 @@ if id factory-oc >/dev/null 2>&1; then
   fi
 fi
 
-# Approved Agent SDK pin. Checked only when the profile package is installed.
-SDK_JSON="$HOME/.dsh/profiles/headless/node_modules/@anthropic-ai/claude-agent-sdk/package.json"
-if [[ -f "$SDK_JSON" ]]; then
-  sdk_ver=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version") or "")' "$SDK_JSON")
-  cc_ver=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("claudeCodeVersion") or "")' "$SDK_JSON")
-  [[ "$sdk_ver" == "0.3.319" ]] && ok "Agent SDK $sdk_ver" || bad "Agent SDK is ${sdk_ver:-unknown}, approved pin is 0.3.319"
-  [[ "$cc_ver" == "2.1.319" ]] && ok "Claude Code $cc_ver" || bad "bundled Claude Code is ${cc_ver:-unknown}, approved is 2.1.319"
-fi
-
 # Quick bwrap env probe (no network model call)
 WS=$(mktemp -d /tmp/factory-doctor-XXXXXX)
 echo hi > "$WS/x"
@@ -123,7 +109,8 @@ if python3 "$FACTORY_ROOT/local/tests/test_github_backend.py" >/tmp/factory-doct
 else
   bad "test_github_backend (see /tmp/factory-doctor-gh.txt)"
 fi
-if node "$FACTORY_ROOT/local/tests/test-cc-allowlist.mjs" >/tmp/factory-doctor-cc.txt 2>&1; then
+if node "$FACTORY_ROOT/local/tests/test-cc-allowlist.mjs" >/tmp/factory-doctor-cc.txt 2>&1 \
+  && node "$FACTORY_ROOT/local/tests/test_cc_hook.mjs" >>/tmp/factory-doctor-cc.txt 2>&1; then
   ok "test-cc-allowlist"
 else
   bad "test-cc-allowlist"
@@ -140,7 +127,7 @@ fi
 CC_SKILL="$HOME/.claude/skills/tdd/SKILL.md"
 [[ -f "$CC_SKILL" ]] && ok "pstack CC skill tdd" || bad "pstack CC skill tdd missing"
 if command -v node >/dev/null; then
-  stage_skills="$(node --input-type=module -e "import { stageSkillNames } from '$FACTORY_ROOT/plugin/cc-allowlist/pstack-session.js'; for (const n of stageSkillNames()) console.log(n)" 2>/dev/null || true)"
+  stage_skills="$(node "$FACTORY_ROOT/lib/cc/pstack-session.js" skills 2>/dev/null || true)"
   if [[ -z "$stage_skills" ]]; then
     bad "pstack stage skill list unreadable"
   else

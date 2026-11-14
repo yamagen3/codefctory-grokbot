@@ -1,39 +1,28 @@
 #!/usr/bin/env bash
-# factory-step — model-less DSH factory step (Claude Code Agent SDK or OpenCode ACP).
-# Usage:
-#   FACTORY_PROVIDER=claude-code factory-step [dsh opts…] <task…>
-#   FACTORY_PROVIDER=opencode    factory-step [dsh opts…] <task…>
+# factory-step — one model step through a standard CLI (no DSH).
+#   FACTORY_PROVIDER=claude-code factory-step [--json] <task…>   claude -p (config/claude-code.json pins)
+#   FACTORY_PROVIDER=opencode    factory-step [--json] <task…>   opencode run in the factory-oc sandbox
+# The runner is lib/factory_step.py (docs/design.md §11). This wrapper owns the
+# environment split, the provider-limit park/resume, and usage recording.
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
 
-PATCH_SRC="${FACTORY_PATCH:-$FACTORY_ROOT/config/factory.patch.yml}"
-PROFILE="${FACTORY_PROFILE:-headless}"
 PROVIDER="${FACTORY_PROVIDER:-claude-code}"
-
-if [[ ! -f "$PATCH_SRC" ]]; then
-  echo "factory-step: missing patch: $PATCH_SRC" >&2
-  exit 2
-fi
-# DSH does not expand the path tokens in factory.patch.yml. Render a temp copy
-# so plugin and profile paths follow this checkout and $HOME.
-PATCH="$(mktemp /tmp/factory-patch-XXXXXX.yml)"
 RESULT=""
 ERR=""
 CC_USAGE=""
-trap 'rm -f "$PATCH" ${RESULT:+"$RESULT"} ${ERR:+"$ERR"} ${CC_USAGE:+"$CC_USAGE"}' EXIT
-factory_render_patch "$PATCH_SRC" "$PATCH"
+trap 'rm -f ${RESULT:+"$RESULT"} ${ERR:+"$ERR"} ${CC_USAGE:+"$CC_USAGE"}' EXIT
 
 # Never let Anthropic API-key auth win over Claude OAuth for CC.
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN || true
 
 case "$PROVIDER" in
   claude-code)
-    # Stash OAuth under a TOKEN-matching name so scrub strips ambient copies from children,
-    # then CC overlay re-injects only into the Claude Code child.
+    # Stash OAuth; the runner hands it only to the claude child (never to OC or tool subprocesses).
     if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
       export FACTORY_CC_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN"
     fi
-    # Keep DeepSeek / OC workspace away from the DSH parent and from CC.
+    # Keep DeepSeek / OC keys and the OC workspace away from CC.
     unset DEEPSEEK_API_KEY OPENCODE_GO_KEY OPENCODE_API_KEY CLAUDE_CODE_OAUTH_TOKEN FACTORY_OC_WORKSPACE FACTORY_OC_API_KEY || true
     ;;
   opencode)
@@ -41,9 +30,9 @@ case "$PROVIDER" in
       echo "factory-step: OPENCODE_GO_KEY required for provider=opencode" >&2
       exit 2
     fi
-    # Stash under KEY-matching name (scrubbed from ambient); ACP overlay maps to launcher.
+    # Stash under the name sudoers keeps; the launcher maps it to the sandboxed child only.
     export FACTORY_OC_API_KEY="${FACTORY_OC_API_KEY:-$OPENCODE_GO_KEY}"
-    # Strip Go/DeepSeek/CC secrets from DSH parent; only child gets the Go key.
+    # Strip Go/DeepSeek/CC secrets; only the sandboxed OpenCode child gets the Go key.
     unset OPENCODE_GO_KEY DEEPSEEK_API_KEY OPENCODE_API_KEY OPENCODE_GO_API_KEY OPENCODE_ZEN_API_KEY \
       CLAUDE_CODE_OAUTH_TOKEN FACTORY_CC_OAUTH_TOKEN || true
     if [[ -z "${FACTORY_OC_WORKSPACE:-}" ]]; then
@@ -95,8 +84,7 @@ if [[ "$PROVIDER" == "claude-code" && "${FACTORY_PROVIDER_IGNORE_LIMIT:-0}" != "
 fi
 
 # Usage tracking (local/usage/<date>/steps.jsonl). A usage failure never changes the step's stdout or exit code.
-# A plugin that never runs must. dsh can exit 0 with empty stdout and only a warning when the
-# orchestrator fails to load (missing plugin deps) or when it ignores the plugin's exit.
+# A runner that never reaches its step-end line must still fail the step.
 USAGE="$FACTORY_ROOT/bin/factory-usage"
 RESULT=$(mktemp /tmp/factory-step-result-XXXXXX)
 ERR=$(mktemp /tmp/factory-step-err-XXXXXX)
@@ -104,41 +92,47 @@ if [[ -z "${FACTORY_USAGE_DISABLE:-}" ]]; then
   OC_BEFORE=""
   [[ "$PROVIDER" == opencode ]] && OC_BEFORE=$("$USAGE" oc-stats 2>/dev/null || true)
   "$USAGE" agmsg-poll before >/dev/null 2>&1 || true
-  if [[ "$PROVIDER" == claude-code ]]; then
-    CC_USAGE=$(mktemp /tmp/factory-step-ccusage-XXXXXX); export FACTORY_CC_USAGE_FILE="$CC_USAGE"
-  fi
+fi
+if [[ "$PROVIDER" == claude-code ]]; then
+  # Always captured: the limit classifier reads it even when usage recording is off.
+  CC_USAGE=$(mktemp /tmp/factory-step-ccusage-XXXXXX); export FACTORY_CC_USAGE_FILE="$CC_USAGE"
 fi
 STARTED=$(date -Iseconds); T0=$(date +%s%3N)
 set +e
-"${FACTORY_DSH_BIN:-dsh}" --profile "$PROFILE" --patch "$PATCH" "$@" \
+if [[ -n "${FACTORY_STEP_RUNNER:-}" ]]; then
+  RUNNER=("$FACTORY_STEP_RUNNER")
+else
+  RUNNER=(python3 "$FACTORY_ROOT/lib/factory_step.py")
+fi
+"${RUNNER[@]}" "$@" \
   > >(tee "$RESULT") 2> >(tee "$ERR" >&2)
 EC=$?
 wait || true
 set -e
 T1=$(date +%s%3N); ENDED=$(date -Iseconds)
-# The orchestrator always logs "factory: step end" before it exits. Missing that line with
-# empty stdout means the plugin never ran (import failure is the observed case).
+# The runner always logs "factory: step end" last. Missing that line with empty
+# stdout means the step failed to load or run.
 if ! grep -q 'factory: step end ' "$ERR"; then
   if [[ "$EC" -eq 0 && ! -s "$RESULT" ]]; then
-    echo "factory-step: ERROR plugin or step failed to load or run (dsh exited 0 with empty stdout and no factory step result)." >&2
+    echo "factory-step: ERROR step failed to load or run (runner exited 0 with empty stdout and no factory step result)." >&2
     if [[ -s "$ERR" ]]; then
-      echo "factory-step: dsh stderr:" >&2
+      echo "factory-step: runner stderr:" >&2
       cat "$ERR" >&2
     else
-      echo "factory-step: dsh produced no stderr. Run factory-setup so plugin/ gets npm ci." >&2
+      echo "factory-step: runner produced no stderr. Run factory-doctor / factory-setup." >&2
     fi
     EC=1
-  elif [[ "$EC" -eq 0 ]] && grep -Eq 'factory: (startActivation failed|activation rejected|DSH /goal failed)' "$ERR"; then
-    echo "factory-step: ERROR step failed to run (see factory: lines above) but dsh exited 0." >&2
+  elif [[ "$EC" -eq 0 ]] && grep -Eq 'factory: step failed to run' "$ERR"; then
+    echo "factory-step: ERROR step failed to run (see factory: lines above) but the runner exited 0." >&2
     EC=1
   fi
 else
-  plugin_ec=$(sed -n 's/.*factory: step end .* exit=\([0-9][0-9]*\).*/\1/p' "$ERR" | tail -1)
-  if [[ -n "${plugin_ec:-}" && "$plugin_ec" != 0 && "$EC" -eq 0 ]]; then
-    echo "factory-step: ERROR step failed (plugin exit=${plugin_ec}) but dsh exited 0." >&2
-    EC=$plugin_ec
+  step_ec=$(sed -n 's/.*factory: step end .* exit=\([0-9][0-9]*\).*/\1/p' "$ERR" | tail -1)
+  if [[ -n "${step_ec:-}" && "$step_ec" != 0 && "$EC" -eq 0 ]]; then
+    echo "factory-step: ERROR step failed (step exit=${step_ec}) but the runner exited 0." >&2
+    EC=$step_ec
   fi
-  [[ "${plugin_ec:-}" == 124 ]] && EC=124
+  [[ "${step_ec:-}" == 124 ]] && EC=124
 fi
 LIMIT_MARKED=0
 if [[ "$PROVIDER" == "claude-code" && -n "$CC_USAGE" && -f "$CC_USAGE" ]]; then

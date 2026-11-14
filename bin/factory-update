@@ -36,13 +36,14 @@ HOME = Path.home()
 ROOT = Path(os.environ["FACTORY_ROOT"]) if os.environ.get("FACTORY_ROOT") else Path(__file__).resolve().parents[1]
 UPD = Path(os.environ.get("FACTORY_UPDATE_DIR", ROOT / "local/updates"))
 PREFIX = Path(os.environ.get("FACTORY_UPDATE_NPM_PREFIX", HOME / ".local"))
-PROFILE = HOME / ".dsh/profiles/headless"
+CC_CONFIG = ROOT / "config/claude-code.json"
 OC_ISO_BIN = Path("/home/factory-oc/bin/opencode")
 AGMSG_CLONE = ROOT / "tools/agmsg"
 AGMSG_SKILL = HOME / ".agents/skills/agmsg"
 PSTACK = ROOT / "tools/pstack-claude"
 OSV_VERSION = "2.7.0"
-DSH_PKG = "@deepseek-ai/dsh"
+DSH_PKG = "@deepseek-ai/dsh"  # removed 2026-11-14; still recognised so a leftover install is never auto-updated
+CC_PKG = "@anthropic-ai/claude-code"
 OC_PKG = "@opencode/cli"
 PONG = "Reply with exactly the single word pong and nothing else."
 PONG_CHECK = ("python3 -c \"import sys,json; d=json.loads(sys.stdin.read().strip().splitlines()[-1]); "
@@ -127,6 +128,8 @@ def classify(cur, new, rule=None):
         return "none", "not newer"
     if rule == "dsh":
         return "needs-approval", "DSH release channel change (rc/prerelease policy)"
+    if rule == "claude-code":
+        return "needs-approval", "Claude Code is the factory brain, pinned in config/claude-code.json (" + bump_kind(cur, new) + ")"
     k = bump_kind(cur, new)
     if k in ("patch", "minor"):
         return "auto", k
@@ -230,11 +233,18 @@ def check_npm(rep):
             continue
         tags = info.get("dist-tags", {})
         versions = info.get("versions", [])
-        if name == DSH_PKG:
-            newer = sorted({v for v in tags.values() if vkey(v) > vkey(cur)}, key=vkey)
-            for v in newer:
+        if name == CC_PKG:
+            pin = cc_pin()
+            safe, top = best_stable(versions, cur)
+            for v in sorted({x for x in (safe, top) if x}, key=vkey):
+                cls, why = classify(cur, v, rule="claude-code")
                 rep["actions"].append({"id": f"npm:{name}@{v}", "kind": "npm", "name": name, "from": cur, "to": v,
-                                       "class": "needs-approval", "reason": "DSH rc/prerelease channel change (" + ",".join(k for k, t in tags.items() if t == v) + ")"})
+                                       "class": cls, "reason": why})
+            if pin and pin != cur:
+                rep["warnings"].append(f"{CC_PKG} installed {cur}, config/claude-code.json pins {pin} (run factory-setup)")
+            continue
+        if name == DSH_PKG:
+            rep["warnings"].append("@deepseek-ai/dsh is still installed but no longer used (npm uninstall -g @deepseek-ai/dsh)")
             continue
         safe, top = best_stable(versions, cur)
         if safe:
@@ -255,31 +265,22 @@ def pkgjson(p):
         return {}
 
 
-def check_dsh_nested(rep):
-    nm = PROFILE / "node_modules"
-    cc = pkgjson(nm / "@deepseek-ai/dsh-subagent-claude-code/package.json")
-    sdk = pkgjson(nm / "@anthropic-ai/claude-agent-sdk/package.json")
-    inv = {"profile": str(PROFILE), "dsh-subagent-claude-code": cc.get("version"),
-           "dsh-subagent-acp": pkgjson(nm / "@deepseek-ai/dsh-subagent-acp/package.json").get("version"),
-           "claude-agent-sdk": sdk.get("version"), "claude": sdk.get("claudeCodeVersion"),
-           "cc_allowlist_patch": "FACTORY_CC_STEP" in (nm / "@deepseek-ai/dsh-subagent-claude-code/lib/index.js").read_text(errors="ignore")
-           if (nm / "@deepseek-ai/dsh-subagent-claude-code/lib/index.js").exists() else None}
-    rep["inventory"]["dsh_profile"] = inv
-    info = npm_view("@anthropic-ai/claude-agent-sdk")
-    if info and sdk.get("version"):
-        lat = info.get("dist-tags", {}).get("latest")
-        if lat and vkey(lat) > vkey(sdk["version"]):
-            rep["actions"].append({"id": f"sdk:claude-agent-sdk@{lat}", "kind": "cc-sdk", "name": "@anthropic-ai/claude-agent-sdk",
-                                   "from": sdk["version"], "to": lat, "class": "needs-approval",
-                                   "reason": f"pinned exactly by dsh-subagent-claude-code {cc.get('version')}; approve to override in the profile ({bump_kind(sdk['version'], lat)})"})
-    lock = PROFILE / "pnpm-lock.yaml"
-    if lock.exists():
-        osv = osv_scan(lock)
-        rep["vulns"]["osv_dsh_profile"] = osv
-        for e in group_vulns(osv):
-            rep["actions"].append({"id": f"vuln:profile:{e['package']}@{e['version']}", "kind": "info",
-                                   "name": e["package"], "from": e["version"], "to": e["fix"] or "no fix listed",
-                                   "class": "needs-approval", "reason": f"{', '.join(e['ids'])} in DSH profile (pinned by DSH packages; needs DSH release or override)"})
+def cc_pin():
+    try:
+        return json.loads(CC_CONFIG.read_text()).get("version")
+    except (OSError, ValueError):
+        return None
+
+
+def check_claude_cli(rep):
+    """Standard Claude Code CLI (npm global @anthropic-ai/claude-code). The factory has no
+    DSH profile, plugin, or Agent SDK; claude -p is the only CC entry point."""
+    p = run(["claude", "--version"], timeout=60) if which("claude") else None
+    ver = (p.stdout.strip().split() or [None])[0] if p and p.returncode == 0 else None
+    rep["inventory"]["claude_cli"] = {"path": which("claude"), "version": ver, "pin": cc_pin(),
+                                      "npm": npm_globals().get(CC_PKG)}
+    if not ver:
+        rep["errors"].append("claude CLI missing (run factory-setup)")
 
 
 def fixed_for(v):
@@ -464,7 +465,7 @@ def do_check():
     t = now()
     rep = {"generated": t.isoformat(timespec="seconds"), "inventory": {}, "vulns": {}, "actions": [], "warnings": [], "errors": [],
            "secrets_present": secrets_presence()}
-    for name, fn in [("npm", check_npm), ("dsh_nested", check_dsh_nested), ("tools", check_tools), ("apt", apt_check),
+    for name, fn in [("npm", check_npm), ("claude_cli", check_claude_cli), ("tools", check_tools), ("apt", apt_check),
                      ("uv_python", check_uv_python), ("factory_oc", check_oc_isolation), ("actions", check_actions_pins)]:
         try:
             fn(rep)
@@ -498,8 +499,8 @@ def render_check(rep):
     L.append("## Inventory")
     for k, v in (inv.get("npm_globals") or {}).items():
         L.append(f"- npm global {k} {v}")
-    dp = inv.get("dsh_profile") or {}
-    L.append(f"- DSH profile: subagent-claude-code {dp.get('dsh-subagent-claude-code')}, Agent SDK {dp.get('claude-agent-sdk')}, claude {dp.get('claude')}, CC allowlist patch={dp.get('cc_allowlist_patch')}")
+    cc = inv.get("claude_cli") or {}
+    L.append(f"- Claude Code CLI {cc.get('version')} (pin {cc.get('pin')}, npm {cc.get('npm')}) at {cc.get('path')}")
     up = inv.get("uv_python") or {}
     L.append(f"- uv {up.get('uv')} (latest {up.get('uv_latest')}); python3.12 {up.get('python3.12')} (newest available {up.get('python3.12_available')})")
     fo = inv.get("factory_oc") or {}
@@ -587,55 +588,15 @@ def apply_npm(a, staging):
     got = pkgjson(npm_pkg_dir(a["name"]) / "package.json").get("version")
     if got != a["to"]:
         raise RuntimeError(f"installed {a['name']}@{got}, expected {a['to']}")
-    if a["name"] == DSH_PKG and not os.environ.get("FACTORY_UPDATE_SKIP_POST"):
-        apply_dsh_profile(a["to"])
+    if a["name"] == CC_PKG:
+        set_cc_pin(a["to"])
 
 
-def apply_dsh_profile(version):
-    """DSH host and the headless profile's subagent packages move together (exact rc pins)."""
-    pj = PROFILE / "package.json"
-    d = json.loads(pj.read_text())
-    deps = {k: version for k in d.get("dependencies", {}) if k.startswith("@deepseek-ai/dsh-")}
-    run(["dsh", "plugin", "--profile", PROFILE.name, "add", "--save-exact"] + [f"{k}@{v}" for k, v in deps.items()], check=True, timeout=1200)
-    for k in deps:
-        got = pkgjson(PROFILE / "node_modules" / k / "package.json").get("version")
-        if got != version:
-            raise RuntimeError(f"profile {k}@{got}, expected {version}")
-    # keep the tracked copy of the profile manifest in sync
-    shutil.copy(pj, ROOT / "config/headless.package.json")
-
-
-def apply_cc_sdk(version):
-    """Override DSH's exact Agent SDK pin in the headless profile (pnpm overrides in pnpm-workspace.yaml).
-    The platform binary package (bundled claude CLI) is overridden to the same version."""
-    ws = PROFILE / "pnpm-workspace.yaml"
-    lines = [l for l in ws.read_text().splitlines()]
-    # drop any previous factory override block
-    out, skip = [], False
-    for l in lines:
-        if l.startswith("overrides:"):
-            skip = True
-            continue
-        if skip and (l.startswith("  ") or not l.strip()):
-            continue
-        skip = False
-        out.append(l)
-    out += ["overrides:", f"  '@anthropic-ai/claude-agent-sdk': {version}", f"  '@anthropic-ai/claude-agent-sdk-linux-x64': {version}"]
-    ws.write_text("\n".join(out) + "\n")
-    run(["dsh", "plugin", "--profile", PROFILE.name, "install"], check=True, timeout=1200)
-    for pk in ("@anthropic-ai/claude-agent-sdk", "@anthropic-ai/claude-agent-sdk-linux-x64"):
-        got = pkgjson(PROFILE / "node_modules" / pk / "package.json").get("version")
-        if got != version:
-            raise RuntimeError(f"profile {pk}@{got}, expected {version}")
-    shutil.copy(ws, ROOT / "config/headless.pnpm-workspace.yaml")
-
-
-def snap_dsh_profile(snap):
-    dst = snap.d / "dsh-profile"
-    run(["cp", "-a", "--reflink=auto", str(PROFILE), str(dst)], check=True, timeout=900)
-    cfg = snap.d / "headless.package.json"
-    shutil.copy(ROOT / "config/headless.package.json", cfg)
-    snap.items.append({"kind": "dsh-profile", "path": str(PROFILE), "backup": str(dst), "cfg_backup": str(cfg)})
+def set_cc_pin(version):
+    """An approved Claude Code update moves the pin with it (rollback restores the old pin)."""
+    doc = json.loads(CC_CONFIG.read_text())
+    doc["version"] = version
+    CC_CONFIG.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
 
 
 def snap_file_sudo(snap, kind, path):
@@ -764,7 +725,7 @@ def provider_outage(rc, text):
 
 
 def post_apply(changed_kinds):
-    """Re-apply CC allowlist patch + pstack (factory-setup is idempotent) and resync factory-oc OpenCode."""
+    """Re-run factory-setup (idempotent: claude CLI pin, pstack, factory-oc) and resync factory-oc OpenCode."""
     if os.environ.get("FACTORY_UPDATE_SKIP_POST"):
         return []
     notes = []
@@ -867,7 +828,7 @@ def do_apply(rep):
                 return res
     snap = Snapshot(d / "snapshot")
     staging = Path(tempfile.mkdtemp(prefix="factory-update-stage-"))
-    order = {"npm": 0, "cc-sdk": 0.5, "agmsg-skill": 1, "oc-copy": 2, "uv": 3, "python": 4, "apt": 5}
+    order = {"npm": 0, "agmsg-skill": 1, "oc-copy": 2, "uv": 3, "python": 4, "apt": 5}
     auto.sort(key=lambda a: order.get(a["kind"], 9))
     try:
         # snapshot everything first
@@ -876,11 +837,8 @@ def do_apply(rep):
         for a in auto:
             if a["kind"] == "npm":
                 snap_npm(snap, a)
-                if a["name"] == DSH_PKG and not os.environ.get("FACTORY_UPDATE_SKIP_POST"):
-                    snap_dsh_profile(snap)
-            elif a["kind"] == "cc-sdk":
-                if not any(i.get("kind") == "dsh-profile" for i in snap.items):
-                    snap_dsh_profile(snap)
+                if a["name"] == CC_PKG:
+                    snap.items.append({"kind": "cc-pin", "version": cc_pin()})
             elif a["kind"] == "agmsg-skill":
                 dst = snap.d / "agmsg-skill"
                 run(["cp", "-a", str(AGMSG_SKILL), str(dst)], check=True)
@@ -904,8 +862,6 @@ def do_apply(rep):
             log(f"apply: {a['id']}")
             if a["kind"] == "npm":
                 apply_npm(a, staging)
-            elif a["kind"] == "cc-sdk":
-                apply_cc_sdk(a["to"])
             elif a["kind"] == "agmsg-skill":
                 apply_agmsg(a)
             elif a["kind"] == "oc-copy":
@@ -969,10 +925,8 @@ def rollback(snap):
         k = it["kind"]
         if k == "npm":
             restore_npm(it)
-        elif k == "dsh-profile":
-            shutil.rmtree(it["path"])
-            run(["cp", "-a", "--reflink=auto", it["backup"], it["path"]], check=True, timeout=900)
-            shutil.copy(it["cfg_backup"], ROOT / "config/headless.package.json")
+        elif k == "cc-pin" and it.get("version"):
+            set_cc_pin(it["version"])
         elif k == "file":
             restore_file(it)
         elif k == "python-link":

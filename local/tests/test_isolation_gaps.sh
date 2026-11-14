@@ -36,7 +36,7 @@ grep -q 'a.txt' "$T/clean.patch" || { echo "FAIL: patch missing a.txt"; exit 1; 
 "$ROOT/bin/factory-patch-extract" check "$T/clean.patch" >/dev/null
 
 echo "=== allowlist denies unknown step ==="
-ALLOWLIST="$ROOT/plugin/cc-allowlist/allowlist.js" "$NODE" --input-type=module <<'JS'
+ALLOWLIST="$ROOT/lib/cc/allowlist.js" "$NODE" --input-type=module <<'JS'
 import assert from 'node:assert/strict'
 import { pathToFileURL } from 'node:url'
 

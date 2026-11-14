@@ -1,0 +1,10 @@
+{
+  "comment": "Pins for factory Claude Code steps. bin/factory-step runs the standard `claude -p` CLI with these values (docs/design.md section 11, DECISIONS.md 2026-11-14). factory-profile checks model and effort here.",
+  "version": "2.1.319",
+  "model": "claude-opus-5-5",
+  "effort": "xhigh",
+  "permission_mode": "acceptEdits",
+  "setting_sources": "user",
+  "disallowed_tools": "AskUserQuestion,ExitPlanMode",
+  "timeoutMs": 1800000
+}

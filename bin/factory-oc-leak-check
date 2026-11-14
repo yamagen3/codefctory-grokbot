@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # OpenCode isolation leak check (P3 "Test B", 14 items). No model call; never prints secret values.
 # Derives the sandbox from the real launcher: copies bin/opencode-acp-isolated, swaps only the final
-# `"$OC_BIN" acp` for a probe script, and runs it through the same root -> factory-oc -> bwrap path.
+# `"$OC_BIN" "${OC_ARGS[@]}"` (acp or run) for a probe script, and runs it through the same root -> factory-oc -> bwrap path.
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/factory-common.sh"
 [[ -n "${OPENCODE_GO_KEY:-}" ]] || die "OPENCODE_GO_KEY must be set (presence only)"
@@ -9,8 +9,9 @@ T=$(mktemp -d /tmp/factory-leak-XXXXXX); chmod 755 "$T"
 WS=/var/factory/oc-workspaces/leak-$(date +%Y%m%d-%H%M%S)-$$
 sudo -n mkdir -p "$WS/.git"
 trap 'sudo -n rm -rf "$T" "$WS"' EXIT
-grep -q '"$OC_BIN" acp' "$FACTORY_ROOT/bin/opencode-acp-isolated" || die "launcher shape changed; update leak check"
-sed 's#"$OC_BIN" acp#/bin/sh "$WS/.probe.sh"#' "$FACTORY_ROOT/bin/opencode-acp-isolated" > "$T/launcher"
+grep -qF '"$OC_BIN" "${OC_ARGS[@]}"' "$FACTORY_ROOT/bin/opencode-acp-isolated" || die "launcher shape changed; update leak check"
+sed 's#"$OC_BIN" "${OC_ARGS\[@\]}"#/bin/sh "$WS/.probe.sh"#' "$FACTORY_ROOT/bin/opencode-acp-isolated" > "$T/launcher"
+grep -qF '/bin/sh "$WS/.probe.sh"' "$T/launcher" || die "leak check could not swap the launcher exec line"
 chmod 755 "$T/launcher"
 # The probe runs inside bwrap, which does not mount the invoking user's home or the
 # factory checkout. Bake those paths in here (14 checks total). When the checkout

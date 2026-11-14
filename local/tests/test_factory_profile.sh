@@ -11,7 +11,7 @@ fail() { echo "test_factory_profile: FAIL $*" >&2; exit 1; }
 unset FACTORY_MODEL_PROFILE || true
 BASE="$T/root"
 FILES=(
-  config/factory.patch.yml
+  config/claude-code.json
   bin/factory-common.sh
   bin/factory-run-local
   bin/factory-stall-retry
@@ -55,15 +55,15 @@ set -e
 
 echo "=== (b) brain effort drift is named ==="
 make_root "$BASE"
-python3 - "$BASE/config/factory.patch.yml" <<'PY'
+python3 - "$BASE/config/claude-code.json" <<'PY'
 import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
 text = path.read_text()
-want = "CLAUDE_CODE_EFFORT_LEVEL: 'xhigh'"
+want = '"effort": "xhigh"'
 assert want in text, text
-path.write_text(text.replace(want, "CLAUDE_CODE_EFFORT_LEVEL: 'high'"))
+path.write_text(text.replace(want, '"effort": "high"'))
 PY
 set +e
 out=$(run_profile "$BASE" check 2>&1)
@@ -133,15 +133,15 @@ grep -qi 'not found\|cannot read' <<<"$out" \
 
 echo "=== (h) model drift is named ==="
 make_root "$BASE"
-python3 - "$BASE/config/factory.patch.yml" <<'PY'
+python3 - "$BASE/config/claude-code.json" <<'PY'
 import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
 text = path.read_text()
-want = "model: claude-opus-5-5"
+want = '"model": "claude-opus-5-5"'
 assert want in text, text
-path.write_text(text.replace(want, "model: claude-opus-5-5-x", 1))
+path.write_text(text.replace(want, '"model": "claude-opus-5-5-x"', 1))
 PY
 set +e
 out=$(run_profile "$BASE" check 2>&1)

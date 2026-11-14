@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPEC prompt is Claude Code /goal. DSH commands/goals are not touched.
+# SPEC prompt is Claude Code /goal, passed as the `claude -p` prompt. No DSH.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck disable=SC1091
@@ -31,12 +31,13 @@ grep -q 'factory-impl-step' "$ROOT/bin/factory-run-local" || fail "run-local no 
 grep -q 'factory-gate-grok' "$ROOT/bin/factory-run-local" || fail "run-local no longer runs gate/grok"
 # IMPL prompt is not a CC /goal.
 grep -q '^/goal ' "$ROOT/bin/factory-impl-step" && fail "impl step starts with /goal" || true
-if grep -qE 'ctx\.commands|ctx\.goals|configureDshGoal|FACTORY_DSH_GOAL_LINE' "$ROOT/plugin/index.js"; then
-  fail "orchestrator still depends on DSH goal services"
+# The runner hands the task to `claude -p` as the prompt, so /goal is expanded by Claude Code.
+grep -q '"-p", task' "$ROOT/lib/factory_step.py" || fail "runner does not pass the task as the claude -p prompt"
+[[ ! -e "$ROOT/plugin" ]] || fail "DSH plugin directory still present"
+[[ ! -e "$ROOT/config/factory.patch.yml" ]] || fail "DSH patch still present"
+if grep -rqE '\bdsh (--profile|plugin)' "$ROOT/bin" "$ROOT/lib"; then
+  fail "a factory script still invokes dsh"
 fi
-grep -q "inject = \['agents', 'subagents'\]" "$ROOT/plugin/index.js" \
-  || fail "inject list changed"
-[[ ! -e "$ROOT/plugin/dsh-goal.js" ]] || fail "dsh-goal.js still present"
 [[ ! -e "$ROOT/bin/factory-goal" ]] || fail "factory-goal substitute still present"
 
 set +e

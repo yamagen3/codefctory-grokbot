@@ -14,7 +14,7 @@ export GIT_AUTHOR_NAME=factory GIT_AUTHOR_EMAIL=factory@localhost
 export GIT_COMMITTER_NAME=factory GIT_COMMITTER_EMAIL=factory@localhost
 
 PROFILE_FILES=(
-  config/factory.patch.yml
+  config/claude-code.json
   bin/factory-common.sh
   bin/factory-run-local
   bin/factory-stall-retry
@@ -50,15 +50,15 @@ out=$(FACTORY_ROOT="$ROOT" "$ROOT/bin/factory-profile" check) \
 echo "=== (b) a model-line drift makes check fail ==="
 TREE="$T/tree-model"
 make_profile_tree "$TREE"
-python3 - "$TREE/config/factory.patch.yml" <<'PY'
+python3 - "$TREE/config/claude-code.json" <<'PY'
 import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
 text = path.read_text()
-want = "model: claude-opus-5-5"
+want = '"model": "claude-opus-5-5"'
 assert want in text, text
-path.write_text(text.replace(want, "model: claude-opus-5-5-x", 1))
+path.write_text(text.replace(want, '"model": "claude-opus-5-5-x"', 1))
 PY
 set +e
 out=$(run_profile "$TREE" check 2>&1)

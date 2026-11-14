@@ -1,8 +1,8 @@
 # Factory layout (local)
 
-**Decision (closes design.md §8 plugin location):** the factory (DSH plugin, launchers, orchestrator) lives in its **own** git repo. On the original host that checkout is `/workspace/factory`. Scripts take `FACTORY_ROOT` or the directory that contains `bin/`; they do not require that path. Product/target repos live under `targets/` (or a path passed to the orchestrator) and are separate git repos with a local bare `origin`.
+**Decision (closes design.md §8 plugin location):** the factory (step runner, launchers, orchestrator) lives in its **own** git repo. On the original host that checkout is `/workspace/factory`. Scripts take `FACTORY_ROOT` or the directory that contains `bin/`; they do not require that path. Product/target repos live under `targets/` (or a path passed to the orchestrator) and are separate git repos with a local bare `origin`.
 
-OpenCode isolation only bind-mounts the product workspace + `factory-oc` home — **never** the factory checkout. So OpenCode cannot modify the factory plugin even if a product tree somehow nested one.
+OpenCode isolation only bind-mounts the product workspace + `factory-oc` home — **never** the factory checkout. So OpenCode cannot modify the factory even if a product tree somehow nested one.
 
 `tools/agmsg/` is an upstream checkout used for reference/install only — **not** part of the factory commit set (gitignored). Use the installed `agmsg` / `~/.agents/skills/agmsg`.
 
@@ -18,12 +18,12 @@ OpenCode isolation only bind-mounts the product workspace + `factory-oc` home �
 ## Usage tracking (`bin/factory-usage`)
 
 - Records: `local/usage/<date>/steps.jsonl` (1 行 1 工程: run_id/target/round/step/provider/started_at/ended_at/duration_ms/input|output|total_tokens/token_source/stop_reason/exit_code/notes)、`agmsg.jsonl`（send / unread poll）、`runs.jsonl` + `local/usage/runs/<run_id>.md`（run 終了サマリ）。`local/usage/` は gitignore。
-- Hooks: `factory-step`（全 CC/OpenCode 起動の wall time + tokens）、spec/impl/gate-claude 各 step が `FACTORY_USAGE_STEP`/run id を付与、`factory-run-local` が round と終了時サマリ、`factory-gate-grok record` が grok 待ち時間、plugin の agmsg send が送信回数/時間。
+- Hooks: `factory-step`（全 CC/OpenCode 起動の wall time + tokens）、spec/impl/gate-claude 各 step が `FACTORY_USAGE_STEP`/run id を付与、`factory-run-local` が round と終了時サマリ、`factory-gate-grok record` が grok 待ち時間、factory-step の agmsg send が送信回数/時間。
 - Report: `factory-usage show|summary|agmsg|balance`（balance = OpenCode Go 残量、CC 残量は対象外）。Tests: `local/tests/test_factory_usage.sh`（モデル呼び出しなし）。
 - `bin/factory-oc-provision`（`factory-setup` から呼ぶ）: box 初期化後の OpenCode 隔離復旧（user factory-oc / binary / opencode.json / sudoers / `/var/factory/oc-workspaces`）。冪等。opencode.json は model `opencode-go/deepseek-v4.1-flash`、permission `*` allow、および `providers.opencode-go.models.deepseek-v4.1-flash.settings.reasoningEffort=max`（`…-max` モデル ID は作らない）。`--print-config` はその JSON だけを出す。
-- pstack: `factory-pstack-install` recopies the pinned subset. CC does not receive those files unless `apply-cc-allowlist-patch.sh` has spread `pstackQueryOverlay()` into the Agent SDK query. See `docs/pstack-cc.md`.
+- pstack: `factory-pstack-install` recopies the pinned subset. SPEC/gate receive their stage skill bodies through `claude -p --append-system-prompt-file` (`lib/cc/pstack-session.js`). See `docs/pstack-cc.md`.
 - OpenCode max: `factory-doctor` fails when the provisioned JSON or the live `/home/factory-oc/.config/opencode/opencode.json` lacks `reasoningEffort=max`. Restore with `factory-oc-provision`.
-- SPEC's Claude Code prompt starts with `/goal ` plus a measurable condition, how to prove it, a turn bound, and the brief (`docs/goal.md`). DSH `/goal` is not used. OpenCode IMPL is an ordinary prompt.
+- SPEC's Claude Code prompt starts with `/goal ` plus a measurable condition, how to prove it, a turn bound, and the brief (`docs/goal.md`). OpenCode IMPL is an ordinary prompt.
 - OpenCode reprovision: `factory-oc-provision` writes `reasoningEffort=max` through `factory_oc_write_config`. A max-less file is replaced. `--apply-config <file>` is the same write without sudo.
 
 ## One cron tick (`bin/factory-tick`)

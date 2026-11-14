@@ -1,0 +1,5 @@
+{
+  "comment": "ES modules for the Claude Code hook and pstack render. This file also stops Node from reading a package.json above lib/cc.",
+  "private": true,
+  "type": "module"
+}

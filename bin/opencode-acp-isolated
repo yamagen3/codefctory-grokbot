@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Sandboxed OpenCode for factory IMPL (user factory-oc, bwrap, clean env).
+#   opencode-acp-isolated                 opencode acp (legacy ACP server; kept for manual use)
+#   opencode-acp-isolated run <message>   opencode run --format json <message>  (bin/factory-step)
+# The name is kept so the existing sudoers rule (/etc/sudoers.d/factory-oc-acp) still matches.
 # Paid OpenCode Go. Source: OPENCODE_GO_KEY (box) → FACTORY_OC_API_KEY stash → child OPENCODE_API_KEY.
 # Model: opencode-go/deepseek-v4.1-flash. Auth also under factory-oc home (shared or FACTORY_OC_HOME).
 
@@ -13,6 +17,22 @@ HOME_ROOT="/var/factory/oc-homes"
 SHARED_HOME="/home/factory-oc"
 
 die() { echo "opencode-acp-isolated: $*" >&2; exit 2; }
+
+# Mode is validated before anything else runs. sudoers allows any arguments,
+# so only these two shapes are accepted and the message can never be a flag.
+MODE="${1:-acp}"
+case "$MODE" in
+  acp)
+    [[ $# -le 1 ]] || die "acp takes no arguments"
+    ;;
+  run)
+    [[ $# -eq 2 ]] || die "usage: opencode-acp-isolated run <message>"
+    [[ -n "$2" && "${2:0:1}" != "-" ]] || die "run message must be non-empty and must not start with '-'"
+    ;;
+  *)
+    die "unknown mode: $MODE (acp|run)"
+    ;;
+esac
 
 # realpath must stay under prefix (resolves symlink escapes).
 require_under() {
@@ -60,7 +80,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
     export FACTORY_OC_HOME="$OC_HOME"
     PRESERVE="${PRESERVE},FACTORY_OC_HOME"
   fi
-  exec sudo -n -u factory-oc --preserve-env="$PRESERVE" "$0"
+  exec sudo -n -u factory-oc --preserve-env="$PRESERVE" "$0" "$@"
 fi
 
 if [[ "$(id -un)" != "factory-oc" ]]; then
@@ -78,6 +98,14 @@ unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN GITHUB_TOKE
 rm -rf "${WS}/.git" 2>/dev/null || true
 OC_BIN="${SHARED_HOME}/bin/opencode"
 [[ -x "$OC_BIN" ]] || die "missing $OC_BIN"
+
+if [[ "$MODE" == run ]]; then
+  # Private server per run (no shared background service inside the sandbox),
+  # JSON events on stdout, permissions auto-approved inside the sandbox only.
+  OC_ARGS=(run --standalone --format json --auto --archived "$2")
+else
+  OC_ARGS=(acp)
+fi
 
 # Home bind: shared /home/factory-oc, or per-slot FACTORY_OC_HOME (binary still from shared via ro-bind).
 HOME_ARGS=()
@@ -130,4 +158,4 @@ exec bwrap \
   --setenv TERM dumb \
   --setenv NO_COLOR 1 \
   --setenv LANG C.UTF-8 \
-  "$OC_BIN" acp
+  "$OC_BIN" "${OC_ARGS[@]}"

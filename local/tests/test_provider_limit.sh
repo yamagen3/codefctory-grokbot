@@ -105,7 +105,7 @@ chmod +x "$T/dsh-marker"
 "$PS" mark claude-code $((now + 3600)) usage_limit_reached
 rm -f "$T/dsh-called"
 set +e
-FACTORY_PROVIDER=claude-code FACTORY_USAGE_DISABLE=1 FACTORY_DSH_BIN="$T/dsh-marker" \
+FACTORY_PROVIDER=claude-code FACTORY_USAGE_DISABLE=1 FACTORY_STEP_RUNNER="$T/dsh-marker" \
   "$ROOT/bin/factory-step" --json x >"$T/step-pre.out" 2>"$T/step-pre.err"
 ec=$?
 set -e
@@ -130,7 +130,7 @@ exit 1
 SH
 chmod +x "$T/dsh-limit"
 set +e
-FACTORY_PROVIDER=claude-code FACTORY_DSH_BIN="$T/dsh-limit" \
+FACTORY_PROVIDER=claude-code FACTORY_STEP_RUNNER="$T/dsh-limit" \
   "$ROOT/bin/factory-step" --json x >"$T/step-post.out" 2>"$T/step-post.err"
 ec=$?
 set -e
@@ -235,7 +235,7 @@ exit 1
 SH
 chmod +x "$T/dsh-text-limit"
 set +e
-FACTORY_PROVIDER=claude-code FACTORY_DSH_BIN="$T/dsh-text-limit" \
+FACTORY_PROVIDER=claude-code FACTORY_STEP_RUNNER="$T/dsh-text-limit" \
   "$ROOT/bin/factory-step" --json x >"$T/step-text-limit.out" 2>"$T/step-text-limit.err"
 ec=$?
 set -e
@@ -253,7 +253,7 @@ exit 0
 SH
 chmod +x "$T/dsh-text-ok"
 set +e
-FACTORY_PROVIDER=claude-code FACTORY_DSH_BIN="$T/dsh-text-ok" \
+FACTORY_PROVIDER=claude-code FACTORY_STEP_RUNNER="$T/dsh-text-ok" \
   "$ROOT/bin/factory-step" --json x >"$T/step-text-ok.out" 2>"$T/step-text-ok.err"
 ec=$?
 set -e
@@ -292,7 +292,7 @@ now=$(date +%s)
 rm -rf "$T/notify-once"
 for n in 1 2; do
   set +e
-  FACTORY_PROVIDER=claude-code FACTORY_NOTIFY_DIR="$T/notify-once" FACTORY_DSH_BIN="$T/dsh-marker" \
+  FACTORY_PROVIDER=claude-code FACTORY_NOTIFY_DIR="$T/notify-once" FACTORY_STEP_RUNNER="$T/dsh-marker" \
     "$ROOT/bin/factory-step" --json x >"$T/step-once-$n.out" 2>"$T/step-once-$n.err"
   ec=$?
   set -e

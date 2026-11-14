@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Idempotent install of a pinned pstack-claude skill subset for factory agents.
 # - Claude Code user files: ~/.claude/skills/<name>
-#   Files alone do not enter the CC prompt. factory-setup's CC patch spreads
-#   pstackQueryOverlay() into the Agent SDK query (docs/pstack-cc.md).
+#   Files alone do not enter the CC prompt. lib/factory_step.py appends the
+#   SPEC/gate stage bodies with --append-system-prompt-file (docs/pstack-cc.md).
 # - OpenCode (factory-oc + bwrap): /home/factory-oc/.agents/skills/<name>
 #   (also mirrored under /home/factory-oc/.config/opencode/skills for discovery)
 # Never mounts /workspace/factory into OpenCode; skills are copied into factory-oc HOME.

@@ -28,35 +28,35 @@ FACTORY_USAGE_RUN_ID=run-a FACTORY_USAGE_STEP=impl FACTORY_USAGE_ROUND=1 "$U" re
   --oc-after  '{"input":1500,"output":160,"reasoning":30,"cache_read":9000,"prompts":8}'
 t "oc delta" "[ \"\$(q steps 'r[-1][\"input_tokens\"],r[-1][\"output_tokens\"],r[-1][\"reasoning_tokens\"],r[-1][\"token_source\"]')\" = \"(500, 60, 20, 'opencode-stats-delta')\" ]"
 
-# 4) factory-step hook end-to-end with a fake dsh (stdout + exit code untouched)
+# 4) factory-step hook end-to-end with a fake runner (stdout + exit code untouched)
 cat > "$T/dsh" <<'D'
 #!/usr/bin/env bash
 echo '{"stopReason":"completed","output":[],"text":"pong","usage":{"input_tokens":7,"output_tokens":1}}'
 exit ${FAKE_DSH_EXIT:-0}
 D
 chmod +x "$T/dsh"
-out=$(FACTORY_DSH_BIN="$T/dsh" FACTORY_USAGE_RUN_ID=run-b FACTORY_USAGE_STEP=other "$F/bin/factory-step" --json hi)
+out=$(FACTORY_STEP_RUNNER="$T/dsh" FACTORY_USAGE_RUN_ID=run-b FACTORY_USAGE_STEP=other "$F/bin/factory-step" --json hi)
 t "step stdout passthrough" "echo '$out' | grep -q '\"text\":\"pong\"'"
 t "step recorded" "[ \"\$(q steps '[x[\"total_tokens\"] for x in r if x[\"run_id\"]==\"run-b\"]')\" = '[8]' ]"
-set +e; FAKE_DSH_EXIT=3 FACTORY_DSH_BIN="$T/dsh" FACTORY_USAGE_RUN_ID=run-c "$F/bin/factory-step" --json hi >/dev/null; ec=$?; set -e
+set +e; FAKE_DSH_EXIT=3 FACTORY_STEP_RUNNER="$T/dsh" FACTORY_USAGE_RUN_ID=run-c "$F/bin/factory-step" --json hi >/dev/null; ec=$?; set -e
 t "exit code passthrough" "[ $ec -eq 3 ] && [ \"\$(q steps '[x[\"exit_code\"] for x in r if x[\"run_id\"]==\"run-c\"]')\" = '[3]' ]"
 
-# 4b) CC usage sidecar (written by our dsh-subagent-claude-code patch): fake dsh writes the SDK result shape
+# 4b) CC usage sidecar (written by lib/factory_step.py): fake runner writes the claude -p result shape
 cat > "$T/dsh-cc" <<'D'
 #!/usr/bin/env bash
-[ -n "${FACTORY_CC_USAGE_FILE:-}" ] && echo '{"source":"claude-agent-sdk.init","model":"claude-opus-5-5","effort":null}' >> "$FACTORY_CC_USAGE_FILE"
-[ -n "${FACTORY_CC_USAGE_FILE:-}" ] && echo '{"source":"claude-agent-sdk.stop-hook","effort":"'"${FAKE_EFFORT:-xhigh}"'"}' >> "$FACTORY_CC_USAGE_FILE"
-[ -n "${FACTORY_CC_USAGE_FILE:-}" ] && echo '{"source":"claude-agent-sdk.result","subtype":"success","num_turns":1,"total_cost_usd":0.0123,"usage":{"input_tokens":3,"output_tokens":5},"modelUsage":{"claude-x":{"inputTokens":10,"outputTokens":4,"cacheReadInputTokens":100,"cacheCreationInputTokens":50,"costUSD":0.01},"claude-y":{"inputTokens":2,"outputTokens":1,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"costUSD":0.0023}}}' >> "$FACTORY_CC_USAGE_FILE"
+[ -n "${FACTORY_CC_USAGE_FILE:-}" ] && echo '{"source":"claude-cli.init","model":"claude-opus-5-5","effort":null}' >> "$FACTORY_CC_USAGE_FILE"
+[ -n "${FACTORY_CC_USAGE_FILE:-}" ] && echo '{"source":"claude-cli.stop-hook","effort":"'"${FAKE_EFFORT:-xhigh}"'"}' >> "$FACTORY_CC_USAGE_FILE"
+[ -n "${FACTORY_CC_USAGE_FILE:-}" ] && echo '{"source":"claude-cli.result","subtype":"success","num_turns":1,"total_cost_usd":0.0123,"usage":{"input_tokens":3,"output_tokens":5},"modelUsage":{"claude-x":{"inputTokens":10,"outputTokens":4,"cacheReadInputTokens":100,"cacheCreationInputTokens":50,"costUSD":0.01},"claude-y":{"inputTokens":2,"outputTokens":1,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"costUSD":0.0023}}}' >> "$FACTORY_CC_USAGE_FILE"
 echo '{"stopReason":"completed","output":[],"text":"pong"}'
 D
 chmod +x "$T/dsh-cc"
-FACTORY_DSH_BIN="$T/dsh-cc" FACTORY_USAGE_RUN_ID=run-cc "$F/bin/factory-step" --json hi >/dev/null
-t "cc sidecar modelUsage summed" "[ \"\$(q steps '[(x[\"input_tokens\"],x[\"output_tokens\"],x[\"total_tokens\"],x[\"cache_read_tokens\"],x[\"cache_write_tokens\"],x[\"cost_usd_estimate\"],x[\"token_source\"]) for x in r if x[\"run_id\"]==\"run-cc\"]')\" = \"[(12, 5, 17, 100, 50, 0.0123, 'cc-sdk-sidecar.modelUsage')]\" ]"
+FACTORY_STEP_RUNNER="$T/dsh-cc" FACTORY_USAGE_RUN_ID=run-cc "$F/bin/factory-step" --json hi >/dev/null
+t "cc sidecar modelUsage summed" "[ \"\$(q steps '[(x[\"input_tokens\"],x[\"output_tokens\"],x[\"total_tokens\"],x[\"cache_read_tokens\"],x[\"cache_write_tokens\"],x[\"cost_usd_estimate\"],x[\"token_source\"]) for x in r if x[\"run_id\"]==\"run-cc\"]')\" = \"[(12, 5, 17, 100, 50, 0.0123, 'cc-sidecar.modelUsage')]\" ]"
 t "init model/effort recorded" "[ \"\$(q steps '[(x[\"cc_model\"],x[\"cc_effort\"],x[\"notes\"]) for x in r if x[\"run_id\"]==\"run-cc\"]')\" = \"[('claude-opus-5-5', 'xhigh', None)]\" ]"
-FAKE_EFFORT=high FACTORY_DSH_BIN="$T/dsh-cc" FACTORY_USAGE_RUN_ID=run-cc-dg "$F/bin/factory-step" --json hi >/dev/null
+FAKE_EFFORT=high FACTORY_STEP_RUNNER="$T/dsh-cc" FACTORY_USAGE_RUN_ID=run-cc-dg "$F/bin/factory-step" --json hi >/dev/null
 t "silent effort downgrade flagged" "q steps '[x[\"notes\"] for x in r if x[\"run_id\"]==\"run-cc-dg\"]' | grep -q 'effort downgrade: requested xhigh, effective high'"
 # sidecar absent (patch missing) -> still null, never invented
-FACTORY_DSH_BIN="$T/dsh" FACTORY_USAGE_RUN_ID=run-cc2 "$F/bin/factory-step" --json hi >/dev/null
+FACTORY_STEP_RUNNER="$T/dsh" FACTORY_USAGE_RUN_ID=run-cc2 "$F/bin/factory-step" --json hi >/dev/null
 t "no sidecar + no usage -> stays from result only" "[ \"\$(q steps '[x[\"token_source\"] for x in r if x[\"run_id\"]==\"run-cc2\"]')\" = \"['result.usage']\" ]"
 echo '{"stopReason":"completed","output":[],"text":"x"}' > "$T/r3"
 "$U" record-step --provider claude-code --started "$NOW" --ended "$NOW" --duration-ms 1 --exit 1 --result-file "$T/r3" --cc-usage-file "$T/nonexistent"
@@ -120,9 +120,32 @@ exit 0
 D
 chmod +x "$T/dsh-noload"
 set +e
-FACTORY_DSH_BIN="$T/dsh-noload" FACTORY_USAGE_RUN_ID=run-noload "$F/bin/factory-step" --json hi >"$T/noload.out" 2>"$T/noload.err"
+FACTORY_STEP_RUNNER="$T/dsh-noload" FACTORY_USAGE_RUN_ID=run-noload "$F/bin/factory-step" --json hi >"$T/noload.out" 2>"$T/noload.err"
 ec=$?
 set -e
 t "plugin load failure exits non-zero" "[ $ec -ne 0 ] && [ ! -s $T/noload.out ] && grep -q 'failed to load or run' $T/noload.err && grep -q schemastery $T/noload.err"
 
-[ $fail -eq 0 ] && echo "test_factory_usage: PASS" || { echo "test_factory_usage: FAIL"; exit 1; }
+[ $fail -eq 0 ] && # sidecar modelUsage beats the runner payload's main-loop usage (claude -p result in both)
+python3 - "$F" <<'PY'
+import json, os, sys, tempfile
+sys.path.insert(0, sys.argv[1] + "/lib")
+os.environ["FACTORY_USAGE_DIR"] = tempfile.mkdtemp()
+import factory_usage as U
+payload = json.dumps({"stopReason": "completed", "usage": {"input_tokens": 1, "output_tokens": 2}})
+side = "\n".join(json.dumps(x) for x in (
+    {"source": "claude-cli.init", "model": "claude-opus-5-5"},
+    {"source": "claude-cli.stop-hook", "effort": "xhigh"},
+    {"source": "claude-cli.result", "type": "result", "num_turns": 7, "total_cost_usd": 0.5,
+     "modelUsage": {"claude-opus-5-5": {"inputTokens": 10, "outputTokens": 20}, "claude-haiku": {"inputTokens": 3, "outputTokens": 4}}}))
+i, o, extra, src = U.tokens_from_result(json.loads(payload))
+assert src == "result.usage"
+ci, co, cextra, csrc = U.tokens_from_cc_sidecar(side)
+assert (ci, co, csrc) == (13, 24, "cc-sidecar.modelUsage") and cextra["num_turns"] == 7 and cextra["cc_effort"] == "xhigh", (ci, co, csrc, cextra)
+U.record_step("claude-code", U.now_iso(), U.now_iso(), 5, 0, payload, cc_usage_text=side, run_id="pref", step="spec")
+rows = [json.loads(l) for f in U.usage_dir().glob("*/steps.jsonl") for l in open(f)]
+r = [x for x in rows if x.get("run_id") == "pref"][-1]
+assert r["token_source"] == "cc-sidecar.modelUsage" and r["input_tokens"] == 13 and r["cc_effort"] == "xhigh", r
+assert r.get("num_turns") == 7 and r.get("cost_usd_estimate") == 0.5, r
+PY
+echo "PASS sidecar modelUsage preferred over payload usage"
+echo "test_factory_usage: PASS" || { echo "test_factory_usage: FAIL"; exit 1; }
